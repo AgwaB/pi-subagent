@@ -43,7 +43,8 @@ jobs:
 
       - name: Bump version from input
         if: github.event_name == 'workflow_dispatch'
-        run: npm version "${{ inputs.version }}" -m "chore(release): %s"
+        run: |
+          npm version "${{ inputs.version }}" -m "chore(release): %s"
 
       - name: Release check
         run: npm run release:check
