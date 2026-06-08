@@ -1,6 +1,6 @@
 {
   "name": "@agwab/pi-subagent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Minimal subagent runtime for Pi.",
   "type": "module",
   "private": false,
