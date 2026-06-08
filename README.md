@@ -125,7 +125,7 @@ Open the read-only run monitor:
 
 ## Code API
 
-Orchestrators can use the same runtime directly:
+Orchestrators can use the same runtime directly. The code API is ESM-only and intentionally exposes only the `./api` subpath; do not deep-import internal files.
 
 ```ts
 import { runSubagent, getSubagentStatus } from "@agwab/pi-subagent/api";

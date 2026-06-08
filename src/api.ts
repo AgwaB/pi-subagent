@@ -160,10 +160,15 @@ export async function interruptSubagent(options: InterruptSubagentOptions): Prom
 }
 
 export type {
+  ArtifactRef,
+  CompletionMetadata,
   ResultEnvelope,
-  ParallelRunResult,
-  RunLogsSnapshot,
-  RunStatusSnapshot,
-  WaitForRunResult,
-  InterruptRunResult,
-};
+  ResultSandbox,
+  ResultTmuxMetadata,
+  ResultWorkspace,
+  WorktreeCleanupStatus,
+} from "./artifacts/index.ts";
+export type { AsyncDependency, Backend, ExecutionMode, FailureKind, ResolvedBackend, Status } from "./core/constants.ts";
+export type { InterruptRunResult } from "./orchestrate/interrupt.ts";
+export type { ParallelRunResult } from "./orchestrate/run.ts";
+export type { RunLogRef, RunLogsSnapshot, RunStatusRef, RunStatusSnapshot, RunTaskStatusSnapshot, WaitForRunResult } from "./orchestrate/status.ts";

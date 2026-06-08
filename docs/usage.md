@@ -74,6 +74,8 @@ await interruptSubagent({ cwd: process.cwd(), runId: run.runId, reason: "caller 
 
 `runSubagent` accepts the same run options as the tool, plus an optional `signal`. Existing-run helpers accept `cwd`, `runId`, and optional `taskId`. The API is intentionally object-only and does not expose the lower-level runner internals.
 
+The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import internal files such as `src/orchestrate/*` because only documented package subpaths are public.
+
 Project-local agents are repository-controlled. The code API has no interactive prompt, so project-local agents require explicit opt-in with `confirmProjectAgents:false` for trusted repositories.
 
 ## Single task

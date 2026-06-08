@@ -1,4 +1,4 @@
-import { createRunId, createTaskArtifactStore, beginRunRecord, appendRunEvent, type ResultEnvelope } from "../artifacts/index.ts";
+import { appendRunEvent, beginRunRecord, createRunId, createTaskArtifactStore, finishTaskFromResult, type ResultEnvelope } from "../artifacts/index.ts";
 import type { ExecutionMode, OnCompleteAction, ResolveInput, ResolvedBackend } from "../core/constants.ts";
 import { runParallelSubagentTasks, runSubagentTask } from "./run.ts";
 
@@ -10,6 +10,14 @@ export interface StartAsyncSubagentRunOptions {
   runId?: string;
   taskId?: string;
   onComplete?: (result: ResultEnvelope, mode: ExecutionMode) => number | Promise<number>;
+}
+
+async function notifyCompletion(options: StartAsyncSubagentRunOptions, result: ResultEnvelope, mode: ExecutionMode): Promise<number> {
+  try {
+    return (await options.onComplete?.(result, mode)) ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 function executionMode(input: ResolveInput): ExecutionMode {
@@ -77,19 +85,18 @@ export async function startAsyncSubagentRun(options: StartAsyncSubagentRunOption
   void (async () => {
     if (mode === "parallel") {
       const parallel = await runParallelSubagentTasks(input, options.cwd, options.signal, { runId, taskIdOffset: 1 });
-      const updatesSent = (await options.onComplete?.(parallel.aggregate, mode)) ?? 0;
+      const updatesSent = await notifyCompletion(options, parallel.aggregate, mode);
       await annotateCompletion(store, input, parallel.aggregate, updatesSent);
       return;
     }
 
     const result = await runSubagentTask({ input, cwd: options.cwd, signal: options.signal, runId, taskId, runMode: mode });
-    const updatesSent = (await options.onComplete?.(result, mode)) ?? 0;
+    const updatesSent = await notifyCompletion(options, result, mode);
     await annotateCompletion(store, input, result, updatesSent);
   })().catch(async (error) => {
     const message = error instanceof Error ? error.message : String(error);
-    await appendRunEvent({ cwd: options.cwd, runId }, { type: "run.failed", status: "failed", message }).catch(() => undefined);
     const stderr = await store.writeTextArtifact("stderr", `${message}\n`);
-    await store.writeResult({
+    const failed = await store.writeResult({
       backend: options.backend,
       status: "failed",
       failureKind: "internal",
@@ -102,6 +109,11 @@ export async function startAsyncSubagentRun(options: StartAsyncSubagentRunOption
       signal: null,
       artifacts: [stderr],
     });
+    const updatesSent = await notifyCompletion(options, failed, mode);
+    const annotated = await annotateCompletion(store, input, failed, updatesSent);
+    await finishTaskFromResult({ cwd: options.cwd, runId }, annotated).catch(() => undefined);
+    await appendRunEvent({ cwd: options.cwd, runId }, { type: "task.failed", taskId, status: "failed", message }).catch(() => undefined);
+    await appendRunEvent({ cwd: options.cwd, runId }, { type: "run.failed", status: "failed", message }).catch(() => undefined);
   });
 
   return running;
