@@ -30,7 +30,7 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - run: npm ci
+      - run: npm ci --legacy-peer-deps
 
       - name: Configure git author
         if: github.event_name == 'workflow_dispatch'

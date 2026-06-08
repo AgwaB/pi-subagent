@@ -58,13 +58,13 @@
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.54",
-    "jiti": "^2.7.0"
+    "jiti": "^2.7.0",
+    "typebox": "^1.2.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-tui": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-ai": {
@@ -75,9 +75,6 @@
     },
     "@earendil-works/pi-tui": {
       "optional": true
-    },
-    "typebox": {
-      "optional": false
     }
   },
   "engines": {
