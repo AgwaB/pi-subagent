@@ -1,0 +1,7 @@
+node_modules/
+.pi/
+.harness/
+.harness-archive/
+internal/
+*.tgz
+.DS_Store

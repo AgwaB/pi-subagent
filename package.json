@@ -1,0 +1,83 @@
+{
+  "name": "pi-subagent",
+  "version": "0.1.0",
+  "description": "Minimal subagent runtime for Pi.",
+  "type": "module",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi",
+    "subagent",
+    "agent",
+    "sandbox"
+  ],
+  "license": "MIT",
+  "files": [
+    "src",
+    "docs",
+    "assets",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/AgwaB/pi-subagent/main/assets/subagent-panel.png"
+  },
+  "scripts": {
+    "check:scripts": "for f in internal/scripts/*.mjs internal/scripts/lib/*.mjs; do node --check \"$f\" || exit 1; done",
+    "smoke:resolver": "node ./internal/scripts/smoke-resolver.mjs",
+    "smoke:artifacts": "node ./internal/scripts/smoke-artifacts.mjs",
+    "smoke:contracts": "node ./internal/scripts/smoke-contracts.mjs",
+    "smoke:agents": "node ./internal/scripts/smoke-agents.mjs",
+    "smoke:no-chain": "node ./internal/scripts/smoke-no-chain.mjs",
+    "smoke:panel": "node ./internal/scripts/smoke-panel.mjs",
+    "smoke:worktree-cleanup": "node ./internal/scripts/smoke-worktree-cleanup.mjs",
+    "smoke:inline-model": "node ./internal/scripts/smoke-inline-model.mjs",
+    "smoke:headless-model": "node ./internal/scripts/smoke-headless-model.mjs",
+    "smoke:tmux-model": "node ./internal/scripts/smoke-tmux-model.mjs",
+    "smoke:all": "npm run smoke:resolver && npm run smoke:artifacts && npm run smoke:contracts && npm run smoke:agents && npm run smoke:no-chain && npm run smoke:panel && npm run smoke:worktree-cleanup && npm run smoke:inline-model && npm run smoke:headless-model && npm run smoke:tmux-model",
+    "validate": "npm run check:scripts && npm run smoke:all && npm run poc",
+    "validate:stress": "npm run poc:srt-headless && npm run poc:tmux-srt",
+    "poc": "node ./internal/scripts/run-pocs.mjs",
+    "poc:inline": "node ./internal/scripts/poc-inline.mjs",
+    "poc:srt-headless": "node ./internal/scripts/poc-srt-headless.mjs",
+    "poc:tmux-srt": "node ./internal/scripts/poc-tmux-srt.mjs",
+    "poc:worktree": "node ./internal/scripts/poc-worktree.mjs",
+    "release:check": "node ./scripts/release-check.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.54"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": false
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": false
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": false
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AgwaB/pi-subagent.git"
+  },
+  "homepage": "https://github.com/AgwaB/pi-subagent#readme",
+  "bugs": {
+    "url": "https://github.com/AgwaB/pi-subagent/issues"
+  }
+}
