@@ -27,7 +27,13 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+          registry-url: https://registry.npmjs.org
           package-manager-cache: false
+
+      - name: Show Node/npm versions
+        run: |
+          node --version
+          npm --version
 
       - run: npm ci --legacy-peer-deps
 
@@ -62,7 +68,7 @@ jobs:
         run: npm run release:check
 
       - name: Publish to npm
-        run: npm publish --provenance --access public
+        run: npm publish --access public
 
       - name: Push release commit and tag
         if: steps.prepare.outputs.needs_push == 'true'
