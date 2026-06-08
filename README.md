@@ -2,18 +2,18 @@
 
 **Minimal subagent runtime for Pi.**
 
-[![npm](https://img.shields.io/npm/v/pi-subagent.svg)](https://www.npmjs.com/package/pi-subagent)
+[![npm](https://img.shields.io/npm/v/@agwab/pi-subagent.svg)](https://www.npmjs.com/package/@agwab/pi-subagent)
 
 `pi-subagent` adds one focused tool: `subagent`. It gives Pi the essentials for isolated worker runs — parallel fan-out, sandbox/worktree controls, durable artifacts, and async status.
 
 It is intentionally small, so you can add it to a project when you need subagents and remove it when you do not.
 
-npm package: [`pi-subagent`](https://www.npmjs.com/package/pi-subagent)
+npm package: [`@agwab/pi-subagent`](https://www.npmjs.com/package/@agwab/pi-subagent)
 
 ## Installation
 
 ```bash
-pi install npm:pi-subagent
+pi install npm:@agwab/pi-subagent
 ```
 
 Then reload Pi.

@@ -5,7 +5,7 @@ Detailed usage reference for the public Pi tool **`subagent`**.
 ## Install
 
 ```bash
-pi install npm:pi-subagent
+pi install npm:@agwab/pi-subagent
 ```
 
 Reload Pi after installation.
