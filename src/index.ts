@@ -94,6 +94,18 @@ interface ToolResult {
   isError: boolean;
 }
 
+class SingleLineComponent {
+  constructor(private readonly text: string) {}
+
+  invalidate(): void {
+    // Static one-line component.
+  }
+
+  render(_width: number): string[] {
+    return [this.text];
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -149,6 +161,38 @@ function compactResult(result: ResultEnvelope, error?: string) {
     ...(result.completion === undefined ? {} : { completion: result.completion }),
     artifacts: artifactSummary(result.artifacts),
   };
+}
+
+function displayText(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function subagentCallSummary(input: unknown): string {
+  const args = isRecord(input) ? input : {};
+  const action = displayText(args.action, 16) ?? "run";
+  const mode = displayText(args.mode, 16) ?? (Array.isArray(args.tasks) ? "parallel" : "single");
+  const pieces = [`subagent ${action}`];
+
+  if (action === "run") {
+    pieces.push(mode);
+    if (Array.isArray(args.tasks)) pieces.push(`${args.tasks.length} task${args.tasks.length === 1 ? "" : "s"}`);
+    const agent = displayText(args.agent, 24);
+    if (agent) pieces.push(agent);
+    const task = displayText(args.task, 48);
+    if (task) pieces.push(task);
+    const asyncMode = args.async === true ? "async" : displayText(args.onComplete, 16);
+    if (asyncMode) pieces.push(asyncMode);
+  } else {
+    const runId = displayText(args.runId, 28);
+    if (runId) pieces.push(runId);
+    const taskId = displayText(args.taskId, 16);
+    if (taskId) pieces.push(taskId);
+  }
+
+  return pieces.filter(Boolean).join(" · ");
 }
 
 function validationFailure(failure: ResolveValidationFailure): ToolResult {
@@ -458,6 +502,12 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
       escalateAfterMs: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
       killAfterMs: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
     }),
+    renderCall(args, theme) {
+      const title = theme.fg("toolTitle", theme.bold("subagent"));
+      const summary = subagentCallSummary(args);
+      const rest = summary.startsWith("subagent ") ? summary.slice("subagent ".length) : summary;
+      return new SingleLineComponent(`${title} ${theme.fg("muted", rest)}`);
+    },
     async execute(toolCallIdOrArgs, maybeParams, signal, onUpdate, ctx) {
       const params = getExecuteParams(toolCallIdOrArgs, maybeParams);
       const cwd = getCwd(ctx);

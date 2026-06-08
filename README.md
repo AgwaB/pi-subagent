@@ -125,13 +125,13 @@ Open the read-only run monitor:
 
 ## Code API
 
-Orchestrators can use the same runtime directly. The code API is ESM-only and intentionally exposes only the `./api` subpath; do not deep-import internal files.
+Orchestrators can use the same runtime directly:
 
 ```ts
 import { runSubagent, getSubagentStatus } from "@agwab/pi-subagent/api";
 
-const run = await runSubagent({ cwd: process.cwd(), agent: "reviewer", task: "Review this diff.", async: true });
-const status = await getSubagentStatus({ cwd: process.cwd(), runId: run.runId });
+const run = await runSubagent({ agent: "reviewer", task: "Review this diff.", async: true });
+const status = await getSubagentStatus({ runId: run.runId });
 ```
 
 ## Detailed docs

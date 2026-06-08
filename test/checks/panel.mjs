@@ -114,6 +114,21 @@ async function main() {
   });
 
   assert.ok(registeredTool, "subagent tool should still register");
+  assert.equal(typeof registeredTool.renderCall, "function", "subagent tool should render an informative active call row");
+  const callTheme = {
+    fg(_color, text) {
+      return text;
+    },
+    bold(text) {
+      return text;
+    },
+  };
+  const singleCallText = renderText(registeredTool.renderCall({ agent: "reviewer", task: "Review clipboard image paste behavior", async: true }, callTheme), 120);
+  assert.match(singleCallText, /subagent run · single · reviewer · Review clipboard image paste behavior · async/);
+  const parallelCallText = renderText(registeredTool.renderCall({ mode: "parallel", tasks: [{ task: "a" }, { task: "b" }], onComplete: "notify" }, callTheme), 120);
+  assert.match(parallelCallText, /subagent run · parallel · 2 tasks · notify/);
+  const statusCallText = renderText(registeredTool.renderCall({ action: "status", runId: "run_example", taskId: "task-1" }, callTheme), 120);
+  assert.match(statusCallText, /subagent status · run_example · task-1/);
   assert.ok(registeredCommand, "subagent command should register");
   assert.equal(registeredCommand.name, "subagent");
   assert.equal(typeof registeredCommand.handler, "function");
