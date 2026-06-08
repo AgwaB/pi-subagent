@@ -123,7 +123,18 @@ Open the read-only run monitor:
 
 ![/subagent panel](./assets/subagent-panel.png)
 
+## Code API
+
+Orchestrators can use the same runtime directly:
+
+```ts
+import { runSubagent, getSubagentStatus } from "@agwab/pi-subagent/api";
+
+const run = await runSubagent({ cwd: process.cwd(), agent: "reviewer", task: "Review this diff.", async: true });
+const status = await getSubagentStatus({ cwd: process.cwd(), runId: run.runId });
+```
+
 ## Detailed docs
 
-- [`docs/usage.md`](./docs/usage.md) — full argument reference, `action` behavior, backend selection, sandbox/worktree behavior, artifacts, and validation notes.
+- [`docs/usage.md`](./docs/usage.md) — full argument reference, code API, `action` behavior, backend selection, sandbox/worktree behavior, artifacts, and validation notes.
 

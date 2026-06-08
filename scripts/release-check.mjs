@@ -54,7 +54,7 @@ console.log("\n$ npm pack --dry-run --json");
 const pack = execFileSync("npm", ["pack", "--dry-run", "--json"], { encoding: "utf8" });
 const [summary] = JSON.parse(pack);
 const files = summary.files.map((file) => file.path);
-const required = ["README.md", "docs/usage.md", "assets/subagent-panel.png", "src/index.ts", "package.json"];
+const required = ["README.md", "docs/usage.md", "assets/subagent-panel.png", "api.mjs", "src/api.ts", "src/index.ts", "package.json"];
 const missing = required.filter((path) => !files.includes(path));
 if (missing.length > 0) {
   console.error(`Package is missing required files: ${missing.join(", ")}`);

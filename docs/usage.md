@@ -45,6 +45,37 @@ State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` rea
 
 The examples below show `subagent` argument objects. Pi usually builds these from natural-language requests; extensions or tests can pass the same object as `params` to the registered tool's `execute` function.
 
+## Code API
+
+Orchestrators can import the runtime directly from the `./api` subpath:
+
+```ts
+import {
+  runSubagent,
+  getSubagentStatus,
+  getSubagentLogs,
+  waitForSubagent,
+  interruptSubagent,
+} from "@agwab/pi-subagent/api";
+
+const run = await runSubagent({
+  cwd: process.cwd(),
+  agent: "reviewer",
+  task: "Review the current diff.",
+  async: true,
+  onComplete: "detach",
+});
+
+const status = await getSubagentStatus({ cwd: process.cwd(), runId: run.runId });
+const logs = await getSubagentLogs({ cwd: process.cwd(), runId: run.runId });
+await waitForSubagent({ cwd: process.cwd(), runId: run.runId, timeoutMs: 300000 });
+await interruptSubagent({ cwd: process.cwd(), runId: run.runId, reason: "caller cancelled" });
+```
+
+`runSubagent` accepts the same run options as the tool, plus an optional `signal`. Existing-run helpers accept `cwd`, `runId`, and optional `taskId`. The API is intentionally object-only and does not expose the lower-level runner internals.
+
+Project-local agents are repository-controlled. The code API has no interactive prompt, so project-local agents require explicit opt-in with `confirmProjectAgents:false` for trusted repositories.
+
 ## Single task
 
 ```json

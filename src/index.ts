@@ -4,9 +4,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadAgentByName, type AgentDefinition } from "./agents.ts";
 import {
   appendRunEvent,
-  beginRunRecord,
-  createResultEnvelope,
-  createRunId,
   createTaskArtifactStore,
   setRunDependency,
   type ArtifactRef,
@@ -28,6 +25,7 @@ import {
 } from "./core/constants.ts";
 import { resolveBackend } from "./core/resolver.ts";
 import { validateResolveInput } from "./core/validation.ts";
+import { startAsyncSubagentRun } from "./orchestrate/async.ts";
 import { interruptRun } from "./orchestrate/interrupt.ts";
 import { DEFAULT_PARALLEL_CONCURRENCY, runParallelSubagentTasks, runSubagentTask } from "./orchestrate/run.ts";
 import { getRunLogs, getRunStatus, waitForRun } from "./orchestrate/status.ts";
@@ -388,94 +386,6 @@ function notifyCompletion(input: ResolveInput, result: ResultEnvelope, mode: Exe
   return updatesSent;
 }
 
-async function annotateCompletion(
-  store: Awaited<ReturnType<typeof createTaskArtifactStore>>,
-  input: ResolveInput,
-  result: ResultEnvelope,
-  updatesSent: number,
-): Promise<ResultEnvelope> {
-  const completion = {
-    onComplete: input.onComplete ?? null,
-    notified: input.onComplete === "notify",
-    updatesSent,
-  };
-  return await store.writeResult({
-    ...result,
-    completedAt: result.completedAt,
-    artifacts: result.artifacts,
-    completion,
-  });
-}
-
-async function startAsyncRun(input: ResolveInput, cwd: string, backend: ResolvedBackend, signal?: AbortSignal, onUpdate?: ToolUpdateCallback, ctx?: NotificationContext): Promise<ResultEnvelope> {
-  const startedAt = new Date();
-  const runId = createRunId(startedAt);
-  const taskId = "task-1";
-  const mode = executionMode(input);
-  const dependency = input.asyncDependency ?? "unclassified";
-  const sandboxed = input.sandbox !== undefined && input.sandbox !== null;
-  const store = await createTaskArtifactStore({ cwd, runId, taskId });
-  const running = await store.writeResult({
-    backend,
-    status: "running",
-    failureKind: null,
-    cwd,
-    startedAt,
-    completedAt: null,
-    workspace: { mode: "shared", cwd },
-    sandbox: { enabled: sandboxed },
-    exitCode: null,
-    signal: null,
-    artifacts: [],
-  });
-  await beginRunRecord({
-    cwd,
-    runId,
-    mode,
-    backend,
-    startedAt,
-    dependency,
-    aggregateTaskId: mode === "parallel" ? taskId : null,
-    tasks: [{ taskId, status: "running", backend }],
-  });
-  await appendRunEvent({ cwd, runId }, { type: "run.started", status: "running", message: `${mode} async run started`, data: { dependency } });
-
-  void (async () => {
-    if (mode === "parallel") {
-      const parallel = await runParallelSubagentTasks(input, cwd, signal, { runId, taskIdOffset: 1 });
-      const updatesSent = notifyCompletion(input, parallel.aggregate, mode, onUpdate, ctx);
-      await annotateCompletion(store, input, parallel.aggregate, updatesSent);
-      return;
-    }
-
-    if (input.onComplete === "notify") {
-      const result = await runSubagentTask({ input, cwd, signal, runId, taskId, runMode: mode });
-      const updatesSent = notifyCompletion(input, result, mode, onUpdate, ctx);
-      await annotateCompletion(store, input, result, updatesSent);
-      return;
-    }
-
-    const result = await runSubagentTask({ input, cwd, signal, runId, taskId, runMode: mode });
-    await annotateCompletion(store, input, result, 0);
-  })().catch(async (error) => {
-    await appendRunEvent({ cwd, runId }, { type: "run.failed", status: "failed", message: error instanceof Error ? error.message : String(error) }).catch(() => undefined);
-    await store.writeResult({
-      backend,
-      status: "failed",
-      failureKind: "internal",
-      cwd,
-      startedAt,
-      completedAt: new Date(),
-      workspace: { mode: "shared", cwd },
-      sandbox: { enabled: sandboxed },
-      exitCode: null,
-      signal: null,
-      artifacts: [await store.writeTextArtifact("stderr", `${error instanceof Error ? error.message : String(error)}\n`)],
-    });
-  });
-
-  return running;
-}
 
 export default function registerSubagentEngine(pi: ExtensionAPI) {
   if (typeof pi.registerCommand === "function") {
@@ -573,7 +483,13 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
         await maybeConfirmProjectAgents(validation.input, runCwd, ctx as ProjectAgentApprovalContext);
         const mode = executionMode(validation.input);
         if (validation.input.async === true || validation.input.onComplete === "detach" || validation.input.onComplete === "notify") {
-          const result = await startAsyncRun(validation.input, runCwd, resolved.backend, signal, onUpdate, ctx as NotificationContext);
+          const result = await startAsyncSubagentRun({
+            input: validation.input,
+            cwd: runCwd,
+            backend: resolved.backend,
+            signal,
+            onComplete: (completed, completedMode) => notifyCompletion(validation.input, completed, completedMode, onUpdate, ctx as NotificationContext),
+          });
           return textResult(compactResult(result), false, { result, resolved });
         }
 
