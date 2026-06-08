@@ -26,12 +26,16 @@ if (!pkg.pi?.extensions?.length) {
   process.exit(1);
 }
 
-const npmWhoami = capture("npm", ["whoami"]);
-if (npmWhoami.status !== 0) {
-  console.error("npm whoami failed. Run npm login first.");
-  process.exit(npmWhoami.status ?? 1);
+if (process.env.GITHUB_ACTIONS === "true") {
+  console.log("Skipping npm whoami in GitHub Actions; publish authentication is handled by trusted publishing/OIDC.");
+} else {
+  const npmWhoami = capture("npm", ["whoami"]);
+  if (npmWhoami.status !== 0) {
+    console.error("npm whoami failed. Run npm login first.");
+    process.exit(npmWhoami.status ?? 1);
+  }
+  console.log(`npm user: ${npmWhoami.stdout.trim()}`);
 }
-console.log(`npm user: ${npmWhoami.stdout.trim()}`);
 
 const versionView = capture("npm", ["view", `${pkg.name}@${pkg.version}`, "version"]);
 if (versionView.status === 0 && versionView.stdout.trim() === pkg.version) {
