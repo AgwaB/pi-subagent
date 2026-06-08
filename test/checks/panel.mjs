@@ -1,0 +1,288 @@
+#!/usr/bin/env node
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import path, { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+function findPackageRoot(startPath, packageName) {
+  let current = fs.statSync(startPath).isDirectory() ? startPath : path.dirname(startPath);
+  while (current !== path.dirname(current)) {
+    const packageJsonPath = path.join(current, "package.json");
+    if (fs.existsSync(packageJsonPath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+        if (parsed.name === packageName) return current;
+      } catch {
+        // Keep walking.
+      }
+    }
+    current = path.dirname(current);
+  }
+  return undefined;
+}
+
+function resolvePiPackageRoot() {
+  const require = createRequire(import.meta.url);
+  try {
+    const packageJson = require.resolve("@earendil-works/pi-coding-agent/package.json");
+    return path.dirname(packageJson);
+  } catch {
+    const piBin = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
+    const packageRoot = findPackageRoot(fs.realpathSync(piBin), "@earendil-works/pi-coding-agent");
+    if (!packageRoot) throw new Error(`Found pi at ${piBin}, but could not locate @earendil-works/pi-coding-agent.`);
+    return packageRoot;
+  }
+}
+
+async function loadExtension() {
+  const piPackageRoot = resolvePiPackageRoot();
+  const jitiPath = path.join(piPackageRoot, "node_modules/jiti/lib/jiti.mjs");
+  const typeboxPath = path.join(piPackageRoot, "node_modules/typebox/build/index.mjs");
+  const { createJiti } = await import(pathToFileURL(jitiPath).href);
+  const jiti = createJiti(import.meta.url, {
+    alias: { typebox: typeboxPath },
+    interopDefault: true,
+    moduleCache: false,
+  });
+  const mod = await jiti.import(resolve("src/index.ts"));
+  return mod.default ?? mod;
+}
+
+function stripAnsi(text) {
+  return text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function renderText(component, width = 120) {
+  return stripAnsi(component.render(width).join("\n"));
+}
+
+async function waitFor(predicate, label) {
+  const deadline = Date.now() + 2_000;
+  let last;
+  while (Date.now() < deadline) {
+    last = predicate();
+    if (last) return last;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
+async function writeRun(cwd, runId, taskId, options) {
+  const taskDir = join(cwd, ".pi/agent/runs", runId, taskId);
+  await mkdir(taskDir, { recursive: true });
+  const outputRel = `.pi/agent/runs/${runId}/${taskId}/output.log`;
+  const resultRel = `.pi/agent/runs/${runId}/${taskId}/result.json`;
+  await writeFile(join(cwd, outputRel), `${options.log}\n`);
+  const result = {
+    schemaVersion: 1,
+    runId,
+    taskId,
+    backend: options.backend ?? "headless",
+    status: options.status,
+    failureKind: options.failureKind ?? null,
+    cwd,
+    startedAt: options.startedAt ?? new Date(Date.now() - 90_000).toISOString(),
+    completedAt: options.completedAt ?? (options.status === "completed" || options.status === "failed" ? new Date().toISOString() : null),
+    durationMs: options.status === "running" || options.status === "pending" ? null : 1000,
+    workspace: { mode: "shared", cwd, worktreePath: options.worktreePath ?? null },
+    sandbox: { enabled: false },
+    exitCode: options.status === "failed" ? 1 : 0,
+    signal: null,
+    artifacts: [
+      { type: "output", path: outputRel },
+      { type: "result", path: resultRel },
+    ],
+  };
+  await writeFile(join(cwd, resultRel), `${JSON.stringify(result, null, 2)}\n`);
+}
+
+async function main() {
+  const register = await loadExtension();
+  let registeredTool;
+  let registeredCommand;
+  register({
+    registerTool(tool) {
+      registeredTool = tool;
+    },
+    registerCommand(name, command) {
+      registeredCommand = { name, ...command };
+    },
+  });
+
+  assert.ok(registeredTool, "subagent tool should still register");
+  assert.ok(registeredCommand, "subagent command should register");
+  assert.equal(registeredCommand.name, "subagent");
+  assert.equal(typeof registeredCommand.handler, "function");
+  assert.equal(registeredCommand.getArgumentCompletions("pa")?.[0]?.value, "panel");
+  assert.equal(registeredCommand.getArgumentCompletions("zzz"), null);
+
+  const tempRoot = await mkdtemp(join(tmpdir(), "pi-subagent-panel-"));
+  try {
+    const cwd = join(tempRoot, "workspace");
+    await mkdir(cwd, { recursive: true });
+
+    const notifications = [];
+    let customCalls = 0;
+    async function runCommand(args, overrides = {}) {
+      let component;
+      let closeCount = 0;
+      const ctx = {
+        cwd,
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          notify(message, level) {
+            notifications.push({ message, level });
+          },
+          async custom(factory) {
+            customCalls += 1;
+            component = await factory(
+              { requestRender() {} },
+              {
+                fg(_color, text) {
+                  return text;
+                },
+                bg(_color, text) {
+                  return text;
+                },
+                bold(text) {
+                  return text;
+                },
+              },
+              {},
+              () => {
+                closeCount += 1;
+              },
+            );
+          },
+        },
+        ...overrides,
+      };
+      await registeredCommand.handler(args, ctx);
+      return { component, closeCount: () => closeCount };
+    }
+
+    await registeredCommand.handler("", { cwd, mode: "tui", hasUI: true, ui: { notify: (message, level) => notifications.push({ message, level }) } });
+    assert.ok(notifications.some((item) => item.message.includes("/subagent panel")), "wrong args should show usage");
+
+    const beforeNonTuiCustomCalls = customCalls;
+    await runCommand("panel", { mode: "json", hasUI: false });
+    assert.equal(customCalls, beforeNonTuiCustomCalls, "non-TUI should not open custom panel");
+    assert.ok(notifications.some((item) => item.message.includes("interactive TUI")), "non-TUI should warn");
+
+    const empty = await runCommand("panel");
+    assert.ok(empty.component, "empty panel should open");
+    await waitFor(() => renderText(empty.component).includes("No subagent runs found"), "empty render");
+    empty.component.handleInput("q");
+    assert.equal(empty.closeCount(), 1, "q should close empty panel");
+
+    await writeRun(cwd, "run_active", "task-1", { status: "running", backend: "headless", log: "active task one latest" });
+    await writeRun(cwd, "run_active", "task-2", { status: "completed", backend: "headless", log: "active task two result" });
+    await writeRun(cwd, "run_queued", "task-1", { status: "pending", backend: "headless", log: "queued waiting slot", completedAt: null });
+    await writeRun(cwd, "run_done", "task-1", { status: "completed", backend: "tmux", log: "done result ready" });
+    await writeRun(cwd, "run_failed", "task-1", { status: "failed", backend: "inline", failureKind: "timeout", log: "failed timeout tail" });
+    for (let index = 0; index < 24; index += 1) {
+      await writeRun(cwd, `run_scroll_${String(index).padStart(2, "0")}`, "task-1", { status: "completed", backend: "headless", log: `scroll run ${index}` });
+    }
+
+    const panel = await runCommand("panel");
+    const component = panel.component;
+    assert.ok(component, "panel should open with runs");
+    await waitFor(() => renderText(component).includes("run_active"), "runs render");
+    let text = renderText(component);
+    assert.match(text, /Subagents/);
+    assert.match(text, /live/);
+    assert.match(text, /run_active/);
+    assert.match(text, /running/);
+    assert.match(text, /RUN/);
+    assert.match(text, /Run ID/);
+    assert.match(text, /WORKSPACE/);
+    assert.match(text, /TASKS/);
+    assert.match(text, /Result/);
+    assert.match(text, /Started/);
+    assert.match(text, /Completed/);
+    assert.match(text, /LOG TAIL/);
+    assert.match(text, /task-1/);
+    assert.match(text, /task-2/);
+    assert.match(text, /active task one latest/);
+    assert.match(text, /\[all\]/, "all should be the default filter");
+    assert.doesNotMatch(text, /active \+ recent 20/, "recent20 tab should be removed");
+    assert.doesNotMatch(text, /\binline\b|\bheadless\b|\btmux\b/, "backend labels should stay hidden in the panel");
+    assert.doesNotMatch(text, /follow/, "follow toggle should not appear");
+
+    const beforeEnter = renderText(component);
+    component.handleInput("\r");
+    assert.equal(renderText(component), beforeEnter, "enter should be a no-op");
+
+    component.handleInput("\u001b[B");
+    text = renderText(component);
+    assert.match(text, /run_queued/, "down should move run selection");
+    component.handleInput("up");
+    assert.match(renderText(component), /run_active/, "named up key should move run selection");
+    component.handleInput("\u001b[1;2B");
+    assert.match(renderText(component), /run_queued/, "modified down sequence should move run selection");
+    for (let index = 0; index < 20; index += 1) component.handleInput("down");
+    assert.match(renderText(component), /^▸ run_scroll_/m, "run list should scroll with selection");
+
+    component.handleInput("\t");
+    await waitFor(() => {
+      const current = renderText(component);
+      return current.includes("[completed]") && current.includes("run_scroll_") && !current.includes("run_failed");
+    }, "completed filter");
+    text = renderText(component);
+    assert.doesNotMatch(text, /run_failed/, "completed filter should hide failed runs");
+
+    component.handleInput("\u001b[C");
+    await waitFor(() => {
+      const current = renderText(component);
+      return current.includes("[failed]") && current.includes("run_failed") && !current.includes("run_done");
+    }, "failed filter");
+    text = renderText(component);
+    assert.doesNotMatch(text, /run_done/, "failed filter should hide completed runs");
+
+    component.handleInput("\u001b[D");
+    await waitFor(() => renderText(component).includes("[completed]") && renderText(component).includes("run_scroll_"), "left/completed filter");
+
+    await writeFile(join(cwd, ".pi/agent/runs/run_scroll_23/task-1/output.log"), "scroll run 23\nnew live tail\n");
+    component.handleInput("r");
+    await waitFor(() => renderText(component).includes("new live tail"), "manual refresh updates log tail");
+
+    component.handleInput("\r");
+    assert.ok(renderText(component).includes("new live tail"), "enter no-op should keep detail visible");
+    component.handleInput("ctrl+[");
+    assert.equal(panel.closeCount(), 1, "escape/ctrl+[ should close panel");
+
+    console.log(
+      JSON.stringify(
+        {
+          name: "check-panel",
+          status: "completed",
+          scenarios: [
+            "command completion",
+            "usage warning",
+            "non-tui guard",
+            "empty state",
+            "full panel render",
+            "structured detail sections and always-visible logs",
+            "run selection",
+            "run-list scrolling",
+            "all/failed/completed filters",
+            "manual refresh/live data reload",
+            "enter no-op",
+            "q/escape close",
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+await main();

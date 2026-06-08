@@ -43,11 +43,11 @@ if (versionView.status === 0 && versionView.stdout.trim() === pkg.version) {
   process.exit(1);
 }
 
-if (existsSync(new URL("../internal/scripts", import.meta.url))) {
-  run("npm", ["run", "validate"]);
-  run("npm", ["run", "validate:stress"]);
+if (existsSync(new URL("../test", import.meta.url))) {
+  run("npm", ["run", "check:scripts"]);
+  run("npm", ["run", "check:static"]);
 } else {
-  console.log("\nSkipping internal validation scripts: internal/scripts is not present in this checkout.");
+  console.log("\nSkipping validation checks: test/ is not present in this checkout.");
 }
 
 console.log("\n$ npm pack --dry-run --json");
