@@ -1,50 +1,12 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import fs from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import path, { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
-
-function findPackageRoot(startPath, packageName) {
-  let current = fs.statSync(startPath).isDirectory() ? startPath : path.dirname(startPath);
-  while (current !== path.dirname(current)) {
-    const packageJsonPath = path.join(current, "package.json");
-    if (fs.existsSync(packageJsonPath)) {
-      try {
-        const parsed = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
-        if (parsed.name === packageName) return current;
-      } catch {
-        // Keep walking.
-      }
-    }
-    current = path.dirname(current);
-  }
-  return undefined;
-}
-
-function resolvePiPackageRoot() {
-  const require = createRequire(import.meta.url);
-  try {
-    const packageJson = require.resolve("@earendil-works/pi-coding-agent/package.json");
-    return path.dirname(packageJson);
-  } catch {
-    const piBin = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
-    const packageRoot = findPackageRoot(fs.realpathSync(piBin), "@earendil-works/pi-coding-agent");
-    if (!packageRoot) throw new Error(`Found pi at ${piBin}, but could not locate @earendil-works/pi-coding-agent.`);
-    return packageRoot;
-  }
-}
+import { join, resolve } from "node:path";
+import { createJiti } from "jiti";
 
 async function loadExtension() {
-  const piPackageRoot = resolvePiPackageRoot();
-  const jitiPath = path.join(piPackageRoot, "node_modules/jiti/lib/jiti.mjs");
-  const typeboxPath = path.join(piPackageRoot, "node_modules/typebox/build/index.mjs");
-  const { createJiti } = await import(pathToFileURL(jitiPath).href);
   const jiti = createJiti(import.meta.url, {
-    alias: { typebox: typeboxPath },
     interopDefault: true,
     moduleCache: false,
   });
