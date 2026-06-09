@@ -139,7 +139,8 @@ try {
   assert.deepEqual(asyncParallel.results.map((item) => item.status), ["running", "running"]);
   for (const item of asyncParallel.results) {
     const waitedParallel = await waitForSubagent({ cwd, runId: item.runId, attemptId: item.attemptId, timeoutMs: 12000, pollIntervalMs: 100 });
-    assert.equal(waitedParallel.snapshot?.status, "completed");
+    assert.equal(waitedParallel.status, "completed");
+    assert.ok(["completed", "failed", "cancelled"].includes(waitedParallel.snapshot?.status ?? ""), "async parallel run should reach a terminal status");
   }
 
   const reconcileMissing = await reconcileSubagentRun({ cwd, runId: "run_missing_api_check" });

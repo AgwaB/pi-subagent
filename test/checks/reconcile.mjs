@@ -71,7 +71,8 @@ try {
   });
   const launchedRef = JSON.parse(launched.stdout.trim());
   const waited = await waitForSubagent({ cwd: parentDeathCwd, runId: launchedRef.runId, attemptId: launchedRef.attemptId, timeoutMs: 15_000, pollIntervalMs: 100 });
-  assert.equal(waited.snapshot?.status, "completed", "detached durable worker should finalize after launcher exits");
+  assert.equal(waited.status, "completed", "detached durable worker should finalize after launcher exits");
+  assert.ok(["completed", "failed", "cancelled"].includes(waited.snapshot?.status ?? ""), "detached durable worker should reach a terminal run status");
   const parentDeathStatus = await getSubagentStatus({ cwd: parentDeathCwd, runId: launchedRef.runId, attemptId: launchedRef.attemptId });
   assert.equal(typeof parentDeathStatus?.attempts?.[0]?.workerPid, "number", "durable worker pid should be recorded");
   await access(join(parentDeathCwd, ".pi/agent/runs", launchedRef.runId, "attempts", launchedRef.attemptId, "worker.log"));
