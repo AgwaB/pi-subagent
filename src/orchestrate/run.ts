@@ -11,7 +11,7 @@ import {
   type ProcessMetadata,
   type ResultEnvelope,
 } from "../artifacts/index.ts";
-import type { ExecutionMode, ResolveInput, ResolvedBackend, SubagentTaskInput } from "../core/constants.ts";
+import type { ResolveInput, ResolvedBackend, SubagentTaskInput } from "../core/constants.ts";
 import { resolveBackend } from "../core/resolver.ts";
 import { runHeadlessModel } from "../runners/headless-model.ts";
 import { runInlineModel } from "../runners/inline.ts";
@@ -29,7 +29,6 @@ export interface RunSubagentTaskOptions {
   runId?: string;
   attemptId?: string;
   taskIndex?: number;
-  runMode?: ExecutionMode;
 }
 
 export interface MultiRunOptions {
@@ -133,7 +132,6 @@ export async function runSubagentTask(options: RunSubagentTaskOptions): Promise<
     const workspace = await resolveWorkspace({
       cwd: baseCwd,
       input,
-      mode: options.runMode === "parallel" ? "parallel" : "single",
       taskIndex: options.taskIndex,
       runId,
     });
@@ -155,7 +153,7 @@ export async function runSubagentTask(options: RunSubagentTaskOptions): Promise<
 
     const onProcessStart = async (process: ProcessMetadata) => {
       await updateAttemptProcess({ ...runRef, attemptId, process });
-      await appendRunEvent({ ...runRef }, { type: "attempt.process_started", attemptId, status: "running", data: process });
+      await appendRunEvent({ ...runRef }, { type: "attempt.process_started", attemptId, status: "running", data: { ...process } });
     };
 
     const common = {
@@ -175,6 +173,7 @@ export async function runSubagentTask(options: RunSubagentTaskOptions): Promise<
     if (input.task === undefined) throw new Error(`${backend} execution requires agent/task input.`);
     const modelOptions = {
       ...common,
+      captureToolCalls: input.captureToolCalls,
       agent: requestedAgent,
       task: input.task,
       roleContext: input.roleContext,
@@ -232,23 +231,23 @@ export async function runParallelSubagentTasks(input: ResolveInput, cwd: string,
     if (task.task === undefined) throw new SubagentToolAuthorityError(`parallel tasks[${index}] requires a non-empty task.`);
   }
 
+  const tasks = input.tasks;
   const runCwd = resolve(input.cwd ?? cwd);
-  const concurrency = Math.min(parallelConcurrency(input), input.tasks.length);
-  const results: ResultEnvelope[] = new Array(input.tasks.length);
+  const concurrency = Math.min(parallelConcurrency(input), tasks.length);
+  const results: ResultEnvelope[] = new Array(tasks.length);
   let nextIndex = 0;
 
   async function worker(): Promise<void> {
     while (true) {
       const index = nextIndex;
       nextIndex += 1;
-      if (index >= input.tasks.length) return;
-      const taskInput = mergeTaskInput(input, input.tasks[index]);
+      if (index >= tasks.length) return;
+      const taskInput = mergeTaskInput(input, tasks[index]!);
       results[index] = await runSubagentTask({
         input: taskInput,
         cwd: runCwd,
         signal,
         taskIndex: index,
-        runMode: "parallel",
       });
     }
   }

@@ -33,6 +33,7 @@ const plannedInput = {
   systemPrompt: "Compiled system prompt",
   skills: ["/tmp/skill"],
   extensions: ["/tmp/extension.ts"],
+  captureToolCalls: true,
   runsDir: ".pi/custom-runs",
   correlationId: "corr_contracts",
   reasoningLevel: "xhigh",
@@ -51,17 +52,19 @@ assert.equal(validation.input.thinking, "xhigh");
 assert.equal(validation.input.systemPrompt, "Compiled system prompt");
 assert.deepEqual(validation.input.skills, ["/tmp/skill"]);
 assert.deepEqual(validation.input.extensions, ["/tmp/extension.ts"]);
+assert.equal(validation.input.captureToolCalls, true);
 assert.equal(validation.input.runsDir, ".pi/custom-runs");
 assert.equal(validation.input.correlationId, "corr_contracts");
 
 const taskModelValidation = validateResolveInput({
   mode: "parallel",
-  tasks: [{ agent: "scout", task: "audit", model: "kimi-coding/kimi-for-coding", thinking: "high", tools: [] }],
+  tasks: [{ agent: "scout", task: "audit", model: "kimi-coding/kimi-for-coding", thinking: "high", tools: [], captureToolCalls: true }],
 });
 assert.equal(taskModelValidation.ok, true);
 assert.equal(taskModelValidation.input.tasks[0].model, "kimi-coding/kimi-for-coding");
 assert.equal(taskModelValidation.input.tasks[0].thinking, "high");
 assert.deepEqual(taskModelValidation.input.tasks[0].tools, []);
+assert.equal(taskModelValidation.input.tasks[0].captureToolCalls, true);
 
 const benignContextWindowOutput = parsePiJsonLines([
   JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Subagents are isolated context windows." }] } }),
@@ -72,6 +75,52 @@ assert.equal(detectContextLengthExceeded({ stderrText: "", errors: benignContext
 assert.equal(detectContextLengthExceeded({ stderrText: "Error: context length exceeded" }), true);
 assert.equal(detectContextLengthExceeded({ stderrText: "Error: request payload is too large for the context limit" }), true);
 assert.equal(detectContextLengthExceeded({ stderrText: "The context window is documented here, not exceeded." }), false);
+
+// Sandbox object form: explicit per-run network egress (C-style caller control).
+const sandboxObject = validateResolveInput({ sandbox: { allowedDomains: ["api.anthropic.com", "*.npmjs.org", "localhost"] }, agent: "worker", task: "inspect" });
+assert.equal(sandboxObject.ok, true);
+assert.deepEqual(sandboxObject.input.sandbox, { allowedDomains: ["api.anthropic.com", "*.npmjs.org", "localhost"] });
+
+const sandboxEmptyObject = validateResolveInput({ sandbox: {}, agent: "worker", task: "inspect" });
+assert.equal(sandboxEmptyObject.ok, true);
+assert.deepEqual(sandboxEmptyObject.input.sandbox, {});
+
+const sandboxTaskObject = validateResolveInput({ mode: "parallel", tasks: [{ agent: "scout", task: "audit", sandbox: { allowedDomains: ["api.openai.com"] } }] });
+assert.equal(sandboxTaskObject.ok, true);
+assert.deepEqual(sandboxTaskObject.input.tasks[0].sandbox, { allowedDomains: ["api.openai.com"] });
+
+const sandboxBadDomain = validateResolveInput({ sandbox: { allowedDomains: ["https://api.anthropic.com"] }, agent: "worker", task: "inspect" });
+assert.equal(sandboxBadDomain.ok, false);
+assert.match(sandboxBadDomain.failure.error, /must be a bare domain/);
+
+const sandboxBroadWildcard = validateResolveInput({ sandbox: { allowedDomains: ["*.com"] }, agent: "worker", task: "inspect" });
+assert.equal(sandboxBroadWildcard.ok, false);
+assert.match(sandboxBroadWildcard.failure.error, /must be a bare domain/);
+
+const sandboxUnknownKey = validateResolveInput({ sandbox: { domains: ["api.anthropic.com"] }, agent: "worker", task: "inspect" });
+assert.equal(sandboxUnknownKey.ok, false);
+assert.match(sandboxUnknownKey.failure.error, /unsupported sandbox option/);
+
+// Inline backend still rejects any sandbox form.
+const inlineObjectSandbox = validateResolveInput({ backend: "inline", sandbox: { allowedDomains: ["api.anthropic.com"] }, agent: "worker", task: "inspect" });
+assert.equal(inlineObjectSandbox.ok, false);
+assert.match(inlineObjectSandbox.failure.error, /inline backend cannot provide/);
+
+// Result envelope records the sandbox network policy.
+const sandboxedResult = createResultEnvelope({
+  runId: "run_contracts_002",
+  attemptId: "attempt-contracts-002",
+  backend: "headless",
+  status: "completed",
+  failureKind: null,
+  cwd: process.cwd(),
+  startedAt: "2026-06-07T00:00:00.000Z",
+  completedAt: "2026-06-07T00:00:00.010Z",
+  sandbox: { enabled: true, allowedDomains: ["api.anthropic.com"] },
+  artifacts: [],
+  metadata: { contextLengthExceeded: false },
+});
+assert.deepEqual(sandboxedResult.sandbox, { enabled: true, allowedDomains: ["api.anthropic.com"] });
 
 const invalid = validateResolveInput({ mode: "fanout" });
 assert.equal(invalid.ok, false);

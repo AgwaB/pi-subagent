@@ -10,7 +10,6 @@ const execFileAsync = promisify(execFile);
 export interface WorkspaceResolutionInput {
   cwd: string;
   input: ResolveInput;
-  mode: "single" | "parallel";
   taskIndex?: number;
   runId?: string;
 }
@@ -36,10 +35,6 @@ function hasExplicitWorkspaceAuto(input: ResolveInput): boolean {
   return input.workspace === "auto" || (typeof input.workspace === "object" && input.workspace !== null && input.workspace.mode === "auto");
 }
 
-function hasExplicitWorkspaceShared(input: ResolveInput): boolean {
-  return input.workspace === "shared" || (typeof input.workspace === "object" && input.workspace !== null && input.workspace.mode === "shared");
-}
-
 function explicitWorkspacePath(input: ResolveInput): string | undefined {
   const workspace = input.workspace;
   if (typeof workspace === "object" && workspace !== null) return workspace.path;
@@ -51,24 +46,21 @@ function worktreePolicy(input: ResolveInput): WorktreePolicy {
   return input.worktreePolicy ?? "auto";
 }
 
-function resolveWorktreeIntent(input: ResolveInput, mode: "single" | "parallel"): "shared" | "worktree" {
+function resolveWorktreeIntent(input: ResolveInput): "shared" | "worktree" {
   const policy = worktreePolicy(input);
   const workspace = workspaceMode(input);
 
+  // Explicit isolation requests are honored or fail loudly in a non-git cwd;
+  // they are never silently downgraded to shared.
   if (policy === "required") return "worktree";
   if (input.worktree === true || typeof input.worktree === "string") return "worktree";
   if (workspace === "worktree") return "worktree";
-
-  if (mode === "parallel" && (policy === "never" || hasExplicitWorkspaceShared(input))) {
-    throw new WorkspacePolicyError("parallel subagent execution cannot mutate a shared checkout; use workspace:auto/worktree or worktreePolicy:required to isolate tasks.");
-  }
-
-  if (policy === "never" || workspace === "shared") {
-    return mode === "parallel" ? "worktree" : "shared";
-  }
-
-  if (mode === "parallel") return "worktree";
+  if (policy === "never") return "shared";
   if (hasExplicitWorkspaceAuto(input) && input.sandbox !== undefined && input.sandbox !== null) return "worktree";
+
+  // Default is shared for both single and parallel runs. Parallel fanout is
+  // usually read-only (reviews, analysis); callers running parallel mutating
+  // tasks should request worktree isolation explicitly.
   return "shared";
 }
 
@@ -84,7 +76,7 @@ async function gitRoot(cwd: string): Promise<string> {
     return await gitOutput(cwd, ["rev-parse", "--show-toplevel"]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new WorkspacePolicyError(`worktree workspace requires a git checkout cwd; ${message}`);
+    throw new WorkspacePolicyError(`worktree isolation was requested but requires a git checkout cwd; use workspace:"shared" (or omit worktree options) to run without isolation. ${message}`);
   }
 }
 
@@ -96,7 +88,7 @@ function defaultWorktreePath(root: string, runId: string | undefined, taskIndex:
 
 export async function resolveWorkspace(options: WorkspaceResolutionInput): Promise<ResolvedWorkspace> {
   const baseCwd = resolve(options.cwd);
-  const intent = resolveWorktreeIntent(options.input, options.mode);
+  const intent = resolveWorktreeIntent(options.input);
 
   if (intent === "shared") {
     return { mode: "shared", baseCwd, cwd: baseCwd, worktreePath: null };

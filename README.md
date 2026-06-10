@@ -18,7 +18,7 @@ pi install npm:@agwab/pi-subagent
 
 Then reload Pi.
 
-Requires Node.js `>=22.19.0`.
+Requires Node.js `>=22.19.0` on macOS or Linux. Native Windows is not supported (POSIX process groups, tmux, and `which`-based Pi discovery); use WSL2.
 
 For local development, add this package as a Pi extension source and reload Pi.
 
@@ -55,9 +55,19 @@ Run workers in an isolated local execution boundary.
 }
 ```
 
+`sandbox: true` denies all network access. Model-backed sandboxed runs must allow their provider endpoint explicitly:
+
+```json
+{
+  "sandbox": { "allowedDomains": ["api.anthropic.com"] },
+  "agent": "implementer",
+  "task": "Make the requested local change and run the checks."
+}
+```
+
 ### Worktree
 
-Isolate parallel or mutating tasks in managed git worktrees.
+Isolate parallel or mutating tasks in managed git worktrees. Workspaces default to shared; request `worktree: true` explicitly for tasks that mutate files in parallel.
 
 ```json
 {

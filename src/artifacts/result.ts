@@ -1,7 +1,7 @@
 import type { FailureKind, ResolvedBackend, Status } from "../core/constants.ts";
 
 export const RESULT_SCHEMA_VERSION = 2 as const;
-export const ARTIFACT_TYPES = ["result", "stdout", "stderr", "output", "worker", "worktree-status", "worktree-diff"] as const;
+export const ARTIFACT_TYPES = ["result", "stdout", "stderr", "output", "worker", "worktree-status", "worktree-diff", "tool-calls", "tool-calls-summary"] as const;
 export const WORKSPACE_MODES = ["shared", "worktree", "auto"] as const;
 
 export type ArtifactType = (typeof ARTIFACT_TYPES)[number];
@@ -27,6 +27,8 @@ export interface ResultWorkspace {
 
 export interface ResultSandbox {
   enabled: boolean;
+  /** Network domains allowed inside the sandbox. Absent or empty means deny-all. */
+  allowedDomains?: string[];
 }
 
 export interface ResultTmuxMetadata {
@@ -133,6 +135,7 @@ function normalizeSandbox(input: ResultEnvelopeInput): ResultSandbox {
 
   return {
     enabled: input.sandbox.enabled ?? true,
+    ...(input.sandbox.allowedDomains === undefined || input.sandbox.allowedDomains.length === 0 ? {} : { allowedDomains: input.sandbox.allowedDomains }),
   };
 }
 

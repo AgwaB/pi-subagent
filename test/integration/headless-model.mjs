@@ -52,7 +52,7 @@ try {
     },
   });
 
-  const stdout = await readArtifact(cwd, result, "stdout");
+  assert.equal(result.artifacts.some((artifact) => artifact.type === "stdout"), false, "headless should not store raw stdout event streams by default");
   const stderr = await readArtifact(cwd, result, "stderr");
   const output = await readArtifact(cwd, result, "output");
   await access(join(cwd, artifactByType(result, "result").path));
@@ -69,7 +69,6 @@ try {
             failureKind: result.failureKind,
             exitCode: result.exitCode,
             stderrBytes: Buffer.byteLength(stderr),
-            stdoutBytes: Buffer.byteLength(stdout),
           },
           null,
           2,

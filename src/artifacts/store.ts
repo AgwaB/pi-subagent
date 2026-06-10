@@ -21,6 +21,8 @@ const ARTIFACT_FILENAMES: Record<ArtifactType, string> = {
   worker: "worker.json",
   "worktree-status": "worktree.status.txt",
   "worktree-diff": "worktree.diff.patch",
+  "tool-calls": "tool-calls.jsonl",
+  "tool-calls-summary": "tool-calls-summary.json",
 };
 
 export type LogArtifactType = Exclude<ArtifactType, "result" | "worker">;

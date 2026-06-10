@@ -144,7 +144,7 @@ export async function startAsyncSubagentRun(options: StartAsyncSubagentRunOption
     cwd: options.cwd,
     runsDir: input.runsDir,
     runId,
-    mode: mode === "parallel" ? "parallel" : "single",
+    mode,
     backend: options.backend,
     startedAt,
     dependency,

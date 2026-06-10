@@ -20,6 +20,7 @@ import {
   type ResolveValidationFailure,
   type ResolvedBackend,
   type SandboxInput,
+  type SandboxOptionsInput,
   type SubagentTaskInput,
   type WorkspaceInput,
 } from "./constants.ts";
@@ -100,7 +101,8 @@ function validateThinkingAliases(value: Record<string, unknown>, fieldName: stri
     }
   }
 
-  const first = entries[0][1];
+  const first = entries[0]![1];
+  if (!isThinkingLevel(first)) return undefined;
   if (entries.some((entry) => entry[1] !== first)) {
     return failure(`${fieldName} thinking aliases must agree when more than one is provided.`, backend);
   }
@@ -126,10 +128,38 @@ function validateTools(value: unknown, fieldName: string, backend: ResolvedBacke
   return validateStringArray(value, fieldName, backend);
 }
 
+const DOMAIN_PATTERN = /^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
+
+function isAllowedDomainPattern(value: string): boolean {
+  if (value === "localhost") return true;
+  if (!DOMAIN_PATTERN.test(value)) return false;
+  // Reject overly broad wildcards such as "*.com"; require *.example.com shape.
+  if (value.startsWith("*.")) return value.slice(2).includes(".");
+  return true;
+}
+
 function validateSandbox(value: unknown, fieldName: string, backend: ResolvedBackend | undefined): SandboxInput | null | ResolveValidationResult {
   if (value === null || value === false) return null;
   if (value === true) return true;
-  return failure(`${fieldName} must be a boolean when provided. Use true to enable sandboxing or false/null to disable it.`, backend);
+  if (isRecord(value)) {
+    const sandbox: SandboxOptionsInput = {};
+    const unknownKeys = Object.keys(value).filter((key) => key !== "allowedDomains");
+    if (unknownKeys.length > 0) {
+      return failure(`unsupported ${fieldName} option(s): ${unknownKeys.map((key) => `"${key}"`).join(", ")}; supported options are "allowedDomains".`, backend);
+    }
+    if (value.allowedDomains !== undefined) {
+      const allowedDomains = validateStringArray(value.allowedDomains, `${fieldName}.allowedDomains`, backend);
+      if (!Array.isArray(allowedDomains)) return allowedDomains;
+      for (const domain of allowedDomains) {
+        if (!isAllowedDomainPattern(domain)) {
+          return failure(`${fieldName}.allowedDomains entry ${formatValue(domain)} must be a bare domain or *.example.com-style wildcard without protocol, path, or port.`, backend);
+        }
+      }
+      sandbox.allowedDomains = allowedDomains;
+    }
+    return sandbox;
+  }
+  return failure(`${fieldName} must be a boolean or an options object when provided. Use true for an offline sandbox, { allowedDomains: [...] } to allow network egress, or false/null to disable sandboxing.`, backend);
 }
 
 function validateTaskItem(value: unknown, fieldName: string, backend: ResolvedBackend | undefined): SubagentTaskInput | ResolveValidationResult {
@@ -223,6 +253,12 @@ function validateTaskItem(value: unknown, fieldName: string, backend: ResolvedBa
     const extensions = validateStringArray(value.extensions, `${fieldName}.extensions`, backend);
     if (!Array.isArray(extensions)) return extensions;
     task.extensions = extensions;
+  }
+
+  if (value.captureToolCalls !== undefined) {
+    const captureToolCalls = validateBoolean(value.captureToolCalls, `${fieldName}.captureToolCalls`, backend);
+    if (typeof captureToolCalls !== "boolean") return captureToolCalls;
+    task.captureToolCalls = captureToolCalls;
   }
 
   const thinking = validateThinkingAliases(value, fieldName, backend);
@@ -453,6 +489,12 @@ export function validateResolveInput(raw: unknown = {}): ResolveValidationResult
     const extensions = validateStringArray(raw.extensions, "extensions", backendForKnownFailure);
     if (!Array.isArray(extensions)) return extensions;
     input.extensions = extensions;
+  }
+
+  if (raw.captureToolCalls !== undefined) {
+    const captureToolCalls = validateBoolean(raw.captureToolCalls, "captureToolCalls", backendForKnownFailure);
+    if (typeof captureToolCalls !== "boolean") return captureToolCalls;
+    input.captureToolCalls = captureToolCalls;
   }
 
   const thinking = validateThinkingAliases(raw, "input", backendForKnownFailure);

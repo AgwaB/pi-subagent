@@ -8,6 +8,7 @@ import { createAttemptArtifactStore, type ArtifactRef, type ResultEnvelope } fro
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import { THINKING_LEVELS, type AgentScope, type FailureKind, type ThinkingLevel } from "../core/constants.ts";
 import { detectContextLengthExceeded } from "./headless-model.ts";
+import { flushToolCallTelemetry, ToolCallTelemetryCollector } from "./tool-call-telemetry.ts";
 
 export interface RunInlineModelOptions {
   agent: string;
@@ -30,6 +31,7 @@ export interface RunInlineModelOptions {
   systemPrompt?: string;
   skills?: string[];
   extensions?: string[];
+  captureToolCalls?: boolean;
   agentDefinition?: AgentDefinition;
 }
 
@@ -281,6 +283,8 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
   let stderrText = "";
   let outputText = "";
   let failureKind: FailureKind | null = null;
+  let toolCallArtifactRefs: ArtifactRef[] = [];
+  const toolCallTelemetry = options.captureToolCalls === true ? new ToolCallTelemetryCollector() : undefined;
 
   try {
     const { module: piSdk, source } = await importPiSdk();
@@ -307,6 +311,7 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
     });
 
     const unsubscribe = session.subscribe?.((event) => {
+      toolCallTelemetry?.processEvent(event);
       stdoutText += maybeTextDelta(event);
       const agentEndText = maybeAssistantTextFromAgentEnd(event);
       if (agentEndText.length > 0) outputText = agentEndText;
@@ -333,12 +338,14 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
     stderrText += "Inline SDK session completed without assistant output.\n";
   }
 
+  toolCallArtifactRefs = await flushToolCallTelemetry(toolCallTelemetry, store);
+
   const completedAt = new Date();
   const status = failureKind === null ? "completed" : "failed";
   const artifacts: ArtifactRef[] = [
-    await store.writeTextArtifact("stdout", stdoutText),
     await store.writeTextArtifact("stderr", stderrText),
     await store.writeTextArtifact("output", outputText),
+    ...toolCallArtifactRefs,
   ];
 
   return await store.writeResult({

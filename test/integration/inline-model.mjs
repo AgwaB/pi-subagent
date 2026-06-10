@@ -35,7 +35,7 @@ try {
     timeoutMs: 60_000,
   });
 
-  const stdout = await readArtifact(cwd, result, "stdout");
+  assert.equal(result.artifacts.some((artifact) => artifact.type === "stdout"), false, "inline should not store stdout streams by default");
   const stderr = await readArtifact(cwd, result, "stderr");
   const output = await readArtifact(cwd, result, "output");
   await access(join(cwd, artifactByType(result, "result").path));
@@ -51,7 +51,6 @@ try {
             reason: "Pi SDK model/auth path unavailable for inline check in this environment.",
             failureKind: result.failureKind,
             stderrBytes: Buffer.byteLength(stderr),
-            stdoutBytes: Buffer.byteLength(stdout),
           },
           null,
           2,

@@ -46,7 +46,11 @@
     "check:no-chain": "node ./test/checks/no-chain.mjs",
     "check:panel": "node ./test/checks/panel.mjs",
     "check:worktree-cleanup": "node ./test/checks/worktree-cleanup.mjs",
+    "check:workspace-policy": "node ./test/checks/workspace-policy.mjs",
+    "check:schema-sync": "node ./test/checks/schema-sync.mjs",
+    "check:run-lock": "node ./test/checks/run-lock.mjs",
     "check:reconcile": "node ./test/checks/reconcile.mjs",
+    "check:headless-streaming": "node ./test/checks/headless-streaming.mjs",
     "check:model:inline": "node ./test/integration/inline-model.mjs",
     "check:model:headless": "node ./test/integration/headless-model.mjs",
     "check:model:tmux": "node ./test/integration/tmux-model.mjs",
@@ -54,13 +58,19 @@
     "validate": "npm run check:scripts && npm run check:static",
     "release:check": "node ./scripts/release-check.mjs",
     "check": "npm run check:static",
-    "check:static": "npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:reconcile",
+    "check:types": "tsc -p tsconfig.json",
+    "check:static": "npm run check:types && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:schema-sync && npm run check:run-lock && npm run check:reconcile && npm run check:headless-streaming",
     "check:integration": "npm run check:model:inline && npm run check:model:headless && npm run check:model:tmux"
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.54",
     "jiti": "^2.7.0",
     "typebox": "^1.2.3"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

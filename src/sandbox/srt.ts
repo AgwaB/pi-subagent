@@ -1,4 +1,4 @@
-import type { SandboxInput } from "../core/constants.ts";
+import { sandboxAllowedDomains, type SandboxInput } from "../core/constants.ts";
 
 interface SandboxRuntimeConfig {
   network: {
@@ -67,10 +67,12 @@ async function importSandboxRuntime(): Promise<SandboxRuntimeModule> {
   }
 }
 
-function defaultConfig(cwd: string, writablePaths: readonly string[], allowPty: boolean): SandboxRuntimeConfig {
+function defaultConfig(sandbox: SandboxInput, cwd: string, writablePaths: readonly string[], allowPty: boolean): SandboxRuntimeConfig {
   const allowWrite = Array.from(new Set([cwd, ...writablePaths]));
   return {
-    network: { allowedDomains: [], deniedDomains: [] },
+    // Empty allowedDomains means deny-all network in @anthropic-ai/sandbox-runtime.
+    // Callers opt into egress per run via sandbox.allowedDomains.
+    network: { allowedDomains: sandboxAllowedDomains(sandbox), deniedDomains: [] },
     filesystem: { denyRead: [], allowWrite, denyWrite: [] },
     ignoreViolations: {},
     allowPty,
@@ -115,7 +117,7 @@ export async function withSandboxedArgv<T>(
       throw new SandboxUnavailableError(`sandbox dependencies are not available: ${dependencyCheck.errors.join("; ")}`);
     }
 
-    const config = defaultConfig(options.cwd, options.writablePaths ?? [], options.allowPty ?? false);
+    const config = defaultConfig(options.sandbox, options.cwd, options.writablePaths ?? [], options.allowPty ?? false);
     validateConfig(srt, config);
 
     try {

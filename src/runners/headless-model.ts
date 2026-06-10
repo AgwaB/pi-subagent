@@ -1,10 +1,15 @@
+import { once } from "node:events";
+import { createReadStream, createWriteStream } from "node:fs";
+import { stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
 import { createAttemptArtifactStore, type ArtifactRef, type ProcessMetadata, type ResultEnvelope, type ResultMetadata } from "../artifacts/index.ts";
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import type { AgentScope, FailureKind, SandboxInput, Status, ThinkingLevel } from "../core/constants.ts";
+import { sandboxAllowedDomains } from "../core/constants.ts";
 import { SandboxUnavailableError, withSandboxedArgv } from "../sandbox/srt.ts";
+import { flushToolCallTelemetry, ToolCallTelemetryCollector } from "./tool-call-telemetry.ts";
 
 export interface RunHeadlessModelOptions {
   agent: string;
@@ -30,6 +35,7 @@ export interface RunHeadlessModelOptions {
   skills?: string[];
   extensions?: string[];
   agentDefinition?: AgentDefinition;
+  captureToolCalls?: boolean;
   onProcessStart?: (process: ProcessMetadata) => void | Promise<void>;
 }
 
@@ -42,8 +48,11 @@ interface ProcessOutcome {
 
 interface ProcessResult {
   outcome: ProcessOutcome;
-  stdout: Buffer;
-  stderr: Buffer;
+  stderrRef: ArtifactRef;
+  toolCallArtifactRefs: ArtifactRef[];
+  parsed: PiJsonParseResult;
+  stderrText: string;
+  stderrContextLengthExceeded: boolean;
 }
 
 export interface PiJsonParseResult {
@@ -96,61 +105,139 @@ function errorText(value: unknown): string | undefined {
   return undefined;
 }
 
-export function parsePiJsonLines(stdout: string): PiJsonParseResult {
-  let finalAssistantText = "";
-  const errors: string[] = [];
-  const parseErrors: string[] = [];
-  const metadata: Partial<ResultMetadata> = {};
+const PARSED_EVENT_PATTERN = /"type"\s*:\s*"(?:message_end|turn_end|agent_end|error)"/;
+const TOOL_CALL_EVENT_PATTERN = /"type"\s*:\s*"(?:tool_execution_start|tool_execution_end)"/;
+const MAX_PARSE_ERRORS = 20;
+const MAX_JSON_LINE_CHARS = 64 * 1024 * 1024;
+const STDERR_TEXT_LIMIT = 256 * 1024;
 
-  for (const [index, line] of stdout.split(/\r?\n/).entries()) {
-    if (line.trim().length === 0) continue;
+function emptyParseResult(): PiJsonParseResult {
+  return { finalAssistantText: "", errors: [], parseErrors: [], metadata: {} };
+}
 
-    let event: unknown;
-    try {
-      event = JSON.parse(line);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      parseErrors.push(`line ${index + 1}: ${message}`);
-      continue;
+function pushParseError(parsed: PiJsonParseResult, message: string): void {
+  if (parsed.parseErrors.length < MAX_PARSE_ERRORS) parsed.parseErrors.push(message);
+}
+
+function parsePiJsonLine(line: string, lineNumber: number, parsed: PiJsonParseResult, onEvent?: (event: unknown) => void): void {
+  if (line.trim().length === 0) return;
+  if (!PARSED_EVENT_PATTERN.test(line) && (onEvent === undefined || !TOOL_CALL_EVENT_PATTERN.test(line))) return;
+  if (line.length > MAX_JSON_LINE_CHARS) {
+    pushParseError(parsed, `line ${lineNumber}: JSON event too large to parse (${line.length} chars)`);
+    return;
+  }
+
+  let event: unknown;
+  try {
+    event = JSON.parse(line);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    pushParseError(parsed, `line ${lineNumber}: ${message}`);
+    return;
+  }
+
+  onEvent?.(event);
+
+  if (typeof event !== "object" || event === null) return;
+  const record = event as Record<string, unknown>;
+  const type = record.type;
+
+  if (type === "message_end" || type === "turn_end") {
+    const message = record.message;
+    if (typeof message === "object" && message !== null && (message as Record<string, unknown>).role === "assistant") {
+      const assistant = message as Record<string, unknown>;
+      parsed.finalAssistantText = textFromContent(assistant.content);
+      if (typeof assistant.provider === "string") parsed.metadata.provider = assistant.provider;
+      if (typeof assistant.model === "string") parsed.metadata.model = assistant.model;
+      if (assistant.usage !== undefined) parsed.metadata.usage = assistant.usage;
+      if (typeof assistant.stopReason === "string") parsed.metadata.stopReason = assistant.stopReason;
+      if (assistant.stopReason === "error") {
+        const text = errorText(assistant.errorMessage) ?? errorText(assistant.error) ?? "assistant stopped with an error";
+        parsed.errors.push(text);
+      }
     }
-
-    if (typeof event !== "object" || event === null) continue;
-    const record = event as Record<string, unknown>;
-    const type = record.type;
-
-    if (type === "message_end" || type === "turn_end") {
-      const message = record.message;
-      if (typeof message === "object" && message !== null && (message as Record<string, unknown>).role === "assistant") {
-        const assistant = message as Record<string, unknown>;
-        finalAssistantText = textFromContent(assistant.content);
-        if (typeof assistant.provider === "string") metadata.provider = assistant.provider;
-        if (typeof assistant.model === "string") metadata.model = assistant.model;
-        if (assistant.usage !== undefined) metadata.usage = assistant.usage;
-        if (typeof assistant.stopReason === "string") metadata.stopReason = assistant.stopReason;
-        if (assistant.stopReason === "error") {
-          const text = errorText(assistant.errorMessage) ?? errorText(assistant.error) ?? "assistant stopped with an error";
-          errors.push(text);
+  } else if (type === "agent_end") {
+    const messages = record.messages;
+    if (Array.isArray(messages)) {
+      for (const message of messages) {
+        if (typeof message === "object" && message !== null && (message as Record<string, unknown>).role === "assistant") {
+          const text = textFromContent((message as Record<string, unknown>).content);
+          if (text.length > 0) parsed.finalAssistantText = text;
         }
       }
-    } else if (type === "agent_end") {
-      const messages = record.messages;
-      if (Array.isArray(messages)) {
-        for (const message of messages) {
-          if (typeof message === "object" && message !== null && (message as Record<string, unknown>).role === "assistant") {
-            const text = textFromContent((message as Record<string, unknown>).content);
-            if (text.length > 0) finalAssistantText = text;
-          }
-        }
-      }
-    }
-
-    if (type === "error") {
-      const text = errorText(record.error) ?? errorText(record.message) ?? errorText(record);
-      if (text) errors.push(text);
     }
   }
 
-  return { finalAssistantText, errors, parseErrors, metadata };
+  if (type === "error") {
+    const text = errorText(record.error) ?? errorText(record.message) ?? errorText(record);
+    if (text) parsed.errors.push(text);
+  }
+}
+
+class PiJsonStreamParser {
+  readonly parsed = emptyParseResult();
+  private buffered = "";
+  private lineNumber = 0;
+  private discardingOversizedLine = false;
+  private readonly onEvent?: (event: unknown) => void;
+
+  constructor(onEvent?: (event: unknown) => void) {
+    this.onEvent = onEvent;
+  }
+
+  push(chunk: Buffer | string): void {
+    let text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    while (text.length > 0) {
+      if (this.discardingOversizedLine) {
+        const newline = text.indexOf("\n");
+        if (newline < 0) return;
+        this.discardingOversizedLine = false;
+        this.buffered = "";
+        text = text.slice(newline + 1);
+        continue;
+      }
+
+      const newline = text.indexOf("\n");
+      const segment = newline < 0 ? text : text.slice(0, newline + 1);
+      this.buffered += segment;
+      text = newline < 0 ? "" : text.slice(newline + 1);
+
+      if (this.buffered.length > MAX_JSON_LINE_CHARS) {
+        this.lineNumber += 1;
+        pushParseError(this.parsed, `line ${this.lineNumber}: JSON event too large to parse`);
+        this.buffered = "";
+        this.discardingOversizedLine = newline < 0;
+        continue;
+      }
+
+      if (newline >= 0) this.flushLine();
+    }
+  }
+
+  finish(): PiJsonParseResult {
+    if (!this.discardingOversizedLine && this.buffered.length > 0) this.flushLine();
+    return this.parsed;
+  }
+
+  private flushLine(): void {
+    this.lineNumber += 1;
+    const line = this.buffered.endsWith("\n") ? this.buffered.slice(0, -1).replace(/\r$/, "") : this.buffered;
+    this.buffered = "";
+    parsePiJsonLine(line, this.lineNumber, this.parsed, this.onEvent);
+  }
+}
+
+export function parsePiJsonLines(stdout: string): PiJsonParseResult {
+  const parser = new PiJsonStreamParser();
+  parser.push(stdout);
+  return parser.finish();
+}
+
+export async function parsePiJsonFile(path: string): Promise<PiJsonParseResult> {
+  const parser = new PiJsonStreamParser();
+  const stream = createReadStream(path, { encoding: "utf8" });
+  for await (const chunk of stream) parser.push(chunk);
+  return parser.finish();
 }
 
 function buildPrompt(options: RunHeadlessModelOptions): string {
@@ -196,23 +283,54 @@ export function buildPiArgv(options: RunHeadlessModelOptions): readonly [string,
   return argv as [string, ...string[]];
 }
 
+async function fileBytes(path: string): Promise<number> {
+  try {
+    return (await stat(path)).size;
+  } catch {
+    return 0;
+  }
+}
+
+function appendLimited(base: string, chunk: string, limit: number): string {
+  if (base.length >= limit) return base;
+  return base + chunk.slice(0, limit - base.length);
+}
+
 async function runProcess(
   argv: readonly [string, ...string[]],
   cwd: string,
   timeoutMs: number | undefined,
+  store: Awaited<ReturnType<typeof createAttemptArtifactStore>>,
+  captureToolCalls?: boolean,
   abortSignal?: AbortSignal,
   env?: NodeJS.ProcessEnv,
   onProcessStart?: (process: ProcessMetadata) => void | Promise<void>,
 ): Promise<ProcessResult> {
-  const stdoutChunks: Buffer[] = [];
-  const stderrChunks: Buffer[] = [];
+  const stderrPath = store.pathFor("stderr");
+  await writeFile(stderrPath, "");
+
+  const toolCallTelemetry = captureToolCalls === true ? new ToolCallTelemetryCollector() : undefined;
+  const parser = new PiJsonStreamParser((event) => toolCallTelemetry?.processEvent(event));
+  const stderrStream = createWriteStream(stderrPath, { flags: "w" });
+  let stderrText = "";
+  let stderrContextLengthExceeded = false;
+
+  async function finishWith(outcome: ProcessOutcome): Promise<ProcessResult> {
+    stderrStream.end();
+    await once(stderrStream, "finish");
+    const parsed = parser.finish();
+    return {
+      outcome,
+      stderrRef: store.refFor("stderr", await fileBytes(stderrPath)),
+      toolCallArtifactRefs: await flushToolCallTelemetry(toolCallTelemetry, store),
+      parsed,
+      stderrText,
+      stderrContextLengthExceeded,
+    };
+  }
 
   if (abortSignal?.aborted) {
-    return {
-      outcome: { status: "failed", failureKind: "abort", exitCode: null, signal: null },
-      stdout: Buffer.concat(stdoutChunks),
-      stderr: Buffer.concat(stderrChunks),
-    };
+    return await finishWith({ status: "failed", failureKind: "abort", exitCode: null, signal: null });
   }
 
   return await new Promise<ProcessResult>((resolveProcess) => {
@@ -271,15 +389,29 @@ async function runProcess(
       if (settled) return;
       settled = true;
       cleanup();
-      resolveProcess({ outcome, stdout: Buffer.concat(stdoutChunks), stderr: Buffer.concat(stderrChunks) });
+      void finishWith(outcome).then(resolveProcess, () => resolveProcess({
+        outcome: { status: "failed", failureKind: "internal", exitCode: null, signal: null },
+        stderrRef: store.refFor("stderr", 0),
+        toolCallArtifactRefs: [],
+        parsed: parser.finish(),
+        stderrText,
+        stderrContextLengthExceeded,
+      }));
     }
 
     child.stdout?.on("data", (chunk: Buffer | string) => {
-      stdoutChunks.push(toBuffer(chunk));
+      parser.push(toBuffer(chunk));
     });
 
     child.stderr?.on("data", (chunk: Buffer | string) => {
-      stderrChunks.push(toBuffer(chunk));
+      const buffer = toBuffer(chunk);
+      const text = buffer.toString("utf8");
+      stderrText = appendLimited(stderrText, text, STDERR_TEXT_LIMIT);
+      stderrContextLengthExceeded ||= detectContextLengthExceeded({ stderrText: text });
+      if (!stderrStream.write(buffer)) {
+        child.stderr?.pause();
+        stderrStream.once("drain", () => child.stderr?.resume());
+      }
     });
 
     child.on("error", () => {
@@ -324,23 +456,24 @@ export async function runHeadlessModel(options: RunHeadlessModelOptions): Promis
   try {
     processResult = options.sandbox
       ? await withSandboxedArgv(argv, { sandbox: options.sandbox, cwd, writablePaths: [store.taskDir], signal: options.signal }, (launch) =>
-          runProcess(launch.argv, cwd, timeoutMs, options.signal, launch.env, options.onProcessStart),
+          runProcess(launch.argv, cwd, timeoutMs, store, options.captureToolCalls, options.signal, launch.env, options.onProcessStart),
         )
-      : await runProcess(argv, cwd, timeoutMs, options.signal, undefined, options.onProcessStart);
+      : await runProcess(argv, cwd, timeoutMs, store, options.captureToolCalls, options.signal, undefined, options.onProcessStart);
   } catch (error) {
     if (!(error instanceof SandboxUnavailableError)) throw error;
+    const stderrRef = await store.writeTextArtifact("stderr", `${error.message}\n`);
     processResult = {
       outcome: { status: "failed", failureKind: "sandbox", exitCode: null, signal: null },
-      stdout: Buffer.alloc(0),
-      stderr: Buffer.from(`${error.message}\n`),
+      stderrRef,
+      toolCallArtifactRefs: [],
+      parsed: emptyParseResult(),
+      stderrText: `${error.message}\n`,
+      stderrContextLengthExceeded: detectContextLengthExceeded({ stderrText: error.message }),
     };
   }
 
-  const { outcome: processOutcome, stdout, stderr } = processResult;
-  const stdoutText = stdout.toString("utf8");
-  const stderrText = stderr.toString("utf8");
-  const parsed = parsePiJsonLines(stdoutText);
-  const contextLengthExceeded = detectContextLengthExceeded({ stderrText, errors: parsed.errors });
+  const { outcome: processOutcome, stderrRef, toolCallArtifactRefs, parsed, stderrText, stderrContextLengthExceeded } = processResult;
+  const contextLengthExceeded = stderrContextLengthExceeded || detectContextLengthExceeded({ stderrText, errors: parsed.errors });
 
   let outcome = processOutcome;
   if (processOutcome.status === "completed" && parsed.parseErrors.length > 0 && parsed.finalAssistantText.length === 0) {
@@ -352,9 +485,9 @@ export async function runHeadlessModel(options: RunHeadlessModelOptions): Promis
   const completedAt = new Date();
   const outputText = parsed.finalAssistantText;
   const artifacts: ArtifactRef[] = [
-    await store.writeTextArtifact("stdout", stdout),
-    await store.writeTextArtifact("stderr", stderr),
+    stderrRef,
     await store.writeTextArtifact("output", outputText),
+    ...toolCallArtifactRefs,
   ];
 
   return await store.writeResult({
@@ -365,7 +498,7 @@ export async function runHeadlessModel(options: RunHeadlessModelOptions): Promis
     startedAt,
     completedAt,
     workspace: options.workspace ?? { mode: "shared", cwd },
-    sandbox: options.sandbox ? { enabled: true } : { enabled: false },
+    sandbox: options.sandbox ? { enabled: true, allowedDomains: sandboxAllowedDomains(options.sandbox) } : { enabled: false },
     exitCode: outcome.exitCode,
     signal: outcome.signal,
     artifacts,

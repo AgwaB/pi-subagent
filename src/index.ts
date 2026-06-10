@@ -61,6 +61,7 @@ const SUPPORTED_KEYS = new Set([
   "extensions",
   "runsDir",
   "correlationId",
+  "captureToolCalls",
   "thinking",
   "thinkingLevel",
   "reasoningLevel",
@@ -75,13 +76,27 @@ const SUPPORTED_KEYS = new Set([
   "killAfterMs",
 ]);
 const AGENT_TASK_KEYS = ["agent", "task", "roleContext", "agentScope", "confirmProjectAgents"];
+const SANDBOX_SCHEMA = Type.Union(
+  [
+    Type.Boolean(),
+    Type.Null(),
+    Type.Object({
+      allowedDomains: Type.Optional(
+        Type.Array(Type.String({ minLength: 1 }), {
+          description: 'Network domains the sandboxed child may reach, e.g. "api.anthropic.com" or "*.npmjs.org". Model-backed sandboxed runs must include their provider endpoint. Omitted means deny-all network.',
+        }),
+      ),
+    }),
+  ],
+  { description: "true = offline OS sandbox; { allowedDomains: [...] } = sandbox with explicit network egress; false/null = no sandbox." },
+);
 const SUBAGENT_TASK_SCHEMA = Type.Object({
   agent: Type.Optional(Type.String({ minLength: 1 })),
   task: Type.Optional(Type.String({ minLength: 1 })),
   roleContext: Type.Optional(Type.String({ minLength: 1 })),
   agentScope: Type.Optional(Type.Union(AGENT_SCOPES.map((value) => Type.Literal(value)))),
   confirmProjectAgents: Type.Optional(Type.Boolean()),
-  sandbox: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])),
+  sandbox: Type.Optional(SANDBOX_SCHEMA),
   visible: Type.Optional(Type.Boolean()),
   cwd: Type.Optional(Type.String({ minLength: 1 })),
   timeoutMs: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
@@ -91,6 +106,7 @@ const SUBAGENT_TASK_SCHEMA = Type.Object({
   systemPrompt: Type.Optional(Type.String({ minLength: 1 })),
   skills: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   extensions: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  captureToolCalls: Type.Optional(Type.Boolean({ description: "Capture redacted child tool-call telemetry as artifacts. Default false." })),
 });
 
 interface ToolTextContent {
@@ -100,7 +116,7 @@ interface ToolTextContent {
 
 interface ToolResult {
   content: ToolTextContent[];
-  details?: unknown;
+  details: unknown;
   isError: boolean;
 }
 
@@ -170,7 +186,7 @@ function getCwd(ctx: unknown): string {
 function textResult(payload: unknown, isError: boolean, details?: unknown): ToolResult {
   return {
     content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-    ...(details === undefined ? {} : { details }),
+    details,
     isError,
   };
 }
@@ -386,7 +402,7 @@ async function writeUnsupportedResult(cwd: string, backend: ResolvedBackend, inp
 }
 
 interface ToolUpdateCallback {
-  (update: { content: ToolTextContent[]; details?: unknown }): void;
+  (update: { content: ToolTextContent[]; details: unknown }): void;
 }
 
 interface NotificationContext {
@@ -508,11 +524,11 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
     name: TOOL_NAME,
     label: "Subagent",
     description:
-      "Subagent engine. Executes headless/tmux/inline workers; supports workspace:auto/worktree isolation, bounded parallel fanout, async lifecycle lookup, mark-background, reconcile, and conservative interrupt.",
+      "Subagent engine. Executes headless/tmux/inline workers; supports workspace:auto/worktree isolation, bounded parallel fanout, async lifecycle lookup, mark-background, reconcile, and conservative interrupt. Workspaces default to shared; set worktree:true for parallel tasks that mutate files.",
     parameters: Type.Object({
       backend: Type.Optional(Type.Union(BACKENDS.map((value) => Type.Literal(value)))),
       visible: Type.Optional(Type.Boolean()),
-      sandbox: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])), 
+      sandbox: Type.Optional(SANDBOX_SCHEMA),
       agent: Type.Optional(Type.String({ minLength: 1 })),
       task: Type.Optional(Type.String({ minLength: 1 })),
       roleContext: Type.Optional(Type.String({ minLength: 1 })),
@@ -544,6 +560,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
       extensions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Explicit Pi extensions to load for headless/tmux child Pi; ambient extensions stay disabled. Inline rejects this option." })),
       runsDir: Type.Optional(Type.String({ minLength: 1, description: "Safe relative run/artifact root under cwd." })),
       correlationId: Type.Optional(Type.String({ minLength: 1, description: "External correlation label; no aggregation semantics." })),
+      captureToolCalls: Type.Optional(Type.Boolean({ description: "Capture redacted child tool-call telemetry (tool names, durations, statuses; no args/results) as run artifacts. Default false." })),
       thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((value) => Type.Literal(value)), { description: "Optional Pi thinking/reasoning level." })),
       thinkingLevel: Type.Optional(Type.Union(THINKING_LEVELS.map((value) => Type.Literal(value)), { description: "Alias for thinking." })),
       reasoningLevel: Type.Optional(Type.Union(THINKING_LEVELS.map((value) => Type.Literal(value)), { description: "Alias for thinking." })),

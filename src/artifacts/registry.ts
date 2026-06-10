@@ -1,4 +1,4 @@
-import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AsyncDependency, ExecutionMode, FailureKind, ResolvedBackend, Status } from "../core/constants.ts";
 import type { ArtifactRef, ResultEnvelope, ResultTmuxMetadata, ResultWorkspace } from "./result.ts";
@@ -191,7 +191,7 @@ function aggregateStatus(attempts: readonly RunAttemptRecord[], latestAttemptId:
   return { status: active.status, failureKind: active.failureKind ?? null, completedAt: active.completedAt };
 }
 
-function mergeDefined<T extends Record<string, unknown>>(base: T, patch: Partial<T>): T {
+function mergeDefined<T extends object>(base: T, patch: Partial<T>): T {
   const next = { ...base };
   for (const [key, value] of Object.entries(patch)) {
     if (value !== undefined) (next as Record<string, unknown>)[key] = value;
@@ -320,6 +320,38 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
+function lockHolderPid(content: string): number | null {
+  const pid = Number.parseInt(content.split("\n")[0] ?? "", 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but belongs to another user.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function lockIsStale(lockPath: string): Promise<boolean> {
+  try {
+    const content = await readFile(lockPath, "utf8");
+    const pid = lockHolderPid(content);
+    if (pid !== null) return !pidAlive(pid);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; // already released
+    // Unreadable content: fall through to the mtime heuristic below.
+  }
+  try {
+    const info = await stat(lockPath);
+    return Date.now() - info.mtimeMs > LOCK_TIMEOUT_MS;
+  } catch {
+    return false;
+  }
+}
+
 async function withFileLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
   await mkdir(dirname(lockPath), { recursive: true });
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
@@ -327,21 +359,44 @@ async function withFileLock<T>(lockPath: string, fn: () => Promise<T>): Promise<
   while (handle === undefined) {
     try {
       handle = await open(lockPath, "wx");
+      await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`);
+      // Two waiters can both judge a lock stale and race rm/open; the loser's rm
+      // can unlink the winner's fresh lock. Confirm the path still carries our
+      // pid; if not, we lost the race and must retry.
+      const owner = lockHolderPid(await readFile(lockPath, "utf8").catch(() => ""));
+      if (owner !== process.pid) {
+        await handle.close().catch(() => undefined);
+        handle = undefined;
+        await sleep(LOCK_RETRY_MS);
+        continue;
+      }
     } catch (error) {
       if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
-      if (Date.now() >= deadline) {
+      // Reclaim only locks whose recorded holder is provably gone (or whose
+      // content is unreadable and stale by mtime); never steal from a live holder.
+      if (await lockIsStale(lockPath)) {
         await rm(lockPath, { force: true }).catch(() => undefined);
         continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for run lock ${lockPath}; the lock is held by a live process. Retry later or remove the file if the holder is wedged.`);
       }
       await sleep(LOCK_RETRY_MS);
     }
   }
   try {
-    await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`);
     return await fn();
   } finally {
     await handle.close().catch(() => undefined);
-    await rm(lockPath, { force: true }).catch(() => undefined);
+    // Release only if we still own the lock; a reclaimed lock may now belong
+    // to another process and must not be deleted out from under it.
+    try {
+      if (lockHolderPid(await readFile(lockPath, "utf8")) === process.pid) {
+        await rm(lockPath, { force: true });
+      }
+    } catch {
+      // Lock already released or unreadable; leave it alone.
+    }
   }
 }
 

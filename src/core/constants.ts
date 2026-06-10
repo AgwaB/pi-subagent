@@ -36,7 +36,22 @@ export type WorktreePolicy = (typeof WORKTREE_POLICIES)[number];
 export type OnCompleteAction = (typeof ON_COMPLETE_ACTIONS)[number];
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-export type SandboxInput = true;
+export interface SandboxOptionsInput {
+  /**
+   * Network domains the sandboxed child process may reach (e.g. "api.anthropic.com",
+   * "*.npmjs.org"). The whole child Pi runs inside the sandbox boundary, so the model
+   * provider endpoint must be listed here for model-backed runs to work. Omitted or
+   * empty means no network access (deny-all), matching `sandbox: true`.
+   */
+  allowedDomains?: string[];
+}
+
+export type SandboxInput = true | SandboxOptionsInput;
+
+export function sandboxAllowedDomains(sandbox: SandboxInput | null | undefined): string[] {
+  if (sandbox === undefined || sandbox === null || sandbox === true) return [];
+  return sandbox.allowedDomains ?? [];
+}
 
 export interface WorkspaceInput {
   mode?: WorkspaceMode;
@@ -59,6 +74,7 @@ export interface SubagentTaskInput {
   systemPrompt?: string;
   skills?: string[];
   extensions?: string[];
+  captureToolCalls?: boolean;
 }
 
 export interface ResolveInput {
@@ -87,6 +103,7 @@ export interface ResolveInput {
   systemPrompt?: string;
   skills?: string[];
   extensions?: string[];
+  captureToolCalls?: boolean;
   runsDir?: string;
   correlationId?: string;
 }

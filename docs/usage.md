@@ -196,6 +196,7 @@ Interrupt a process-backed run:
 | `extensions` | Explicit Pi extensions to load for headless/tmux child Pi. Ambient extensions remain disabled. Inline backend rejects this option. |
 | `runsDir` | Safe relative artifact root under `cwd`; default `.pi/agent/runs`. |
 | `correlationId` | Optional external trace label, e.g. a workflow run id. It has no scheduling or aggregation semantics. |
+| `captureToolCalls` | Optional redacted debug telemetry for child tool calls. Defaults to `false`; when `true`, supported live event backends write completed tool call summaries as artifacts without full args/results or update streams. |
 
 ## Sandbox
 
@@ -209,10 +210,35 @@ Interrupt a process-backed run:
 
 Rules:
 
-- `sandbox: true` enables sandboxing. `false`, `null`, or omission disables it.
+- `sandbox: true` enables sandboxing with **no network access** (deny-all). `false`, `null`, or omission disables sandboxing.
+- `sandbox: { allowedDomains: [...] }` enables sandboxing with explicit network egress.
 - Process-backed workers (`headless`, `tmux`) can be sandboxed.
 - `inline + sandbox` fails validation because an in-process SDK worker cannot provide per-worker OS sandboxing.
 - The public API intentionally does not expose sandbox engine selection yet.
+
+### Sandbox network policy
+
+The whole child Pi process runs inside the sandbox boundary, so the model API call itself needs network access. A sandboxed model-backed run must therefore allow its provider endpoint explicitly:
+
+```json
+{
+  "sandbox": { "allowedDomains": ["api.anthropic.com"] },
+  "agent": "implementer",
+  "task": "Make the requested local change and run the checks."
+}
+```
+
+Rules:
+
+- Domains are bare hostnames (`api.anthropic.com`) or `*.example.com`-style wildcards. Protocols, paths, ports, and broad wildcards such as `*.com` are rejected.
+- `deniedDomains` is not exposed; the policy is allow-only.
+- `sandbox: true` keeps deny-all network. Use it for offline work: running local checks, formatting, builds against vendored dependencies.
+- The effective `allowedDomains` are recorded in the result envelope (`result.sandbox.allowedDomains`) for audit.
+
+Guidance:
+
+- The caller decides per run, following least privilege: list the model provider endpoint the child will use, plus any extra domains the task itself needs (for example `github.com` or `*.npmjs.org` for installs).
+- Do not sandbox open-ended research tasks; the domains they need cannot be enumerated in advance, and headless workers cannot prompt for approval. Use an unsandboxed worker with worktree isolation instead (filesystem safety without network limits).
 
 ## Workspaces and worktrees
 
@@ -242,7 +268,9 @@ Advanced forms:
 { "worktreePolicy": "required" }
 ```
 
-Parallel runs use worktrees by default. Non-git workspaces cannot create git worktrees and fail safely when worktree isolation is required.
+The default workspace is `shared` for both single and parallel runs, so fanout works in any directory, including non-git workspaces. Parallel fanout is usually read-only (reviews, analysis); when parallel tasks mutate files, request worktree isolation explicitly so tasks do not write into the same checkout concurrently.
+
+Explicit isolation requests (`worktree: true`, `workspace: "worktree"`, `worktreePolicy: "required"`) are never silently downgraded: in a non-git cwd they fail with a validation error instead of falling back to shared. Note that shared-workspace runs do not produce `worktree-status`/`worktree-diff` artifacts, so mutating tasks lose change-evidence capture without worktree isolation.
 
 Worktree cleanup is managed:
 
@@ -252,6 +280,14 @@ failed/cancelled -> capture status/diff artifacts, keep the worktree for debuggi
 ```
 
 Worktree evidence is recorded in `result.json` under `workspace.worktreeCleanupStatus`, `workspace.worktreeStatusPath`, and `workspace.worktreeDiffPath`.
+
+Kept worktrees (from failed or cancelled runs) live in `.pi-subagent-worktrees/` **next to** the repository root, not inside it, and are never pruned automatically. To clean up after debugging:
+
+```bash
+git worktree list                      # inspect registered worktrees
+rm -rf ../.pi-subagent-worktrees/<dir> # remove the kept checkout
+git worktree prune                     # clear stale registrations
+```
 
 ## Backend selection
 
@@ -330,7 +366,7 @@ Timeout notes:
 
 - `timeoutMs` on a run is the worker execution deadline. If omitted, pi-subagent does not impose a run timeout.
 - `action:"wait"` uses `timeoutMs` as a polling deadline and defaults to 60 seconds.
-- `onComplete:"notify"` uses an internal completion monitor with a long safety window; it does not kill the worker. Orchestrators that need a 4h or other SLA should pass `timeoutMs` explicitly on the run.
+- `onComplete:"notify"` uses an internal completion monitor with a long safety window (up to 24h when no `timeoutMs` is set); it does not kill the worker. The monitor polls in the parent process and has no cancellation handle, so long-lived SDK embeddings should prefer `onComplete:"detach"` plus explicit `action:"status"`/`"wait"` polling. Orchestrators that need a 4h or other SLA should pass `timeoutMs` explicitly on the run.
 
 ## Artifacts
 

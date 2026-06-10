@@ -46,9 +46,11 @@ interface PanelSnapshot {
 }
 
 interface PanelTheme {
-  fg?: (color: string, text: string) => string;
-  bg?: (color: string, text: string) => string;
-  bold?: (text: string) => string;
+  // Method signatures are intentionally used so the host Theme (with a narrower
+  // ThemeColor union) remains assignable under bivariant method checks.
+  fg?(color: string, text: string): string;
+  bg?(color: string, text: string): string;
+  bold?(text: string): string;
 }
 
 interface PanelTui {

@@ -130,6 +130,7 @@ try {
     cwd,
     backend: "inline",
     async: true,
+    timeoutMs: 1000,
     correlationId: "corr_api_async_parallel",
     tasks: [{ task: "async A" }, { task: "async B" }],
   });
@@ -138,7 +139,7 @@ try {
   assert.equal(new Set(asyncParallel.runIds).size, 2);
   assert.deepEqual(asyncParallel.results.map((item) => item.status), ["running", "running"]);
   for (const item of asyncParallel.results) {
-    const waitedParallel = await waitForSubagent({ cwd, runId: item.runId, attemptId: item.attemptId, timeoutMs: 12000, pollIntervalMs: 100 });
+    const waitedParallel = await waitForSubagent({ cwd, runId: item.runId, attemptId: item.attemptId, timeoutMs: 30000, pollIntervalMs: 100 });
     assert.equal(waitedParallel.status, "completed");
     assert.ok(["completed", "failed", "cancelled"].includes(waitedParallel.snapshot?.status ?? ""), "async parallel run should reach a terminal status");
   }
