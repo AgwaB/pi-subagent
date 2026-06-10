@@ -402,6 +402,9 @@ The panel shows all/completed/failed filters, run/attempt details, workspace/art
 In this source checkout:
 
 ```bash
+npm install --legacy-peer-deps   # peer deps (pi-coding-agent) are required for typecheck
+npm run check                    # typecheck + static checks
+npm run check:all                # plus model-backed integration checks (needs model auth)
 npm run validate
 npm pack --dry-run --json
 ```

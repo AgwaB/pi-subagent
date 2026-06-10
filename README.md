@@ -27,7 +27,7 @@ For local development, add this package as a Pi extension source and reload Pi.
 Use it when you want Pi to spin up a separate worker instead of doing everything in the parent session:
 
 ```text
-Run three isolated reviewers in parallel for this change.
+Run three reviewers in parallel for this change.
 ```
 
 ```text
