@@ -192,8 +192,8 @@ Interrupt a process-backed run:
 | `agentScope` | Restrict agent lookup to `auto`, `global`, or `project`. |
 | `confirmProjectAgents` | Set `false` to skip the project-agent confirmation prompt for trusted repositories. |
 | `systemPrompt` | Full system prompt override. When provided, it wins over any agent file prompt; named-agent frontmatter such as `tools`, `model`, and `thinking` may still apply. |
-| `skills` | Explicit Pi skills to load for headless/tmux child Pi. Ambient skills remain disabled. Inline backend rejects this option. |
-| `extensions` | Explicit Pi extensions to load for headless/tmux child Pi. Ambient extensions remain disabled. Inline backend rejects this option. |
+| `skills` | Additional Pi skill paths to load in the child. Omit to use normal ambient discovery; pass `[]` to disable child skills. |
+| `extensions` | Additional Pi extension paths to load in the child. Omit to use normal ambient discovery; pass `[]` to disable child extensions. |
 | `runsDir` | Safe relative artifact root under `cwd`; default `.pi/agent/runs`. |
 | `correlationId` | Optional external trace label, e.g. a workflow run id. It has no scheduling or aggregation semantics. |
 | `captureToolCalls` | Optional redacted debug telemetry for child tool calls. Defaults to `false`; when `true`, supported live event backends write completed tool call summaries as artifacts without full args/results or update streams. |
@@ -300,6 +300,8 @@ Backend is optional. When omitted, the engine uses auto-selection:
 | normal `agent`/`task` | `inline` |
 
 Supported explicit backend values are `auto`, `inline`, `headless`, and `tmux`. Most users should omit `backend`. Use `visible: true` only when you want a tmux-backed visible worker.
+
+Child sessions load Pi's normal ambient extensions and skills by default, so package tools such as web access are available when enabled in Pi settings. Pass `extensions: []` or `skills: []` for a hermetic child. Recursive subagent spawning is blocked by excluding the `subagent` tool from child sessions.
 
 ## Agent definitions
 

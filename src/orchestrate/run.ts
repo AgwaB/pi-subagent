@@ -11,7 +11,7 @@ import {
   type ProcessMetadata,
   type ResultEnvelope,
 } from "../artifacts/index.ts";
-import type { ResolveInput, ResolvedBackend, SubagentTaskInput } from "../core/constants.ts";
+import type { ResolveInput, SubagentTaskInput } from "../core/constants.ts";
 import { resolveBackend } from "../core/resolver.ts";
 import { runHeadlessModel } from "../runners/headless-model.ts";
 import { runInlineModel } from "../runners/inline.ts";
@@ -79,13 +79,6 @@ function toolListLabel(tools: readonly string[] | undefined): string {
   return tools === undefined ? "(unspecified)" : tools.length === 0 ? "(none)" : tools.join(", ");
 }
 
-export function validateBackendResourceSupport(input: ResolveInput, backend: ResolvedBackend): void {
-  if (backend !== "inline") return;
-  if ((input.skills?.length ?? 0) > 0 || (input.extensions?.length ?? 0) > 0) {
-    throw new SubagentToolAuthorityError("inline backend does not support child Pi skills/extensions; use headless or tmux for explicit skills/extensions.");
-  }
-}
-
 function resolveEffectiveTools(input: ResolveInput, agentDefinition: AgentDefinition | undefined): string[] | undefined {
   if (agentDefinition === undefined) return input.tools;
   if (input.tools === undefined) return agentDefinition.tools;
@@ -106,7 +99,6 @@ export async function runSubagentTask(options: RunSubagentTaskOptions): Promise<
   if (resolved.status === "failed") throw new Error(resolved.error);
 
   const backend = resolved.backend;
-  validateBackendResourceSupport(input, backend);
   const runId = options.runId ?? createRunId();
   const attemptId = options.attemptId ?? createAttemptId();
   const baseCwd = resolve(input.cwd ?? options.cwd);

@@ -35,12 +35,31 @@ export interface RunInlineModelOptions {
   agentDefinition?: AgentDefinition;
 }
 
+interface ResourceLoaderLike {
+  reload(options?: unknown): Promise<void>;
+}
+
+interface DefaultResourceLoaderOptionsLike {
+  cwd: string;
+  agentDir: string;
+  additionalExtensionPaths?: string[];
+  additionalSkillPaths?: string[];
+  noExtensions?: boolean;
+  noSkills?: boolean;
+  noPromptTemplates?: boolean;
+  noThemes?: boolean;
+  noContextFiles?: boolean;
+  systemPromptOverride?: (base: string | undefined) => string | undefined;
+  appendSystemPromptOverride?: (base: string[]) => string[];
+}
+
 interface PiSdkModule {
   AuthStorage: { create(): unknown };
   ModelRegistry: { create(authStorage: unknown): ModelRegistryLike };
   SessionManager: { inMemory(cwd?: string): unknown };
+  DefaultResourceLoader: new (options: DefaultResourceLoaderOptionsLike) => ResourceLoaderLike;
+  getAgentDir: () => string;
   createAgentSession(options: Record<string, unknown>): Promise<{ session: AgentSessionLike; diagnostics?: unknown[] }>;
-  createExtensionRuntime?: () => unknown;
 }
 
 interface ModelLike {
@@ -207,8 +226,7 @@ function buildPrompt(options: RunInlineModelOptions): string {
   return sections.filter((section): section is string => section !== undefined).join("\n\n");
 }
 
-function createChildResourceLoader(piSdk: PiSdkModule, options: RunInlineModelOptions) {
-  const extensionRuntime = piSdk.createExtensionRuntime?.();
+function createChildResourceLoader(piSdk: PiSdkModule, options: RunInlineModelOptions, cwd: string): ResourceLoaderLike {
   const baseSystemPrompt = [
     `You are the Pi subagent named ${JSON.stringify(options.agent)}.`,
     "Child profile: inline SDK worker. Recursive subagent spawning is disabled. Use only the explicitly enabled local tools if needed.",
@@ -223,17 +241,19 @@ function createChildResourceLoader(piSdk: PiSdkModule, options: RunInlineModelOp
       ? agentSystemPrompt
       : `${baseSystemPrompt}\n\n${agentSystemPrompt}`;
 
-  return {
-    getExtensions: () => ({ extensions: [], errors: [], runtime: extensionRuntime }),
-    getSkills: () => ({ skills: [], diagnostics: [] }),
-    getPrompts: () => ({ prompts: [], diagnostics: [] }),
-    getThemes: () => ({ themes: [], diagnostics: [] }),
-    getAgentsFiles: () => ({ agentsFiles: [] }),
-    getSystemPrompt: () => systemPrompt,
-    getAppendSystemPrompt: () => [],
-    extendResources: () => {},
-    reload: async () => {},
-  };
+  return new piSdk.DefaultResourceLoader({
+    cwd,
+    agentDir: piSdk.getAgentDir(),
+    additionalExtensionPaths: options.extensions?.length ? options.extensions : undefined,
+    additionalSkillPaths: options.skills?.length ? options.skills : undefined,
+    noExtensions: options.extensions !== undefined && options.extensions.length === 0,
+    noSkills: options.skills !== undefined && options.skills.length === 0,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    systemPromptOverride: () => systemPrompt,
+    appendSystemPromptOverride: () => [],
+  });
 }
 
 async function promptWithStops(session: AgentSessionLike, prompt: string, timeoutMs: number | undefined, signal: AbortSignal | undefined): Promise<FailureKind | null> {
@@ -291,7 +311,7 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
     const authStorage = piSdk.AuthStorage.create();
     const modelRegistry = piSdk.ModelRegistry.create(authStorage);
     const sessionManager = piSdk.SessionManager.inMemory(cwd);
-    const resourceLoader = createChildResourceLoader(piSdk, options);
+    const resourceLoader = createChildResourceLoader(piSdk, options, cwd);
     await resourceLoader.reload();
     const requestedModel = options.model ?? options.agentDefinition?.model;
     const requestedThinking = options.thinking ?? options.agentDefinition?.thinking;
@@ -305,6 +325,7 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
       modelRegistry,
       sessionManager,
       resourceLoader,
+      excludeTools: ["subagent"],
       ...(tools === undefined ? {} : { tools }),
       ...(model === undefined ? {} : { model }),
       ...(requestedThinking === undefined && modelThinking === undefined ? {} : { thinkingLevel: requestedThinking ?? modelThinking }),

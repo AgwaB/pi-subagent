@@ -15,7 +15,7 @@ import {
 } from "../artifacts/index.ts";
 import type { ExecutionMode, ResolveInput, ResolvedBackend, SubagentTaskInput } from "../core/constants.ts";
 import { resolveBackend } from "../core/resolver.ts";
-import { DEFAULT_PARALLEL_CONCURRENCY, MAX_PARALLEL_CONCURRENCY, MAX_PARALLEL_TASKS, SubagentToolAuthorityError, validateBackendResourceSupport, type ParallelRunResult } from "./run.ts";
+import { DEFAULT_PARALLEL_CONCURRENCY, MAX_PARALLEL_CONCURRENCY, MAX_PARALLEL_TASKS, SubagentToolAuthorityError, type ParallelRunResult } from "./run.ts";
 import { readRunResult, waitForRun } from "./status.ts";
 
 export interface StartAsyncSubagentRunOptions {
@@ -98,7 +98,6 @@ export async function startAsyncParallelSubagentRuns(input: ResolveInput, cwd: s
       const taskInput = mergeTaskInput(input, input.tasks![index]);
       const resolved = resolveBackend(taskInput);
       if (resolved.status === "failed") throw new SubagentToolAuthorityError(resolved.error);
-      validateBackendResourceSupport(taskInput, resolved.backend);
       results[index] = await startAsyncSubagentRun({ input: taskInput, cwd: taskInput.cwd ?? cwd, backend: resolved.backend, signal, onComplete });
     }
   }
@@ -116,7 +115,6 @@ export async function startAsyncSubagentRun(options: StartAsyncSubagentRunOption
   if (mode === "parallel") {
     throw new SubagentToolAuthorityError("startAsyncSubagentRun handles one run; use startAsyncParallelSubagentRuns for parallel inputs.");
   }
-  validateBackendResourceSupport(input, options.backend);
   const dependency = input.asyncDependency ?? "unclassified";
   const store = await createAttemptArtifactStore({ cwd: options.cwd, runId, attemptId, runsDir: input.runsDir });
   const payloadPath = store.pathFor("worker");

@@ -260,8 +260,8 @@ export function buildPiArgv(options: RunHeadlessModelOptions): readonly [string,
     "--print",
     "--no-session",
     "--no-context-files",
-    "--no-extensions",
-    "--no-skills",
+    "--exclude-tools",
+    "subagent",
   ];
   const model = options.model ?? options.agentDefinition?.model;
   const thinking = options.thinking ?? options.agentDefinition?.thinking;
@@ -277,8 +277,10 @@ export function buildPiArgv(options: RunHeadlessModelOptions): readonly [string,
   if (thinking !== undefined) argv.push("--thinking", thinking);
   if (tools !== undefined && tools.length > 0) argv.push("--tools", tools.join(","));
   else if (tools !== undefined) argv.push("--no-tools");
-  for (const skill of options.skills ?? []) argv.push("--skill", skill);
-  for (const extension of options.extensions ?? []) argv.push("--extension", extension);
+  if (options.skills !== undefined && options.skills.length === 0) argv.push("--no-skills");
+  else for (const skill of options.skills ?? []) argv.push("--skill", skill);
+  if (options.extensions !== undefined && options.extensions.length === 0) argv.push("--no-extensions");
+  else for (const extension of options.extensions ?? []) argv.push("--extension", extension);
   argv.push(buildPrompt(options));
   return argv as [string, ...string[]];
 }

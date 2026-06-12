@@ -36,6 +36,9 @@ Always mention injected-agent-ok.
   assert.match(buildAgentSystemPrompt(agent), /SMOKE_AGENT_PROMPT_MARKER/);
 
   const argv = buildPiArgv({ agent: "review.security", task: "check injection", cwd, agentDefinition: agent });
+  assert.deepEqual(argv.slice(argv.indexOf("--exclude-tools"), argv.indexOf("--exclude-tools") + 2), ["--exclude-tools", "subagent"]);
+  assert.equal(argv.includes("--no-extensions"), false, "ambient extensions should be loaded by default");
+  assert.equal(argv.includes("--no-skills"), false, "ambient skills should be loaded by default");
   const appendIndex = argv.indexOf("--append-system-prompt");
   assert.ok(appendIndex > 0, "agent system prompt should be appended");
   assert.match(argv[appendIndex + 1], /SMOKE_AGENT_PROMPT_MARKER/);
@@ -80,7 +83,13 @@ OPEN_AGENT_PROMPT_MARKER
   assert.deepEqual(explicitPromptArgv.slice(explicitPromptArgv.indexOf("--system-prompt"), explicitPromptArgv.indexOf("--system-prompt") + 2), ["--system-prompt", "COMPILED_SYSTEM_PROMPT"]);
   assert.deepEqual(explicitPromptArgv.slice(explicitPromptArgv.indexOf("--skill"), explicitPromptArgv.indexOf("--skill") + 2), ["--skill", "/tmp/skill"]);
   assert.deepEqual(explicitPromptArgv.slice(explicitPromptArgv.indexOf("--extension"), explicitPromptArgv.indexOf("--extension") + 2), ["--extension", "/tmp/ext.ts"]);
+  assert.equal(explicitPromptArgv.includes("--no-skills"), false);
+  assert.equal(explicitPromptArgv.includes("--no-extensions"), false);
   assert.match(explicitPromptArgv.at(-1), /^raw task prompt$/);
+
+  const hermeticArgv = buildPiArgv({ agent: "review.security", task: "hermetic child", cwd, agentDefinition: agent, skills: [], extensions: [] });
+  assert.equal(hermeticArgv.includes("--no-skills"), true, "skills: [] should disable child skills");
+  assert.equal(hermeticArgv.includes("--no-extensions"), true, "extensions: [] should disable child extensions");
 
   await assert.rejects(
     () => runSubagent({ cwd, backend: "inline", agent: "review.security", agentScope: "project", confirmProjectAgents: false, task: "check expansion", tools: ["read", "write"] }),

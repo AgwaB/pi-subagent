@@ -31,11 +31,6 @@ try {
     (error) => error instanceof SubagentValidationError && error.failureKind === "validation" && /agent\/task input/.test(error.message),
   );
 
-  await assert.rejects(
-    () => runSubagent({ backend: "inline", task: "inline resources", skills: ["explicit-skill"] }),
-    (error) => error instanceof SubagentValidationError && error.failureKind === "validation" && /inline backend does not support/.test(error.message),
-  );
-
   cwd = await mkdtemp(join(tmpdir(), "pi-subagent-api-check-"));
   const runId = "run_api_check";
   const attemptId = "attempt_api_check";
