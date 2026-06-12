@@ -69,11 +69,11 @@ function agentRequests(input: ResolveInput): AgentRequest[] {
         agent: task.agent,
         cwd: task.cwd,
         agentScope: task.agentScope ?? input.agentScope,
-        confirmProjectAgents: task.confirmProjectAgents ?? input.confirmProjectAgents,
+        confirmProjectAgents: task.confirmProjectAgents ?? input.confirmProjectAgents ?? false,
       }));
   }
   return typeof input.agent === "string" && input.agent.length > 0
-    ? [{ agent: input.agent, cwd: input.cwd, agentScope: input.agentScope, confirmProjectAgents: input.confirmProjectAgents }]
+    ? [{ agent: input.agent, cwd: input.cwd, agentScope: input.agentScope, confirmProjectAgents: input.confirmProjectAgents ?? false }]
     : [];
 }
 

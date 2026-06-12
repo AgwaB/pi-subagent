@@ -89,7 +89,7 @@ await reconcileSubagentRun({ cwd: process.cwd(), runId: run.runId });
 
 The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import internal files such as `src/orchestrate/*` because only documented package subpaths are public.
 
-Project-local agents are repository-controlled. The code API has no interactive prompt, so project-local agents require explicit opt-in with `confirmProjectAgents:false` for trusted repositories.
+Project-local agents are repository-controlled. Project-local agent confirmation is disabled by default; use trusted repositories or constrain lookup with `agentScope:"global"`. The code API has no interactive prompt, so setting `confirmProjectAgents:true` rejects project-local agents instead of prompting.
 
 ## Single run
 
@@ -190,7 +190,7 @@ Interrupt a process-backed run:
 | `tools` | Tool allowlist. With a named agent this may only narrow agent-declared tools; it cannot expand authority. For agentless runs it sets the full tool allowlist. |
 | `roleContext` | Add one-off role instructions without creating an agent file. |
 | `agentScope` | Restrict agent lookup to `auto`, `global`, or `project`. |
-| `confirmProjectAgents` | Set `false` to skip the project-agent confirmation prompt for trusted repositories. |
+| `confirmProjectAgents` | Defaults to `false`. Set `true` to require project-agent confirmation in interactive tool calls; code API calls with `true` reject project-local agents because they cannot prompt. |
 | `systemPrompt` | Full system prompt override. When provided, it wins over any agent file prompt; named-agent frontmatter such as `tools`, `model`, and `thinking` may still apply. |
 | `skills` | Additional Pi skill paths to load in the child. Omit to use normal ambient discovery; pass `[]` to disable child skills. |
 | `extensions` | Additional Pi extension paths to load in the child. Omit to use normal ambient discovery; pass `[]` to disable child extensions. |
@@ -335,7 +335,7 @@ Use `agentScope` to constrain lookup:
 auto | global | project
 ```
 
-Project-local agents are repository-controlled. In interactive Pi sessions, the engine asks for confirmation before using them unless `confirmProjectAgents:false` is set.
+Project-local agents are repository-controlled. The engine uses them without prompting by default; set `confirmProjectAgents:true` in interactive Pi sessions to require confirmation, or use `agentScope:"global"` to avoid project-local agents entirely.
 
 ## Model controls
 
