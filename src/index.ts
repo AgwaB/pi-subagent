@@ -183,6 +183,18 @@ function getCwd(ctx: unknown): string {
   return process.cwd();
 }
 
+function parentSessionIdFromCtx(ctx: unknown): string | undefined {
+  if (!isRecord(ctx)) return undefined;
+  const sessionManager = ctx.sessionManager;
+  if (!isRecord(sessionManager) || typeof sessionManager.getSessionId !== "function") return undefined;
+  try {
+    const id = (sessionManager.getSessionId as () => unknown)();
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function textResult(payload: unknown, isError: boolean, details?: unknown): ToolResult {
   return {
     content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
@@ -596,6 +608,9 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 
         const validation = validateResolveInput(params);
         if (!validation.ok) return validationFailure(validation.failure);
+
+        const parentSessionId = parentSessionIdFromCtx(ctx);
+        if (parentSessionId !== undefined) validation.input.parentSessionId = parentSessionId;
 
         const resolved = resolveBackend(validation.input);
         if (resolved.status === "failed") return validationFailure(resolved);

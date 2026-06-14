@@ -106,6 +106,8 @@ export interface ResolveInput {
   captureToolCalls?: boolean;
   runsDir?: string;
   correlationId?: string;
+  /** Pi session id of the parent that launched this run. Injected from ctx, not a model-settable tool arg. */
+  parentSessionId?: string;
 }
 
 export interface ResolveSuccess {

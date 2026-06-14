@@ -1,6 +1,6 @@
 {
   "name": "@agwab/pi-subagent",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Minimal subagent runtime for Pi.",
   "type": "module",
   "private": false,
@@ -41,6 +41,8 @@
     "check:resolver": "node ./test/checks/resolver.mjs",
     "check:api": "node ./test/checks/api.mjs",
     "check:artifacts": "node ./test/checks/artifacts.mjs",
+    "check:parent-session": "node ./test/checks/parent-session.mjs",
+    "check:panel-session-scope": "node ./test/checks/panel-session-scope.mjs",
     "check:contracts": "node ./test/checks/contracts.mjs",
     "check:agents": "node ./test/checks/agents.mjs",
     "check:no-chain": "node ./test/checks/no-chain.mjs",
@@ -59,7 +61,7 @@
     "release:check": "node ./scripts/release-check.mjs",
     "check": "npm run check:static",
     "check:types": "tsc -p tsconfig.json",
-    "check:static": "npm run check:types && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:schema-sync && npm run check:run-lock && npm run check:reconcile && npm run check:headless-streaming",
+    "check:static": "npm run check:types && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:parent-session && npm run check:panel-session-scope && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:schema-sync && npm run check:run-lock && npm run check:reconcile && npm run check:headless-streaming",
     "check:integration": "npm run check:model:inline && npm run check:model:headless && npm run check:model:tmux"
   },
   "dependencies": {

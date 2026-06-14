@@ -387,6 +387,8 @@ Runs write durable evidence under:
         └── output.log
 ```
 
+`run.json` records a `parentSessionId` field: the Pi session id of the session that launched the run, injected from the tool context (not a model-settable argument). Consumers (e.g. status panels) can use it to scope a shared per-`cwd` runs directory to the session that owns each run. The field is omitted when no session id is available, and older records simply lack it.
+
 Older `schemaVersion: 1` artifacts under `<run-id>/<task-id>/` are still readable for compatibility.
 
 Tool responses return compact status and artifact references rather than raw logs.

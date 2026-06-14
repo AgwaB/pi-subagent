@@ -65,6 +65,8 @@ export interface RunRecord {
   schemaVersion: typeof RUN_RECORD_SCHEMA_VERSION;
   runId: string;
   correlationId?: string;
+  /** Pi session id of the parent session that launched this run. */
+  parentSessionId?: string;
   mode: ExecutionMode;
   status: Status;
   failureKind: FailureKind | null;
@@ -125,6 +127,7 @@ export interface BeginRunOptions extends RunRef {
   startedAt?: Date | string;
   dependency?: AsyncDependency | null;
   correlationId?: string;
+  parentSessionId?: string;
   activeAttemptId?: string | null;
   attempts?: Array<Pick<RunAttemptRecord, "attemptId"> & Partial<RunAttemptRecord>>;
   /** @deprecated ignored for v2 writes. */
@@ -457,6 +460,7 @@ export async function beginRunRecord(options: BeginRunOptions): Promise<RunRecor
           schemaVersion: RUN_RECORD_SCHEMA_VERSION,
           runId: options.runId,
           ...(options.correlationId === undefined ? {} : { correlationId: options.correlationId }),
+          ...(options.parentSessionId === undefined ? {} : { parentSessionId: options.parentSessionId }),
           mode: options.mode,
           status: attempts.length > 0 ? aggregate.status : "pending",
           failureKind: attempts.length > 0 ? aggregate.failureKind : null,
@@ -474,6 +478,7 @@ export async function beginRunRecord(options: BeginRunOptions): Promise<RunRecor
       : {
           ...existing,
           ...(options.correlationId === undefined ? {} : { correlationId: options.correlationId }),
+          ...(existing.parentSessionId === undefined && options.parentSessionId !== undefined ? { parentSessionId: options.parentSessionId } : {}),
           mode: existing.mode ?? options.mode,
           backend: existing.backend ?? options.backend,
           dependency: existing.dependency ?? options.dependency ?? null,

@@ -52,6 +52,7 @@ function mergeTaskInput(parent: ResolveInput, task: SubagentTaskInput): ResolveI
     asyncDependency: parent.asyncDependency,
     runsDir: parent.runsDir,
     correlationId: parent.correlationId,
+    parentSessionId: parent.parentSessionId,
   };
 }
 
@@ -147,6 +148,7 @@ export async function startAsyncSubagentRun(options: StartAsyncSubagentRunOption
     startedAt,
     dependency,
     correlationId: input.correlationId,
+    parentSessionId: input.parentSessionId,
     activeAttemptId: attemptId,
     attempts: [{ attemptId, status: "running", backend: options.backend, startedAt: startedAt.toISOString(), artifactCwd: options.cwd, resultPath: running.artifacts.find((artifact) => artifact.type === "result")?.path }],
   });

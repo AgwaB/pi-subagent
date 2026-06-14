@@ -59,6 +59,7 @@ function mergeTaskInput(parent: ResolveInput, task: SubagentTaskInput): ResolveI
     asyncDependency: undefined,
     runsDir: parent.runsDir,
     correlationId: parent.correlationId,
+    parentSessionId: parent.parentSessionId,
   };
 }
 
@@ -116,6 +117,7 @@ export async function runSubagentTask(options: RunSubagentTaskOptions): Promise<
     startedAt,
     dependency: input.asyncDependency ?? null,
     correlationId: input.correlationId,
+    parentSessionId: input.parentSessionId,
     activeAttemptId: attemptId,
     attempts: [{ attemptId, status: "running", backend, startedAt: startedAt.toISOString() }],
   });
