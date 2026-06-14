@@ -22,6 +22,31 @@ function renderText(component, width = 120) {
   return stripAnsi(component.render(width).join("\n"));
 }
 
+// Independent display-width oracle: wide East Asian / fullwidth / emoji code
+// points occupy 2 terminal columns. Mirrors how the host TUI validates lines.
+function displayWidth(text) {
+  let width = 0;
+  for (const ch of stripAnsi(text)) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) continue;
+    const wide =
+      (cp >= 0x1100 && cp <= 0x115f) ||
+      (cp >= 0x2e80 && cp <= 0x303e) ||
+      (cp >= 0x3041 && cp <= 0x33ff) ||
+      (cp >= 0x3400 && cp <= 0x4dbf) ||
+      (cp >= 0x4e00 && cp <= 0x9fff) ||
+      (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) ||
+      (cp >= 0xfe30 && cp <= 0xfe6f) ||
+      (cp >= 0xff00 && cp <= 0xff60) ||
+      (cp >= 0xffe0 && cp <= 0xffe6) ||
+      (cp >= 0x1f300 && cp <= 0x1faff) ||
+      (cp >= 0x20000 && cp <= 0x3fffd);
+    width += wide ? 2 : 1;
+  }
+  return width;
+}
+
 async function waitFor(predicate, label) {
   const deadline = Date.now() + 2_000;
   let last;
@@ -195,6 +220,25 @@ async function main() {
     assert.doesNotMatch(text, /\binline\b|\bheadless\b|\btmux\b/, "backend labels should stay hidden in the panel");
     assert.doesNotMatch(text, /follow/, "follow toggle should not appear");
 
+    // Regression: CJK / wide-character content must not overflow the terminal
+    // width. Code-unit length under-counts wide chars, so a narrow terminal
+    // would otherwise emit a line wider than `width` and crash the host TUI.
+    const cjkLog = "지금 터미널 current folder에는 기존 큰 세션 하나만 보이고, Telegram의 최근 세션들은 root-level에만 있어서 안 보이는 상황입니다. 复制不是硬链接 🚀🚀🚀";
+    await writeRun(cwd, "run_cjk", "attempt-1", { status: "running", backend: "headless", log: cjkLog, completedAt: null });
+    component.handleInput("r");
+    await waitFor(() => renderText(component).includes("run_cjk"), "cjk run appears");
+    // The panel enforces a hard minimum render width of 48 columns, so only
+    // widths at/above that floor are exercised here.
+    for (const renderWidth of [48, 72, 120, 200, 272]) {
+      const rawLines = component.render(renderWidth);
+      for (const rawLine of rawLines) {
+        assert.ok(
+          displayWidth(rawLine) <= renderWidth,
+          `rendered line exceeds width ${renderWidth}: ${displayWidth(rawLine)} cols`,
+        );
+      }
+    }
+
     const beforeEnter = renderText(component);
     component.handleInput("\r");
     assert.equal(renderText(component), beforeEnter, "enter should be a no-op");
@@ -249,6 +293,7 @@ async function main() {
             "non-tui guard",
             "empty state",
             "full panel render",
+            "wide-character lines never exceed terminal width",
             "structured detail sections and always-visible logs",
             "run selection",
             "run-list scrolling",

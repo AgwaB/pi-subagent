@@ -78,8 +78,68 @@ function bold(theme: PanelTheme, text: string): string {
 
 const ANSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
 
+// Terminal display width of a single Unicode code point, in columns.
+// Wide East Asian / fullwidth / emoji code points occupy 2 columns; combining
+// marks and control characters occupy 0. This must stay aligned with how the
+// host TUI measures lines, otherwise CJK-heavy text under-counts and overflows
+// the terminal width (which crashes the renderer).
+function charWidth(cp: number): number {
+  // C0/C1 control characters render with no horizontal advance here.
+  if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
+  // Zero-width and combining ranges.
+  if (
+    cp === 0x200b || // zero width space
+    (cp >= 0x0300 && cp <= 0x036f) || // combining diacritical marks
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe00 && cp <= 0xfe0f) || // variation selectors
+    (cp >= 0xfe20 && cp <= 0xfe2f)
+  ) {
+    return 0;
+  }
+  // Wide (2-column) ranges.
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+    cp === 0x2329 ||
+    cp === 0x232a ||
+    (cp >= 0x2e80 && cp <= 0x303e) || // CJK radicals, Kangxi, punctuation
+    (cp >= 0x3041 && cp <= 0x33ff) || // Hiragana..CJK compatibility
+    (cp >= 0x3400 && cp <= 0x4dbf) || // CJK ext A
+    (cp >= 0x4e00 && cp <= 0x9fff) || // CJK unified
+    (cp >= 0xa000 && cp <= 0xa4cf) || // Yi
+    (cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
+    (cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
+    (cp >= 0xfe10 && cp <= 0xfe19) || // vertical forms
+    (cp >= 0xfe30 && cp <= 0xfe6f) || // CJK compatibility forms
+    (cp >= 0xff00 && cp <= 0xff60) || // fullwidth forms
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1faff) || // emoji & pictographs
+    (cp >= 0x20000 && cp <= 0x3fffd) // CJK ext B+
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
+// Measure the visible terminal width of a string, ignoring ANSI escapes and
+// accounting for wide characters.
 function visibleLength(text: string): number {
-  return text.replace(ANSI_PATTERN, "").length;
+  let width = 0;
+  for (let index = 0; index < text.length; ) {
+    if (text.charCodeAt(index) === 0x1b) {
+      ANSI_PATTERN.lastIndex = index;
+      const match = ANSI_PATTERN.exec(text);
+      if (match && match.index === index) {
+        index = ANSI_PATTERN.lastIndex;
+        continue;
+      }
+    }
+    const cp = text.codePointAt(index) ?? 0;
+    width += charWidth(cp);
+    index += cp > 0xffff ? 2 : 1;
+  }
+  return width;
 }
 
 function clip(text: string, width: number): string {
@@ -89,7 +149,7 @@ function clip(text: string, width: number): string {
 
   let output = "";
   let visible = 0;
-  for (let index = 0; index < text.length && visible < width - 1; ) {
+  for (let index = 0; index < text.length; ) {
     if (text.charCodeAt(index) === 0x1b) {
       ANSI_PATTERN.lastIndex = index;
       const match = ANSI_PATTERN.exec(text);
@@ -99,9 +159,13 @@ function clip(text: string, width: number): string {
         continue;
       }
     }
-    output += text[index];
-    visible += 1;
-    index += 1;
+    const cp = text.codePointAt(index) ?? 0;
+    const w = charWidth(cp);
+    // Reserve one column for the ellipsis.
+    if (visible + w > width - 1) break;
+    output += String.fromCodePoint(cp);
+    visible += w;
+    index += cp > 0xffff ? 2 : 1;
   }
   return `${output}…`;
 }
