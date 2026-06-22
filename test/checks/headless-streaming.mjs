@@ -197,6 +197,76 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		"valid-final-output",
 	);
 
+	const recoveredContextPi = join(tempRoot, "fake-pi-recovered-context.mjs");
+	await writeFile(
+		recoveredContextPi,
+		`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ type: "error", error: { message: "context_length_exceeded: compacted and retrying" } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "recovered-final-output" }], provider: "fake", model: "fake/model", stopReason: "stop" } }) + "\\n");
+`,
+		"utf8",
+	);
+	await chmod(recoveredContextPi, 0o700);
+
+	const recoveredContext = await runHeadlessModel({
+		cwd,
+		runId: "run_check_headless_recovered_context",
+		attemptId: "attempt-recovered-context",
+		piCommand: recoveredContextPi,
+		agent: "stream-worker",
+		task: "recover from context overflow before final output",
+		timeoutMs: 30_000,
+	});
+	assert.equal(recoveredContext.status, "completed");
+	assert.equal(recoveredContext.failureKind, null);
+	assert.equal(recoveredContext.metadata.contextLengthExceeded, false);
+	assert.equal(recoveredContext.metadata.contextOverflowRecovered, true);
+	assert.deepEqual(recoveredContext.metadata.streamErrors, [
+		"context_length_exceeded: compacted and retrying",
+	]);
+	assert.deepEqual(recoveredContext.metadata.nonFatalStreamErrors, [
+		"context_length_exceeded: compacted and retrying",
+	]);
+	assert.deepEqual(recoveredContext.metadata.recoveredStreamErrors, [
+		"context_length_exceeded: compacted and retrying",
+	]);
+	assert.equal(
+		await readFile(
+			join(cwd, artifactByType(recoveredContext, "output").path),
+			"utf8",
+		),
+		"recovered-final-output",
+	);
+
+	const terminalContextPi = join(tempRoot, "fake-pi-terminal-context.mjs");
+	await writeFile(
+		terminalContextPi,
+		`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ type: "error", error: { message: "context_length_exceeded: cannot continue" } }) + "\\n");
+`,
+		"utf8",
+	);
+	await chmod(terminalContextPi, 0o700);
+
+	const terminalContext = await runHeadlessModel({
+		cwd,
+		runId: "run_check_headless_terminal_context",
+		attemptId: "attempt-terminal-context",
+		piCommand: terminalContextPi,
+		agent: "stream-worker",
+		task: "fail after unrecovered context overflow",
+		timeoutMs: 30_000,
+	});
+	assert.equal(terminalContext.status, "failed");
+	assert.equal(terminalContext.failureKind, "model");
+	assert.equal(terminalContext.metadata.contextLengthExceeded, true);
+	assert.equal(terminalContext.metadata.contextOverflowRecovered, undefined);
+	assert.deepEqual(terminalContext.metadata.streamErrors, [
+		"context_length_exceeded: cannot continue",
+	]);
+	assert.equal(terminalContext.metadata.nonFatalStreamErrors, undefined);
+	assert.equal(terminalContext.metadata.recoveredStreamErrors, undefined);
+
 	const fatalErrorPi = join(tempRoot, "fake-pi-fatal-error.mjs");
 	await writeFile(
 		fatalErrorPi,

@@ -79,6 +79,13 @@ export interface PiJsonParseResult {
 	metadata: Partial<ResultMetadata>;
 }
 
+export interface ContextLengthResolution {
+	rawContextLengthExceeded: boolean;
+	contextLengthExceeded: boolean;
+	contextOverflowRecovered: boolean;
+	recoveredStreamErrors: string[];
+}
+
 const CONTEXT_LENGTH_ERROR_PATTERN =
 	/\bcontext[_ -]?length[_ -]?exceeded\b|\bcontext[_ -]?window[_ -]?(?:exceeded|overflow|exhausted)\b|\b(?:maximum|max)[_ -]?context[_ -]?length\b|\btoo many tokens\b|\b(?:prompt|input|request)[^\n]{0,80}\btoo large\b|\bcontext_length_exceeded\b/i;
 
@@ -92,6 +99,32 @@ export function detectContextLengthExceeded(signals: {
 		)
 		.join("\n");
 	return CONTEXT_LENGTH_ERROR_PATTERN.test(text);
+}
+
+export function resolveContextLengthState(
+	parsed: PiJsonParseResult,
+	rawContextLengthExceeded: boolean,
+): ContextLengthResolution {
+	const contextOverflowRecovered =
+		rawContextLengthExceeded && finalAssistantSucceeded(parsed);
+	return {
+		rawContextLengthExceeded,
+		contextLengthExceeded:
+			rawContextLengthExceeded && !contextOverflowRecovered,
+		contextOverflowRecovered,
+		recoveredStreamErrors: contextOverflowRecovered
+			? parsed.errors.filter((error) =>
+					detectContextLengthExceeded({ errors: [error] }),
+				)
+			: [],
+	};
+}
+
+function finalAssistantSucceeded(parsed: PiJsonParseResult): boolean {
+	return (
+		parsed.finalAssistantText.length > 0 &&
+		parsed.metadata.stopReason !== "error"
+	);
 }
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
@@ -390,18 +423,29 @@ export function resolvePiJsonOutcome(
 
 export function resultMetadataFromParse(
 	parsed: PiJsonParseResult,
-	contextLengthExceeded: boolean,
+	contextLength: ContextLengthResolution,
 	outcome: ProcessOutcome,
 ): Partial<ResultMetadata> {
 	return {
 		...parsed.metadata,
-		contextLengthExceeded,
+		contextLengthExceeded: contextLength.contextLengthExceeded,
+		...(contextLength.contextOverflowRecovered
+			? { contextOverflowRecovered: true }
+			: {}),
 		...(parsed.errors.length === 0
 			? {}
 			: { streamErrors: parsed.errors.slice(0, MAX_METADATA_ERRORS) }),
 		...(outcome.status === "completed" && parsed.errors.length > 0
 			? { nonFatalStreamErrors: parsed.errors.slice(0, MAX_METADATA_ERRORS) }
 			: {}),
+		...(contextLength.recoveredStreamErrors.length === 0
+			? {}
+			: {
+					recoveredStreamErrors: contextLength.recoveredStreamErrors.slice(
+						0,
+						MAX_METADATA_ERRORS,
+					),
+				}),
 		...(parsed.parseErrors.length === 0
 			? {}
 			: { parseErrors: parsed.parseErrors.slice(0, MAX_METADATA_ERRORS) }),
@@ -774,14 +818,18 @@ export async function runHeadlessModel(
 		stderrText,
 		stderrContextLengthExceeded,
 	} = processResult;
-	const contextLengthExceeded =
+	const rawContextLengthExceeded =
 		stderrContextLengthExceeded ||
 		detectContextLengthExceeded({ stderrText, errors: parsed.errors });
+	const contextLength = resolveContextLengthState(
+		parsed,
+		rawContextLengthExceeded,
+	);
 
 	const outcome = resolvePiJsonOutcome(
 		processOutcome,
 		parsed,
-		contextLengthExceeded,
+		contextLength.contextLengthExceeded,
 	);
 
 	const completedAt = new Date();
@@ -811,7 +859,7 @@ export async function runHeadlessModel(
 		artifacts,
 		correlationId: options.correlationId,
 		metadata: {
-			...resultMetadataFromParse(parsed, contextLengthExceeded, outcome),
+			...resultMetadataFromParse(parsed, contextLength, outcome),
 			...sessionMetadata,
 			...(options.parentSessionId === undefined
 				? {}

@@ -80,6 +80,7 @@ export interface ResultSessionMetadata {
 
 export interface ResultMetadata {
 	contextLengthExceeded: boolean;
+	contextOverflowRecovered?: boolean;
 	provider?: string;
 	model?: string;
 	usage?: unknown;
@@ -89,6 +90,7 @@ export interface ResultMetadata {
 	session?: ResultSessionMetadata;
 	streamErrors?: string[];
 	nonFatalStreamErrors?: string[];
+	recoveredStreamErrors?: string[];
 	parseErrors?: string[];
 }
 
@@ -199,6 +201,9 @@ function normalizeMetadata(input: ResultEnvelopeInput): ResultMetadata {
 	const metadata = input.metadata ?? {};
 	return {
 		contextLengthExceeded: metadata.contextLengthExceeded ?? false,
+		...(metadata.contextOverflowRecovered === undefined
+			? {}
+			: { contextOverflowRecovered: metadata.contextOverflowRecovered }),
 		...(metadata.provider === undefined ? {} : { provider: metadata.provider }),
 		...(metadata.model === undefined ? {} : { model: metadata.model }),
 		...(metadata.usage === undefined ? {} : { usage: metadata.usage }),
@@ -218,6 +223,9 @@ function normalizeMetadata(input: ResultEnvelopeInput): ResultMetadata {
 		...(metadata.nonFatalStreamErrors === undefined
 			? {}
 			: { nonFatalStreamErrors: metadata.nonFatalStreamErrors }),
+		...(metadata.recoveredStreamErrors === undefined
+			? {}
+			: { recoveredStreamErrors: metadata.recoveredStreamErrors }),
 		...(metadata.parseErrors === undefined
 			? {}
 			: { parseErrors: metadata.parseErrors }),

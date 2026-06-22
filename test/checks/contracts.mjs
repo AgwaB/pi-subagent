@@ -281,6 +281,8 @@ const sandboxedResult = createResultEnvelope({
 	artifacts: [],
 	metadata: {
 		contextLengthExceeded: false,
+		contextOverflowRecovered: true,
+		recoveredStreamErrors: ["context_length_exceeded: compacted"],
 		parentSessionId: "parent-contracts",
 		sessionId: "contract-session",
 		session: {
@@ -297,6 +299,10 @@ assert.deepEqual(sandboxedResult.metadata.session, {
 });
 assert.equal(sandboxedResult.metadata.parentSessionId, "parent-contracts");
 assert.equal(sandboxedResult.metadata.sessionId, "contract-session");
+assert.equal(sandboxedResult.metadata.contextOverflowRecovered, true);
+assert.deepEqual(sandboxedResult.metadata.recoveredStreamErrors, [
+	"context_length_exceeded: compacted",
+]);
 assert.deepEqual(sandboxedResult.sandbox, {
 	enabled: true,
 	allowedDomains: ["api.anthropic.com"],
