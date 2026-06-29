@@ -33,14 +33,14 @@ Every call has an `action`. The default is `run`, so omitting `action` starts a 
 | `action` | Purpose | Key parameters |
 |---|---|---|
 | `run` (default) | Start a new subagent run, or launch independent runs in parallel. | `agent`/`task` or `tasks`; plus `sandbox`, `worktree`, `model`, `async`, etc. |
-| `status` | Read a run's current state. | `runId`, optional `attemptId` |
-| `logs` | Read a run's captured logs. | `runId`, optional `attemptId` |
-| `wait` | Block until a run finishes. | `runId`, optional `timeoutMs`, `pollIntervalMs` |
-| `interrupt` | Signal a process-backed run. | `runId`, optional `attemptId`, `signal`, `escalateAfterMs`, `killAfterMs`, `reason` |
-| `mark-background` | Mark a run as not needed before the final answer. | `runId` |
-| `reconcile` | Re-read durable artifacts and repair stale/orphaned state when possible. | `runId` |
+| `status` | Read a run's current state. | `runId`, optional `cwd`, `attemptId` |
+| `logs` | Read a run's captured logs. | `runId`, optional `cwd`, `attemptId` |
+| `wait` | Block until a run finishes. | `runId`, optional `cwd`, `timeoutMs`, `pollIntervalMs` |
+| `interrupt` | Signal a process-backed run. | `runId`, optional `cwd`, `attemptId`, `signal`, `escalateAfterMs`, `killAfterMs`, `reason` |
+| `mark-background` | Mark a run as not needed before the final answer. | `runId`, optional `cwd` |
+| `reconcile` | Re-read durable artifacts and repair stale/orphaned state when possible. | `runId`, optional `cwd` |
 
-State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work.
+State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
 
 Model:
 
@@ -85,7 +85,7 @@ await interruptSubagent({ cwd: process.cwd(), runId: run.runId, reason: "caller 
 await reconcileSubagentRun({ cwd: process.cwd(), runId: run.runId });
 ```
 
-`runSubagent` accepts the same run options as the tool, plus an optional `signal`. Existing-run helpers accept `cwd`, `runId`, optional `attemptId`, and optional `runsDir`. The API is intentionally object-only and does not expose the lower-level runner internals.
+`runSubagent` accepts the same run options as the tool, plus an optional `signal`. Existing-run helpers accept `runId`, optional `cwd`, optional `attemptId`, and optional `runsDir`; when `cwd` is omitted they use the global locator index first and fall back to the current cwd for legacy records. The API is intentionally object-only and does not expose the lower-level runner internals.
 
 The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import internal files such as `src/orchestrate/*` because only documented package subpaths are public.
 
@@ -177,11 +177,21 @@ Interrupt a process-backed run:
 
 `interrupt` is conservative. It can signal runs with registered process metadata. Unsupported or already-terminal runs return explicit status rather than pretending cancellation succeeded.
 
+### Existing-run resolution
+
+For `status`, `logs`, `wait`, `interrupt`, `mark-background`, and `reconcile`, the lookup order is:
+
+1. Use the explicit `cwd`/`runsDir` when provided.
+2. Otherwise, check the current cwd's `.pi/agent/runs` for legacy/local records.
+3. Otherwise, resolve `runId` through the global locator index and read the pointed-to run directory.
+
+The locator index is only a pointer for finding runs across cwd boundaries. `run.json`, `events.jsonl`, and attempt `result.json` files remain the source of truth.
+
 ## Common run options
 
 | Option | Use |
 |---|---|
-| `cwd` | Run from a specific project directory. Existing-run actions also accept `cwd` to find that run registry. |
+| `cwd` | Run from a specific project directory. Existing-run actions accept `cwd` to force a registry location; if omitted, recent runs can be found by global locator and older runs fall back to the current cwd. |
 | `timeoutMs` | Limit worker execution time for `run`; limit polling duration for `action: "wait"`. Omit it for no runtime kill deadline; `wait` alone defaults to 60s polling. |
 | `visible` | Use a visible tmux-backed worker (`visible: true`). |
 | `concurrency` | Cap parallel run fan-out. |
@@ -247,8 +257,8 @@ There are three inputs for worktree isolation, in order of preference:
 | Input | When to use |
 |---|---|
 | `worktree` | Primary switch. `true` to isolate; or a string path for an explicit worktree location. |
-| `workspace` | Advanced. `"shared" | "worktree" | "auto"`, or `{ mode, path }` for an explicit path. |
-| `worktreePolicy` | Advanced. `"auto" | "required" | "never"` to force or forbid isolation. |
+| `workspace` | Advanced. `"shared" \| "worktree" \| "auto"`, or `{ mode, path }` for an explicit path. |
+| `worktreePolicy` | Advanced. `"auto" \| "required" \| "never"` to force or forbid isolation. |
 
 Most calls only need `worktree`:
 
@@ -389,6 +399,8 @@ Runs write durable evidence under:
 
 `run.json` records a `parentSessionId` field: the Pi session id of the session that launched the run, injected from the tool context (not a model-settable argument). Consumers (e.g. status panels) can use it to scope a shared per-`cwd` runs directory to the session that owns each run. The field is omitted when no session id is available, and older records simply lack it.
 
+Recent runs also write a small locator file under Pi's global subagent-run index. A locator contains the `runId`, absolute `cwd`, optional `runsDir`, optional `parentSessionId`, optional `correlationId`, and `updatedAt`. It is not authoritative evidence and can become stale if the pointed-to run directory is moved or deleted; use `run.json`, `events.jsonl`, and attempt `result.json` as the source of truth.
+
 Older `schemaVersion: 1` artifacts under `<run-id>/<task-id>/` are still readable for compatibility.
 
 Tool responses return compact status and artifact references rather than raw logs.
@@ -399,7 +411,17 @@ Tool responses return compact status and artifact references rather than raw log
 /subagent panel
 ```
 
-The panel shows all/completed/failed filters, run/attempt details, workspace/artifact paths, dependency metadata, event tail, and log tail. The panel is for human inspection; existing-run tool actions remain the programmatic interface.
+The panel shows run/attempt details, workspace/artifact paths, dependency metadata, event tail, and log tail. It has three scopes:
+
+- `session`: runs whose `run.json.parentSessionId` matches the current Pi session. This is the default when a session id is available.
+- `cwd`: runs under the current workspace's `.pi/agent/runs`, including legacy records that lack `parentSessionId`.
+- `all`: the global locator index plus current-cwd legacy records.
+
+Status filters are `all`, `running`, `completed`, and `failed`. The panel keeps a fixed-height layout, uses an internally scrollable detail pane, and never renders raw `parentSessionId` values.
+
+Stale or malformed locators are counted in the header and skipped. Active runs whose process metadata is dead and whose heartbeat/update timestamp is stale are rendered read-only as `failed` with failure `stale`; the panel does not mutate or delete records. Use `action:"reconcile"` to repair local registry state from durable artifacts when possible.
+
+The panel is for human inspection; existing-run tool actions remain the programmatic interface.
 
 ## Development validation
 

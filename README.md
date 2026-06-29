@@ -38,7 +38,6 @@ Run this check in a sandboxed worker and report the artifact paths.
 Start a background audit and let me inspect it in /subagent panel.
 ```
 
-
 ## What it does
 
 Tool: `subagent`
@@ -121,9 +120,11 @@ Existing run:
 { "action": "status", "runId": "run_..." }
 ```
 
+Recent runs can be addressed by `runId` even when they were launched from another cwd; legacy records still resolve from the explicit or current cwd.
+
 ### Panel
 
-Inspect runs, attempts, artifacts, and log tails in a live TUI.
+Inspect runs, attempts, artifacts, and log tails in a live TUI. The panel defaults to the current Pi session, can switch to current cwd or all indexed runs, and includes status filters plus a scrollable detail pane. It counts stale/malformed run pointers without exposing raw session ids.
 
 Open the run monitor:
 
@@ -147,4 +148,3 @@ const status = await getSubagentStatus({ runId: run.runId });
 ## Detailed docs
 
 - [`docs/usage.md`](./docs/usage.md) — full argument reference, code API, `action` behavior, backend selection, sandbox/worktree behavior, artifacts, and validation notes.
-

@@ -21,6 +21,7 @@ import {
 	resolveWorkspace,
 	type ResolvedWorkspace,
 } from "../workspace/worktree.ts";
+import { writeRunLocator } from "./run-ref.ts";
 
 export const DEFAULT_PARALLEL_CONCURRENCY = 4;
 export const MAX_PARALLEL_TASKS = 12;
@@ -150,6 +151,11 @@ export async function runSubagentTask(
 			},
 		],
 	});
+	await writeRunLocator({
+		...runRef,
+		parentSessionId: input.parentSessionId,
+		correlationId: input.correlationId,
+	}).catch(() => undefined);
 
 	try {
 		const workspace = await resolveWorkspace({
