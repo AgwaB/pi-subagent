@@ -754,7 +754,11 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 				return filtered.length > 0 ? filtered : null;
 			},
 			async handler(args, ctx) {
-				if (args.trim() !== "panel") {
+				const commandArgs = args.trim();
+				const normalizedArgs = commandArgs
+					.replace(/^\/?subagent\b\s*/, "")
+					.trim();
+				if (normalizedArgs !== "panel") {
 					ctx.ui.notify?.("Usage: /subagent panel", "warning");
 					return;
 				}

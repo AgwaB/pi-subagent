@@ -417,7 +417,7 @@ The panel shows run/attempt details, workspace/artifact paths, dependency metada
 - `cwd`: runs under the current workspace's `.pi/agent/runs`, including legacy records that lack `parentSessionId`.
 - `all`: the global locator index plus current-cwd legacy records.
 
-Status filters are `all`, `running`, `completed`, and `failed`. The panel keeps a fixed-height layout, uses an internally scrollable detail pane, and never renders raw `parentSessionId` values.
+Status filters are `all`, `running`, `completed`, and `failed`. In the `all` status view, the default list shows all active runs plus recent terminal runs only: 20 for `session`/`cwd`, 50 for `all`. The `completed` and `failed` filters use the same recent terminal cap; `running` is uncapped. The header reports `shown/total`, and when older matching runs are hidden, press `m` in the panel to show more; no separate command is needed. The panel keeps a fixed-height layout, uses an internally scrollable detail pane, and never renders raw `parentSessionId` values.
 
 Stale or malformed locators are counted in the header and skipped. Active runs whose process metadata is dead and whose heartbeat/update timestamp is stale are rendered read-only as `failed` with failure `stale`; the panel does not mutate or delete records. Use `action:"reconcile"` to repair local registry state from durable artifacts when possible.
 

@@ -12,7 +12,7 @@ function capture(command, args) {
   return spawnSync(command, args, { encoding: "utf8", shell: false });
 }
 
-const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
 if (pkg.private === true) {
   console.error("package.json has private:true; refusing release check.");
   process.exit(1);
@@ -43,7 +43,7 @@ if (versionView.status === 0 && versionView.stdout.trim() === pkg.version) {
   process.exit(1);
 }
 
-if (existsSync(new URL("../test", import.meta.url))) {
+if (existsSync(new URL("../../test", import.meta.url))) {
   run("npm", ["run", "check:scripts"]);
   run("npm", ["run", "check:static"]);
 } else {

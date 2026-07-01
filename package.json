@@ -37,7 +37,7 @@
     "image": "https://raw.githubusercontent.com/AgwaB/pi-subagent/main/assets/subagent-panel.png"
   },
   "scripts": {
-    "check:scripts": "for d in scripts test internal/scripts; do [ -d \"$d\" ] && find \"$d\" -name '*.mjs' -print; done | xargs -n1 node --check",
+    "check:scripts": "for d in scripts test; do [ -d \"$d\" ] && find \"$d\" -name '*.mjs' -print; done | xargs -n1 node --check",
     "check:resolver": "node ./test/checks/resolver.mjs",
     "check:api": "node ./test/checks/api.mjs",
     "check:artifacts": "node ./test/checks/artifacts.mjs",

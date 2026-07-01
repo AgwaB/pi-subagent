@@ -13,6 +13,8 @@ const STALE_RUN_AFTER_MS = 30_000;
 const PANEL_MIN_LINES = 12;
 const PANEL_MAX_LINES = 30;
 const PANEL_RESERVED_TUI_LINES = 8;
+const DEFAULT_RECENT_TERMINAL_LIMIT = 20;
+const ALL_SCOPE_RECENT_TERMINAL_LIMIT = 50;
 
 type ScopeFilter = "session" | "cwd" | "all";
 type StatusFilter = "all" | "running" | "completed" | "failed";
@@ -52,6 +54,7 @@ interface RunRow {
 interface PanelSnapshot {
 	runs: RunRow[];
 	totalRuns: number;
+	hiddenRuns: number;
 	loadedAt: Date;
 	staleLocators: number;
 	invalidLocators: number;
@@ -75,6 +78,7 @@ interface LoadOptions {
 	scope: ScopeFilter;
 	statusFilter: StatusFilter;
 	currentSessionId?: string;
+	showMorePages: number;
 }
 
 function isInsideOrEqual(parent: string, child: string): boolean {
@@ -757,6 +761,54 @@ function statusMatches(run: RunRow, filter: StatusFilter): boolean {
 	return run.status === "failed" || run.status === "cancelled";
 }
 
+function recentTerminalLimit(
+	scope: ScopeFilter,
+	showMorePages: number,
+): number {
+	const base =
+		scope === "all"
+			? ALL_SCOPE_RECENT_TERMINAL_LIMIT
+			: DEFAULT_RECENT_TERMINAL_LIMIT;
+	return base * Math.max(1, showMorePages + 1);
+}
+
+function compareRecentRuns(a: RunRow, b: RunRow): number {
+	return b.updatedMs - a.updatedMs || a.key.localeCompare(b.key);
+}
+
+function takeRecentRuns(runs: RunRow[], limit: number): RunRow[] {
+	if (runs.length <= limit) return runs;
+	const visibleKeys = new Set(
+		runs
+			.toSorted(compareRecentRuns)
+			.slice(0, limit)
+			.map((run) => run.key),
+	);
+	return runs.filter((run) => visibleKeys.has(run.key));
+}
+
+function limitRunsForPanel(
+	runs: RunRow[],
+	options: Pick<LoadOptions, "scope" | "statusFilter" | "showMorePages">,
+): { runs: RunRow[]; hiddenRuns: number } {
+	if (options.statusFilter === "running") return { runs, hiddenRuns: 0 };
+	const limit = recentTerminalLimit(options.scope, options.showMorePages);
+	if (options.statusFilter !== "all") {
+		const limited = takeRecentRuns(runs, limit);
+		return {
+			runs: limited,
+			hiddenRuns: Math.max(0, runs.length - limited.length),
+		};
+	}
+	const active = runs.filter((run) => isActive(run.status));
+	const terminal = runs.filter((run) => !isActive(run.status));
+	const limitedTerminal = takeRecentRuns(terminal, limit);
+	return {
+		runs: [...active, ...limitedTerminal],
+		hiddenRuns: Math.max(0, terminal.length - limitedTerminal.length),
+	};
+}
+
 async function loadRuns(options: LoadOptions): Promise<PanelSnapshot> {
 	const effectiveScope =
 		options.scope === "session" && options.currentSessionId === undefined
@@ -774,9 +826,11 @@ async function loadRuns(options: LoadOptions): Promise<PanelSnapshot> {
 	const filtered = allRuns.filter((run) =>
 		statusMatches(run, options.statusFilter),
 	);
+	const limited = limitRunsForPanel(filtered, options);
 	return {
-		runs: filtered,
-		totalRuns: allRuns.length,
+		runs: limited.runs,
+		totalRuns: filtered.length,
+		hiddenRuns: limited.hiddenRuns,
 		loadedAt: new Date(),
 		staleLocators: loaded.stale,
 		invalidLocators: loaded.invalid,
@@ -884,11 +938,13 @@ export class SubagentPanel implements Component {
 		runs: [],
 		totalRuns: 0,
 		loadedAt: new Date(),
+		hiddenRuns: 0,
 		staleLocators: 0,
 		invalidLocators: 0,
 		skippedLocators: 0,
 	};
 	private selectedRun = 0;
+	private showMorePages = 0;
 	private scope: ScopeFilter;
 	private statusFilter: StatusFilter = "all";
 	private focus: FocusGroup = "scope";
@@ -926,6 +982,13 @@ export class SubagentPanel implements Component {
 		}
 		if (data === "r") {
 			void this.refresh();
+			return;
+		}
+		if (data === "m") {
+			if (this.snapshot.hiddenRuns > 0) {
+				this.showMorePages += 1;
+				void this.refresh();
+			}
 			return;
 		}
 		if (isTabKey(data) || data === "shift+tab" || data === "\u001b[Z") {
@@ -988,13 +1051,7 @@ export class SubagentPanel implements Component {
 			);
 			for (let index = 1; index < bodyHeight; index += 1) lines.push("");
 			lines.push(style(this.theme, "border", border(safeWidth)));
-			lines.push(
-				style(
-					this.theme,
-					"dim",
-					"tab focus scope/status/detail · ←→ change · ↑↓/j/k select/scroll · r refresh · q/esc close",
-				),
-			);
+			lines.push(style(this.theme, "dim", this.footerHelp(false)));
 			return lines.slice(0, maxLines).map((line) => clip(line, safeWidth));
 		}
 
@@ -1021,13 +1078,7 @@ export class SubagentPanel implements Component {
 			);
 		}
 		lines.push(style(this.theme, "border", border(safeWidth)));
-		lines.push(
-			style(
-				this.theme,
-				"dim",
-				"tab focus scope/status/detail · ←→ change · ↑↓/j/k select/scroll · PgUp/PgDn detail · r refresh · q/esc close",
-			),
-		);
+		lines.push(style(this.theme, "dim", this.footerHelp(true)));
 		return lines.slice(0, maxLines).map((line) => clip(line, safeWidth));
 	}
 
@@ -1056,6 +1107,7 @@ export class SubagentPanel implements Component {
 				scope: this.scope,
 				statusFilter: this.statusFilter,
 				currentSessionId: this.currentSessionId,
+				showMorePages: this.showMorePages,
 			});
 			this.snapshot = snapshot;
 			const oldSelectedRun = this.selectedRun;
@@ -1092,7 +1144,14 @@ export class SubagentPanel implements Component {
 			return;
 		}
 		this.selectedRun = 0;
+		this.showMorePages = 0;
 		await this.refresh({ preserveSelection: false });
+	}
+
+	private footerHelp(withDetailKeys: boolean): string {
+		const detail = withDetailKeys ? " · PgUp/PgDn detail" : "";
+		const more = this.snapshot.hiddenRuns > 0 ? " · m show more" : "";
+		return `tab focus scope/status/detail · ←→ change · ↑↓/j/k select/scroll${detail} · r refresh${more} · q/esc close`;
 	}
 
 	private moveRun(delta: number): void {

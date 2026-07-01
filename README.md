@@ -124,7 +124,7 @@ Recent runs can be addressed by `runId` even when they were launched from anothe
 
 ### Panel
 
-Inspect runs, attempts, artifacts, and log tails in a live TUI. The panel defaults to the current Pi session, can switch to current cwd or all indexed runs, and includes status filters plus a scrollable detail pane. It counts stale/malformed run pointers without exposing raw session ids.
+Inspect runs, attempts, artifacts, and log tails in a live TUI. The panel defaults to the current Pi session, can switch to current cwd or all indexed runs, and includes status filters plus a scrollable detail pane. It shows active and recent terminal runs by default, with in-panel `m` to show more, and counts stale/malformed run pointers without exposing raw session ids.
 
 Open the run monitor:
 

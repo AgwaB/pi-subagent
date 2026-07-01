@@ -328,6 +328,17 @@ async function main() {
 		);
 		empty.component.handleInput("q");
 		assert.equal(empty.closeCount(), 1, "q should close empty panel");
+		const fullInvocation = await runCommand("/subagent panel");
+		assert.ok(
+			fullInvocation.component,
+			"full slash invocation should open the panel",
+		);
+		fullInvocation.component.handleInput("q");
+		assert.equal(
+			fullInvocation.closeCount(),
+			1,
+			"q should close full-invocation panel",
+		);
 
 		await writeRun(cwd, "run_active", "attempt-1", {
 			status: "running",
@@ -463,14 +474,14 @@ async function main() {
 		component.handleInput("up");
 		assert.match(
 			renderText(component),
-			/^▸ run_done/m,
-			"up on the first run should wrap to the last run",
+			/^▸ run_scroll_04/m,
+			"up on the first run should wrap to the last shown run",
 		);
 		component.handleInput("\u001b[B");
 		assert.match(
 			renderText(component),
 			/^▸ run_cjk/m,
-			"down on the last run should wrap to the first run",
+			"down on the last shown run should wrap to the first run",
 		);
 		component.handleInput("\u001b[B");
 		assert.match(
@@ -487,10 +498,45 @@ async function main() {
 			/run_active/,
 			"named up key should move run selection",
 		);
+		text = renderText(component);
+		assert.match(
+			text,
+			/23\/29 shown/,
+			"default all view should show all active runs plus 20 recent terminal runs",
+		);
+		assert.doesNotMatch(
+			text,
+			/run_failed/,
+			"older terminal runs should be hidden before show more even when failed",
+		);
+		assert.match(
+			text,
+			/m show more/,
+			"hidden older runs should expose in-panel show more action",
+		);
+		component.handleInput("m");
+		await waitFor(
+			() => /29\/29 shown/.test(renderText(component)),
+			"show more reveals all matching rows",
+		);
+		text = renderText(component);
+		assert.doesNotMatch(
+			text,
+			/m show more/,
+			"show more hint should hide when all matching rows are visible",
+		);
+		component.handleInput("up");
+		component.handleInput("up");
+		assert.match(
+			renderText(component),
+			/^▸ run_done/m,
+			"show more should include older terminal runs in navigation",
+		);
+		component.handleInput("\u001b[B");
 		component.handleInput("\u001b[1;2B");
 		assert.match(
 			renderText(component),
-			/run_queued/,
+			/run_active/,
 			"modified down sequence should move run selection",
 		);
 		for (let index = 0; index < 20; index += 1) component.handleInput("down");
@@ -720,6 +766,35 @@ async function main() {
 			text,
 			/skipped [12]/,
 			"malformed/skipped locator entries should be counted",
+		);
+		for (let index = 0; index < 30; index += 1) {
+			await writeIndexedRun(
+				indexDir,
+				otherCwd,
+				`run_all_cap_${String(index).padStart(2, "0")}`,
+				"attempt-1",
+				{
+					status: "completed",
+					backend: "headless",
+					log: `all scope cap ${index}`,
+				},
+			);
+		}
+		scoped.component.handleInput("r");
+		await waitFor(
+			() => /53\/63 shown/.test(renderText(scoped.component)),
+			"all scope should cap default terminal rows at 50",
+		);
+		text = renderText(scoped.component);
+		assert.match(
+			text,
+			/m show more/,
+			"all scope cap should expose show more when older runs are hidden",
+		);
+		scoped.component.handleInput("m");
+		await waitFor(
+			() => /63\/63 shown/.test(renderText(scoped.component)),
+			"all scope show more should reveal all hidden terminal rows",
 		);
 		scoped.component.handleInput("q");
 		assert.equal(scoped.closeCount(), 1, "q should close session-scoped panel");
