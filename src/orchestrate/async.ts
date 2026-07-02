@@ -67,6 +67,8 @@ function mergeTaskInput(
 		worktree: parent.worktree,
 		worktreePolicy: parent.worktreePolicy,
 		concurrency: undefined,
+		failFast: undefined,
+		cancelSiblingsOnFailure: undefined,
 		asyncDependency: parent.asyncDependency,
 		runsDir: parent.runsDir,
 		correlationId: parent.correlationId,
@@ -182,6 +184,10 @@ export async function startAsyncParallelSubagentRuns(
 		runIds: results.map((result) => result.runId),
 		results,
 		concurrency,
+		totalTasks: input.tasks.length,
+		startedCount: results.length,
+		skippedCount: 0,
+		failFastTriggered: false,
 	};
 }
 

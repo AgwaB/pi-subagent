@@ -45,6 +45,10 @@ export interface ParallelRunResult {
 	runIds: string[];
 	results: ResultEnvelope[];
 	concurrency: number;
+	totalTasks: number;
+	startedCount: number;
+	skippedCount: number;
+	failFastTriggered: boolean;
 }
 
 export class SubagentToolAuthorityError extends Error {
@@ -64,6 +68,8 @@ function mergeTaskInput(
 		worktree: parent.worktree,
 		worktreePolicy: parent.worktreePolicy,
 		concurrency: undefined,
+		failFast: undefined,
+		cancelSiblingsOnFailure: undefined,
 		asyncDependency: undefined,
 		runsDir: parent.runsDir,
 		correlationId: parent.correlationId,
@@ -325,29 +331,97 @@ export async function runParallelSubagentTasks(
 	const tasks = input.tasks;
 	const runCwd = resolve(input.cwd ?? cwd);
 	const concurrency = Math.min(parallelConcurrency(input), tasks.length);
-	const results: ResultEnvelope[] = new Array(tasks.length);
+	const resultSlots: Array<ResultEnvelope | undefined> = new Array(
+		tasks.length,
+	);
+	const failFast =
+		input.failFast === true || input.cancelSiblingsOnFailure === true;
+	const cancelSiblings = input.cancelSiblingsOnFailure === true;
+	const controller = cancelSiblings ? new AbortController() : undefined;
+	const childSignal = controller?.signal ?? signal;
 	let nextIndex = 0;
+	let startedCount = 0;
+	let stopScheduling = false;
+	let failFastTriggered = false;
+	let parentAbortTriggered = false;
+	let siblingCancelTriggered = false;
+	const workerErrors: unknown[] = [];
 
-	async function worker(): Promise<void> {
-		while (true) {
-			const index = nextIndex;
-			nextIndex += 1;
-			if (index >= tasks.length) return;
-			const taskInput = mergeTaskInput(input, tasks[index]!);
-			results[index] = await runSubagentTask({
-				input: taskInput,
-				cwd: runCwd,
-				signal,
-				taskIndex: index,
-			});
+	function triggerFailFast(): void {
+		if (!failFast) return;
+		failFastTriggered = true;
+		stopScheduling = true;
+		if (cancelSiblings && !controller?.signal.aborted) {
+			siblingCancelTriggered = true;
+			controller?.abort();
 		}
 	}
 
-	await Promise.all(Array.from({ length: concurrency }, () => worker()));
+	function onParentAbort(): void {
+		parentAbortTriggered = true;
+		controller?.abort();
+	}
+	if (controller !== undefined && signal !== undefined) {
+		if (signal.aborted) controller.abort();
+		else signal.addEventListener("abort", onParentAbort, { once: true });
+	}
+
+	async function worker(): Promise<void> {
+		while (true) {
+			if (stopScheduling) return;
+			const index = nextIndex;
+			nextIndex += 1;
+			if (index >= tasks.length) return;
+			startedCount += 1;
+			const taskInput = mergeTaskInput(input, tasks[index]!);
+			try {
+				const result = await runSubagentTask({
+					input: taskInput,
+					cwd: runCwd,
+					signal: childSignal,
+					taskIndex: index,
+				});
+				resultSlots[index] = result;
+				if (result.status !== "completed") triggerFailFast();
+			} catch (error) {
+				const siblingAbort =
+					controller?.signal.aborted === true &&
+					siblingCancelTriggered &&
+					!parentAbortTriggered;
+				triggerFailFast();
+				if (!failFast || !siblingAbort) throw error;
+				workerErrors.push(error);
+				return;
+			}
+		}
+	}
+
+	try {
+		const workers = await Promise.allSettled(
+			Array.from({ length: concurrency }, () => worker()),
+		);
+		const rejected = workers.find(
+			(workerResult): workerResult is PromiseRejectedResult =>
+				workerResult.status === "rejected",
+		);
+		if (rejected !== undefined) throw rejected.reason;
+		if (workerErrors.length > 0) failFastTriggered = true;
+	} finally {
+		if (controller !== undefined && signal !== undefined)
+			signal.removeEventListener("abort", onParentAbort);
+	}
+
+	const results = resultSlots.filter(
+		(result): result is ResultEnvelope => result !== undefined,
+	);
 	return {
 		mode: "parallel",
 		runIds: results.map((result) => result.runId),
 		results,
 		concurrency,
+		totalTasks: tasks.length,
+		startedCount,
+		skippedCount: Math.max(0, tasks.length - startedCount),
+		failFastTriggered,
 	};
 }

@@ -8,6 +8,7 @@ import {
   getSubagentStatus,
   interruptSubagent,
   reconcileSubagentRun,
+  recordSubagentChildEvent,
   runSubagent,
   SubagentValidationError,
   waitForSubagent,
@@ -23,6 +24,7 @@ assert.equal(typeof getSubagentLogs, "function");
 assert.equal(typeof waitForSubagent, "function");
 assert.equal(typeof interruptSubagent, "function");
 assert.equal(typeof reconcileSubagentRun, "function");
+assert.equal(typeof recordSubagentChildEvent, "function");
 
 let cwd;
 try {
@@ -50,12 +52,23 @@ try {
     artifacts: [output],
     metadata: { contextLengthExceeded: false },
   });
+  await recordSubagentChildEvent({
+    cwd,
+    runId,
+    event: "failed",
+    childRunId: "run_child_api",
+    childTaskId: "task-4",
+    failureKind: "model",
+    message: "child model failed",
+  });
 
   const status = await getSubagentStatus({ cwd, runId, attemptId });
   assert.equal(status?.status, "completed");
   assert.equal(status?.runId, runId);
   assert.equal(status?.attemptId, attemptId);
   assert.equal(status?.resultPath, result.artifacts.find((artifact) => artifact.type === "result")?.path);
+  assert.equal(status?.childSummary?.failed, 1);
+  assert.equal(status?.childSummary?.latestFailure?.childRunId, "run_child_api");
 
   const logs = await getSubagentLogs({ cwd, runId, attemptId });
   assert.equal(logs?.logText.output, "api-ok\n");

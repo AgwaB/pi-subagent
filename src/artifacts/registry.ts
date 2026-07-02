@@ -18,6 +18,11 @@ export type RunEventType =
   | "run.cancelled"
   | "run.interrupt_requested"
   | "run.mark_background"
+  | "child.started"
+  | "child.updated"
+  | "child.completed"
+  | "child.failed"
+  | "child.cancelled"
   | "attempt.started"
   | "attempt.process_started"
   | "attempt.heartbeat"
@@ -716,11 +721,11 @@ export async function readRunEvents(ref: RunRef, limit = 50): Promise<RunEvent[]
   const paths = runPaths(ref);
   try {
     const text = await readFile(paths.eventsPath, "utf8");
-    return text
+    const lines = text
       .split(/\r?\n/)
-      .filter(Boolean)
-      .slice(-limit)
-      .map((line) => JSON.parse(line) as RunEvent);
+      .filter(Boolean);
+    const selected = Number.isFinite(limit) ? lines.slice(-limit) : lines;
+    return selected.map((line) => JSON.parse(line) as RunEvent);
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return [];
     throw error;

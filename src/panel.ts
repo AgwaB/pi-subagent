@@ -2,9 +2,13 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Component } from "@earendil-works/pi-tui";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import type { ResultEnvelope } from "./artifacts/index.ts";
+import type { ResultEnvelope, RunEvent } from "./artifacts/index.ts";
 import type { Status } from "./core/constants.ts";
 import { listRunLocators, type RunRefLocator } from "./orchestrate/run-ref.ts";
+import {
+	summarizeChildEvents,
+	type RunChildSummary,
+} from "./orchestrate/status.ts";
 
 const DEFAULT_RUNS_DIR = ".pi/agent/runs";
 const LIVE_REFRESH_MS = 1_500;
@@ -48,6 +52,7 @@ interface RunRow {
 	completedAt: string | null;
 	dependency: string | null;
 	eventTail: string[];
+	childSummary?: RunChildSummary;
 	tasks: TaskRow[];
 }
 
@@ -319,6 +324,36 @@ function statusLabel(status: Status): string {
 	return status;
 }
 
+function childFailureCount(summary: RunChildSummary | undefined): number {
+	return (summary?.failed ?? 0) + (summary?.cancelled ?? 0);
+}
+
+function runHasFailure(run: Pick<RunRow, "status" | "childSummary">): boolean {
+	return (
+		run.status === "failed" ||
+		run.status === "cancelled" ||
+		childFailureCount(run.childSummary) > 0
+	);
+}
+
+function runStatusLabel(run: Pick<RunRow, "status" | "childSummary">): string {
+	const base = statusLabel(run.status);
+	return childFailureCount(run.childSummary) > 0 ? `${base}+child` : base;
+}
+
+function runStatusDetail(run: Pick<RunRow, "status" | "childSummary">): string {
+	const failures = childFailureCount(run.childSummary);
+	return failures > 0
+		? `${statusLabel(run.status)} (child failures: ${failures})`
+		: statusLabel(run.status);
+}
+
+function runStatusColor(run: Pick<RunRow, "status" | "childSummary">): string {
+	return childFailureCount(run.childSummary) > 0
+		? "error"
+		: statusColor(run.status);
+}
+
 function isActive(status: Status): boolean {
 	return status === "pending" || status === "running";
 }
@@ -412,6 +447,20 @@ function isRegistryRunRecord(value: unknown): value is RegistryRunRecord {
 		(Array.isArray((value as { attempts?: unknown }).attempts) ||
 			Array.isArray((value as { tasks?: unknown }).tasks))
 	);
+}
+
+function parseRunEvents(text: string): RunEvent[] {
+	return text
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.map((line) => {
+			try {
+				return JSON.parse(line) as RunEvent;
+			} catch {
+				return null;
+			}
+		})
+		.filter((event): event is RunEvent => event !== null);
 }
 
 async function readTextTail(
@@ -577,14 +626,17 @@ async function readRunFromRegistry(
 	loadTails: boolean,
 	currentSessionId?: string,
 ): Promise<RunRow | null> {
-	const eventsText = loadTails
-		? await readFile(join(runDir, "events.jsonl"), "utf8").catch(() => "")
-		: "";
-	const eventTail = eventsText
-		.split(/\r?\n/)
-		.map((line) => sanitizeRunText(line, currentSessionId))
-		.filter(Boolean)
-		.slice(-LOG_TAIL_LINES);
+	const eventsText = await readFile(join(runDir, "events.jsonl"), "utf8").catch(
+		() => "",
+	);
+	const eventTail = loadTails
+		? eventsText
+				.split(/\r?\n/)
+				.map((line) => sanitizeRunText(line, currentSessionId))
+				.filter(Boolean)
+				.slice(-LOG_TAIL_LINES)
+		: [];
+	const childSummary = summarizeChildEvents(parseRunEvents(eventsText));
 	const records = registry.attempts ?? registry.tasks ?? [];
 	const tasks = await Promise.all(
 		records.map((task) =>
@@ -609,6 +661,7 @@ async function readRunFromRegistry(
 		completedAt: registry.completedAt,
 		dependency: registry.dependency ?? null,
 		eventTail,
+		...(childSummary === undefined ? {} : { childSummary }),
 		tasks,
 	};
 }
@@ -670,6 +723,16 @@ async function loadRunsFromCwd(
 				.filter((entry) => entry.isDirectory() && entry.name !== "attempts")
 				.map((entry) => join(runDir, entry.name, "result.json")),
 		];
+		const eventsText = await readFile(
+			join(runDir, "events.jsonl"),
+			"utf8",
+		).catch(() => "");
+		const eventTail = eventsText
+			.split(/\r?\n/)
+			.map((line) => sanitizeRunText(line, options.currentSessionId))
+			.filter(Boolean)
+			.slice(-LOG_TAIL_LINES);
+		const childSummary = summarizeChildEvents(parseRunEvents(eventsText));
 		const tasks: TaskRow[] = [];
 		let updatedMs = 0;
 		for (const resultPath of candidates) {
@@ -708,7 +771,8 @@ async function loadRunsFromCwd(
 						.at(-1) ?? null)
 				: null,
 			dependency: null,
-			eventTail: [],
+			eventTail,
+			...(childSummary === undefined ? {} : { childSummary }),
 			tasks,
 		});
 	}
@@ -757,8 +821,9 @@ function statusMatches(run: RunRow, filter: StatusFilter): boolean {
 	if (filter === "all") return true;
 	if (filter === "running")
 		return run.status === "running" || run.status === "pending";
-	if (filter === "completed") return run.status === "completed";
-	return run.status === "failed" || run.status === "cancelled";
+	if (filter === "completed")
+		return run.status === "completed" && !runHasFailure(run);
+	return runHasFailure(run);
 }
 
 function recentTerminalLimit(
@@ -1028,8 +1093,8 @@ export class SubagentPanel implements Component {
 		const active = this.snapshot.runs.filter((run) =>
 			isActive(run.status),
 		).length;
-		const failed = this.snapshot.runs.filter(
-			(run) => run.status === "failed" || run.status === "cancelled",
+		const failed = this.snapshot.runs.filter((run) =>
+			runHasFailure(run),
 		).length;
 		const title = `${style(this.theme, "accent", "●")} ${bold(this.theme, "Subagents")}`;
 		const stale = this.snapshot.staleLocators + this.snapshot.invalidLocators;
@@ -1236,13 +1301,13 @@ export class SubagentPanel implements Component {
 					runIndex === this.selectedRun
 						? style(this.theme, "accent", "▸")
 						: " ";
-				const status = statusLabel(run.status);
+				const status = runStatusLabel(run);
 				const age = fmtAge(run.updatedMs);
 				const cwdLabel = showCwd
 					? ` · ${basename(run.sourceCwd) || run.sourceCwd}`
 					: "";
 				const fullMeta = `${age}${cwdLabel}`;
-				const statusWidth = Math.max(4, Math.min(9, status.length));
+				const statusWidth = Math.max(4, Math.min(13, status.length));
 				const fullIdWidth = visibleLength(run.runId);
 				let metaWidth = visibleLength(fullMeta);
 				let idWidth = width - statusWidth - metaWidth - 4;
@@ -1255,7 +1320,7 @@ export class SubagentPanel implements Component {
 				}
 				idWidth = Math.max(6, idWidth);
 				const meta = clip(fullMeta, metaWidth);
-				const line = `${marker} ${pad(clip(run.runId, idWidth), idWidth)} ${style(this.theme, statusColor(run.status), pad(status, statusWidth))} ${style(this.theme, "muted", meta)}`;
+				const line = `${marker} ${pad(clip(run.runId, idWidth), idWidth)} ${style(this.theme, runStatusColor(run), pad(status, statusWidth))} ${style(this.theme, "muted", meta)}`;
 				return clip(line, width);
 			});
 	}
@@ -1313,20 +1378,20 @@ export class SubagentPanel implements Component {
 
 		section("RUN");
 		field("Run ID", run.runId, "text");
-		field("Status", statusLabel(run.status), statusColor(run.status));
+		field("Status", runStatusDetail(run), runStatusColor(run));
 		field("Elapsed", fmtElapsed(run.startedAt, run.completedAt));
 		field("Updated", fmtAge(run.updatedMs));
 
-		section("WORKSPACE");
-		field("Registry", safeRelative(this.cwd, run.sourceCwd));
-		field("RunsDir", run.runsDir);
-		field("Attempt", safeRelative(this.cwd, task.workspace));
-		field(
-			"Worktree",
-			task.worktreePath === null
-				? "—"
-				: safeRelative(this.cwd, task.worktreePath),
-		);
+		if (run.childSummary !== undefined) {
+			const latest = run.childSummary.latestFailure;
+			field(
+				"Children",
+				latest === null
+					? `total ${run.childSummary.total} · running ${run.childSummary.running} · failed ${run.childSummary.failed}`
+					: `total ${run.childSummary.total} · failed ${run.childSummary.failed} · latest ${latest.childRunId}${latest.taskId ? `/${latest.taskId}` : ""}${latest.failureKind ? ` · ${latest.failureKind}` : ""}`,
+				childFailureCount(run.childSummary) > 0 ? "error" : "muted",
+			);
+		}
 
 		section("ATTEMPT");
 		field(
@@ -1340,7 +1405,7 @@ export class SubagentPanel implements Component {
 		);
 		field(
 			"Selected",
-			`${task.attemptId} · ${statusLabel(task.status)} · ${fmtElapsed(task.startedAt, task.completedAt)}${task.modelLabel ? ` · ${task.modelLabel}` : ""}`,
+			`${run.tasks.indexOf(task) + 1}/${run.tasks.length} · ${task.attemptId} · ${statusLabel(task.status)} · ${fmtElapsed(task.startedAt, task.completedAt)}${task.modelLabel ? ` · ${task.modelLabel}` : ""}`,
 			statusColor(task.status),
 		);
 		field("Started", task.startedAt);
@@ -1360,6 +1425,17 @@ export class SubagentPanel implements Component {
 
 		field("Result", task.resultPath);
 		field("Log", task.logPath ?? "—");
+
+		section("WORKSPACE");
+		field("Registry", safeRelative(this.cwd, run.sourceCwd));
+		field("RunsDir", run.runsDir);
+		field("Attempt", safeRelative(this.cwd, task.workspace));
+		field(
+			"Worktree",
+			task.worktreePath === null
+				? "—"
+				: safeRelative(this.cwd, task.worktreePath),
+		);
 
 		if (run.eventTail.length > 0) {
 			section("EVENTS");

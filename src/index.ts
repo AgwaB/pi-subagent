@@ -54,6 +54,8 @@ const SUPPORTED_KEYS = new Set([
 	"mode",
 	"tasks",
 	"concurrency",
+	"failFast",
+	"cancelSiblingsOnFailure",
 	"asyncDependency",
 	"workspace",
 	"worktree",
@@ -306,6 +308,8 @@ function subagentCallSummary(input: unknown): string {
 		if (task) pieces.push(task);
 		const asyncMode =
 			args.async === true ? "async" : displayText(args.onComplete, 16);
+		if (args.failFast === true || args.cancelSiblingsOnFailure === true)
+			pieces.push("fail-fast");
 		if (asyncMode) pieces.push(asyncMode);
 	} else {
 		const runId = displayText(args.runId, 28);
@@ -795,6 +799,18 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 					description: `Maximum parallel runs to launch at once. Default ${DEFAULT_PARALLEL_CONCURRENCY}.`,
 				}),
 			),
+			failFast: Type.Optional(
+				Type.Boolean({
+					description:
+						"For synchronous parallel runs, stop scheduling additional siblings after the first failed result.",
+				}),
+			),
+			cancelSiblingsOnFailure: Type.Optional(
+				Type.Boolean({
+					description:
+						"For synchronous parallel runs, abort already-running siblings after the first failed result. Implies fail-fast scheduling.",
+				}),
+			),
 			asyncDependency: Type.Optional(
 				Type.Union(
 					ASYNC_DEPENDENCIES.map((value) => Type.Literal(value)),
@@ -1007,7 +1023,8 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 					const runs = parallel.results.map((result) => compactResult(result));
 					const failed =
 						!asyncRequested &&
-						parallel.results.some((result) => result.status !== "completed");
+						(parallel.failFastTriggered ||
+							parallel.results.some((result) => result.status !== "completed"));
 					return textResult(
 						{
 							tool: TOOL_NAME,
@@ -1019,6 +1036,10 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 									: "completed",
 							runIds: parallel.runIds,
 							concurrencyLimit: parallel.concurrency,
+							totalTasks: parallel.totalTasks,
+							startedCount: parallel.startedCount,
+							skippedCount: parallel.skippedCount,
+							failFastTriggered: parallel.failFastTriggered,
 							runs,
 						},
 						failed,

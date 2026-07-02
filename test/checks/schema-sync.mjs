@@ -34,6 +34,8 @@ const probeValues = {
   mode: "single",
   tasks: [{ agent: "worker", task: "inspect" }],
   concurrency: 2,
+  failFast: true,
+  cancelSiblingsOnFailure: true,
   asyncDependency: "background",
   workspace: "shared",
   worktree: true,

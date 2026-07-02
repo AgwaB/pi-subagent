@@ -26,6 +26,7 @@ import { resolveRunRef } from "./run-ref.ts";
 const DEFAULT_RUNS_DIR = ".pi/agent/runs";
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 const EVENT_TAIL_LIMIT = 20;
+const CHILD_EVENT_SCAN_LIMIT = Number.POSITIVE_INFINITY;
 
 export interface RunStatusRef {
 	runId: string;
@@ -64,6 +65,28 @@ export type RunTaskStatusSnapshot = RunAttemptStatusSnapshot & {
 	taskId?: string;
 };
 
+export interface RunChildFailureSummary {
+	childRunId: string;
+	workflowRunId?: string;
+	taskId?: string;
+	status: Status;
+	failureKind: FailureKind | string | null;
+	message?: string;
+	timestamp: string;
+}
+
+export interface RunChildSummary {
+	total: number;
+	pending: number;
+	running: number;
+	completed: number;
+	failed: number;
+	cancelled: number;
+	activeChildRunIds: string[];
+	latestFailure: RunChildFailureSummary | null;
+	worstDescendantStatus: Status | null;
+}
+
 export interface RunStatusSnapshot {
 	runId: string;
 	attemptId: string;
@@ -85,6 +108,7 @@ export interface RunStatusSnapshot {
 	registryPath?: string;
 	eventsPath?: string;
 	eventTail?: RunEvent[];
+	childSummary?: RunChildSummary;
 	attempts?: RunAttemptStatusSnapshot[];
 	/** @deprecated v1 compatibility only. */
 	tasks?: RunTaskStatusSnapshot[];
@@ -232,6 +256,127 @@ export function statusFailedClosed(
 	);
 }
 
+function dataString(
+	data: Record<string, unknown> | undefined,
+	key: string,
+): string | undefined {
+	const value = data?.[key];
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function statusFromChildEvent(event: RunEvent): Status | undefined {
+	if (isStatus(event.status)) return event.status;
+	if (event.type === "child.started" || event.type === "child.updated")
+		return "running";
+	if (event.type === "child.completed") return "completed";
+	if (event.type === "child.failed") return "failed";
+	if (event.type === "child.cancelled") return "cancelled";
+	return undefined;
+}
+
+export function summarizeChildEvents(
+	events: readonly RunEvent[],
+): RunChildSummary | undefined {
+	const children = new Map<
+		string,
+		{
+			status: Status;
+			failureKind: FailureKind | string | null;
+			workflowRunId?: string;
+			taskId?: string;
+			message?: string;
+			timestamp: string;
+		}
+	>();
+	let latestFailure: RunChildFailureSummary | null = null;
+	let anonymous = 0;
+
+	for (const event of events) {
+		if (!event.type.startsWith("child.")) continue;
+		const status = statusFromChildEvent(event);
+		if (status === undefined) continue;
+		const data = event.data;
+		const childRunId =
+			dataString(data, "childRunId") ??
+			dataString(data, "childId") ??
+			dataString(data, "descendantRunId") ??
+			`anonymous-child-${anonymous++}`;
+		const failureKind = dataString(data, "failureKind") ?? null;
+		const child = {
+			status,
+			failureKind,
+			...(dataString(data, "workflowRunId") === undefined
+				? {}
+				: { workflowRunId: dataString(data, "workflowRunId") }),
+			...(dataString(data, "taskId") === undefined
+				? {}
+				: { taskId: dataString(data, "taskId") }),
+			...(event.message === undefined ? {} : { message: event.message }),
+			timestamp: event.timestamp,
+		};
+		children.set(childRunId, child);
+		if (status === "failed" || status === "cancelled") {
+			latestFailure = {
+				childRunId,
+				...(child.workflowRunId === undefined
+					? {}
+					: { workflowRunId: child.workflowRunId }),
+				...(child.taskId === undefined ? {} : { taskId: child.taskId }),
+				status,
+				failureKind,
+				...(event.message === undefined ? {} : { message: event.message }),
+				timestamp: event.timestamp,
+			};
+		}
+	}
+
+	if (children.size === 0) return undefined;
+	let pending = 0;
+	let running = 0;
+	let completed = 0;
+	let failed = 0;
+	let cancelled = 0;
+	const activeChildRunIds: string[] = [];
+	for (const [childRunId, child] of children) {
+		if (child.status === "pending") pending += 1;
+		else if (child.status === "running") running += 1;
+		else if (child.status === "completed") completed += 1;
+		else if (child.status === "failed") failed += 1;
+		else if (child.status === "cancelled") cancelled += 1;
+		if (child.status === "pending" || child.status === "running")
+			activeChildRunIds.push(childRunId);
+	}
+	return {
+		total: children.size,
+		pending,
+		running,
+		completed,
+		failed,
+		cancelled,
+		activeChildRunIds,
+		latestFailure,
+		worstDescendantStatus:
+			failed > 0
+				? "failed"
+				: cancelled > 0
+					? "cancelled"
+					: running > 0
+						? "running"
+						: pending > 0
+							? "pending"
+							: children.size > 0
+								? "completed"
+								: null,
+	};
+}
+
+function withChildSummary<T extends RunStatusSnapshot>(
+	snapshot: T,
+	childSummary: RunChildSummary | undefined,
+): T {
+	return childSummary === undefined ? snapshot : { ...snapshot, childSummary };
+}
+
 export function createRunStatusSnapshot(
 	result: ResultEnvelope,
 ): RunStatusSnapshot {
@@ -327,7 +472,6 @@ async function readResultFile(path: string): Promise<ResultEnvelope | null> {
 }
 
 async function readRunResultFromAttempt(
-	cwd: string,
 	attempt: RunAttemptRecord | undefined,
 ): Promise<ResultEnvelope | null> {
 	if (attempt?.resultPath === undefined || attempt.artifactCwd === undefined)
@@ -462,10 +606,7 @@ export async function readRunResult(
 	const resultFromRecord =
 		record === null
 			? null
-			: await readRunResultFromAttempt(
-					pathsFor(resolvedRef).cwd,
-					selectedAttempt(record, resolvedRef),
-				);
+			: await readRunResultFromAttempt(selectedAttempt(record, resolvedRef));
 	return resultFromRecord ?? (await readRunResultFallback(resolvedRef));
 }
 
@@ -474,19 +615,28 @@ export async function getRunStatus(
 ): Promise<RunStatusSnapshot | null> {
 	const resolvedRef = await resolveRunRef(ref);
 	const record = await readRunRecord(resolvedRef);
-	const events = await readRunEvents(resolvedRef, EVENT_TAIL_LIMIT).catch(
-		() => [],
-	);
+	const scannedEvents = await readRunEvents(
+		resolvedRef,
+		CHILD_EVENT_SCAN_LIMIT,
+	).catch(() => []);
+	const events = scannedEvents.slice(-EVENT_TAIL_LIMIT);
+	const childSummary = summarizeChildEvents(scannedEvents);
 	const result = await readRunResult(resolvedRef);
 	if (result !== null) {
 		const snapshot = createRunStatusSnapshot(result);
-		return record === null
-			? snapshot
-			: mergeRecordSnapshot(snapshot, record, resolvedRef, events);
+		return withChildSummary(
+			record === null
+				? snapshot
+				: mergeRecordSnapshot(snapshot, record, resolvedRef, events),
+			childSummary,
+		);
 	}
 	return record === null
 		? null
-		: snapshotFromRecord(record, resolvedRef, events);
+		: withChildSummary(
+				snapshotFromRecord(record, resolvedRef, events),
+				childSummary,
+			);
 }
 
 export async function getRunLogs(

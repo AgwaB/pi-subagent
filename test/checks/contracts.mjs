@@ -7,6 +7,7 @@ import {
 	isTerminalStatus,
 	statusFailedClosed,
 	statusSucceeded,
+	summarizeChildEvents,
 } from "../../src/orchestrate/index.ts";
 import {
 	detectContextLengthExceeded,
@@ -30,6 +31,8 @@ const plannedInput = {
 		{ agent: "contract-reader", task: "review schemas", timeoutMs: 1000 },
 	],
 	concurrency: 2,
+	failFast: true,
+	cancelSiblingsOnFailure: true,
 	asyncDependency: "needed-before-final",
 	visible: false,
 	sandbox: true,
@@ -56,6 +59,8 @@ assert.equal(validation.ok, true);
 assert.equal(validation.input.agent, plannedInput.agent);
 assert.equal(validation.input.tasks.length, 2);
 assert.equal(validation.input.concurrency, 2);
+assert.equal(validation.input.failFast, true);
+assert.equal(validation.input.cancelSiblingsOnFailure, true);
 assert.equal(validation.input.asyncDependency, "needed-before-final");
 assert.equal(validation.input.workspace.mode, "auto");
 assert.equal(validation.input.model, "kimi-coding/kimi-for-coding");
@@ -130,6 +135,14 @@ assert.match(
 	/tasks\[0\]\.sessionId must contain only letters/,
 );
 
+const badFailFastValidation = validateResolveInput({
+	agent: "worker",
+	task: "inspect",
+	failFast: "yes",
+});
+assert.equal(badFailFastValidation.ok, false);
+assert.match(badFailFastValidation.failure.error, /failFast must be a boolean/);
+
 const taskModelValidation = validateResolveInput({
 	mode: "parallel",
 	tasks: [
@@ -193,6 +206,28 @@ assert.equal(
 	}),
 	false,
 );
+
+const childSummary = summarizeChildEvents([
+	{
+		schemaVersion: 2,
+		timestamp: "2026-01-01T00:00:00.000Z",
+		type: "child.started",
+		runId: "run_parent",
+		status: "running",
+		data: { childRunId: "run_child" },
+	},
+	{
+		schemaVersion: 2,
+		timestamp: "2026-01-01T00:00:01.000Z",
+		type: "child.failed",
+		runId: "run_parent",
+		status: "failed",
+		data: { childRunId: "run_child", failureKind: "model" },
+	},
+]);
+assert.equal(childSummary?.total, 1);
+assert.equal(childSummary?.failed, 1);
+assert.equal(childSummary?.latestFailure?.childRunId, "run_child");
 
 // Sandbox object form: explicit per-run network egress (C-style caller control).
 const sandboxObject = validateResolveInput({

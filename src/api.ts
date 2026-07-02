@@ -1,10 +1,16 @@
 import { resolve } from "node:path";
 import { loadAgentByName, type AgentDefinition } from "./agents.ts";
-import type { ResultEnvelope } from "./artifacts/index.ts";
+import {
+	appendRunEvent,
+	type ResultEnvelope,
+	type RunEvent,
+} from "./artifacts/index.ts";
 import type {
 	ExecutionMode,
+	FailureKind,
 	ResolveInput,
 	ResolvedBackend,
+	Status,
 } from "./core/constants.ts";
 import { resolveBackend } from "./core/resolver.ts";
 import { validateResolveInput } from "./core/validation.ts";
@@ -22,6 +28,7 @@ import {
 	type ReconcileSubagentRunOptions as ReconcileRunOptions,
 	type ReconcileSubagentRunResult,
 } from "./orchestrate/reconcile.ts";
+import { resolveRunRef } from "./orchestrate/run-ref.ts";
 import {
 	runParallelSubagentTasks,
 	runSubagentTask,
@@ -49,6 +56,16 @@ export type GetSubagentLogsOptions = RunStatusRef;
 export type WaitForSubagentOptions = WaitForRunOptions;
 export type InterruptSubagentOptions = InterruptRunOptions;
 export type ReconcileSubagentOptions = ReconcileRunOptions;
+
+export interface RecordSubagentChildEventOptions extends RunStatusRef {
+	event: "started" | "updated" | "completed" | "failed" | "cancelled";
+	childRunId: string;
+	workflowRunId?: string;
+	childTaskId?: string;
+	status?: Status;
+	failureKind?: FailureKind | string | null;
+	message?: string;
+}
 
 export class SubagentValidationError extends Error {
 	readonly failureKind = "validation" as const;
@@ -269,6 +286,40 @@ export async function reconcileSubagentRun(
 	return await reconcileRun(options);
 }
 
+function defaultChildStatus(
+	event: RecordSubagentChildEventOptions["event"],
+): Status {
+	if (event === "started" || event === "updated") return "running";
+	if (event === "completed") return "completed";
+	if (event === "cancelled") return "cancelled";
+	return "failed";
+}
+
+export async function recordSubagentChildEvent(
+	options: RecordSubagentChildEventOptions,
+): Promise<RunEvent> {
+	const {
+		event,
+		childRunId,
+		workflowRunId,
+		childTaskId,
+		failureKind,
+		message,
+	} = options;
+	const ref = await resolveRunRef(options);
+	return await appendRunEvent(ref, {
+		type: `child.${event}`,
+		status: options.status ?? defaultChildStatus(event),
+		...(message === undefined ? {} : { message }),
+		data: {
+			childRunId,
+			...(workflowRunId === undefined ? {} : { workflowRunId }),
+			...(childTaskId === undefined ? {} : { taskId: childTaskId }),
+			...(failureKind === undefined ? {} : { failureKind }),
+		},
+	});
+}
+
 export type {
 	ArtifactRef,
 	CompletionMetadata,
@@ -294,6 +345,8 @@ export type { InterruptRunResult } from "./orchestrate/interrupt.ts";
 export type { ReconcileSubagentRunResult } from "./orchestrate/reconcile.ts";
 export type { ParallelRunResult } from "./orchestrate/run.ts";
 export type {
+	RunChildFailureSummary,
+	RunChildSummary,
 	RunLogRef,
 	RunLogsSnapshot,
 	RunStatusRef,

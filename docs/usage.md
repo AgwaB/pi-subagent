@@ -42,11 +42,14 @@ Every call has an `action`. The default is `run`, so omitting `action` starts a 
 
 State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
 
+Parent orchestrators may record descendant state with `recordSubagentChildEvent`, which appends `child.*` events to the parent run's `events.jsonl` (`child.started`, `child.failed`, `child.completed`, or `child.cancelled`). `status` and `/subagent panel` aggregate those into `childSummary`, including failure counts, active child run IDs, and the latest child failure. This keeps parent status distinct from descendant failures and makes retry attempts distinguishable from newly-started child work.
+
 Model:
 
 ```text
 run = one subagent execution
 attempt = one launch attempt
+child = descendant work reported by an orchestrator through child.* events
 correlationId = optional external trace label
 ```
 
@@ -68,6 +71,7 @@ import {
   waitForSubagent,
   interruptSubagent,
   reconcileSubagentRun,
+  recordSubagentChildEvent,
 } from "@agwab/pi-subagent/api";
 
 const run = await runSubagent({
@@ -83,6 +87,14 @@ const logs = await getSubagentLogs({ cwd: process.cwd(), runId: run.runId });
 await waitForSubagent({ cwd: process.cwd(), runId: run.runId, timeoutMs: 300000 });
 await interruptSubagent({ cwd: process.cwd(), runId: run.runId, reason: "caller cancelled" });
 await reconcileSubagentRun({ cwd: process.cwd(), runId: run.runId });
+await recordSubagentChildEvent({
+  cwd: process.cwd(),
+  runId: run.runId,
+  event: "failed",
+  childRunId: "run_child_123",
+  childTaskId: "task-4",
+  failureKind: "model",
+});
 ```
 
 `runSubagent` accepts the same run options as the tool, plus an optional `signal`. Existing-run helpers accept `runId`, optional `cwd`, optional `attemptId`, and optional `runsDir`; when `cwd` is omitted they use the global locator index first and fall back to the current cwd for legacy records. The API is intentionally object-only and does not expose the lower-level runner internals.
@@ -127,6 +139,21 @@ Use `concurrency` to cap parallel fan-out:
   ]
 }
 ```
+
+For synchronous parallel fan-out, `failFast:true` stops scheduling additional siblings after the first failed result. Add `cancelSiblingsOnFailure:true` to also abort siblings that are already running:
+
+```json
+{
+  "failFast": true,
+  "cancelSiblingsOnFailure": true,
+  "tasks": [
+    { "task": "Run check A." },
+    { "task": "Run check B." }
+  ]
+}
+```
+
+The parallel response includes `totalTasks`, `startedCount`, `skippedCount`, and `failFastTriggered` so callers can distinguish skipped siblings from completed/failed runs. Async parallel launches return once children are started, so fail-fast decisions for later runtime failures must be handled by the parent/workflow layer.
 
 Chain/sequential execution is intentionally not supported by this engine. If step B needs output from step A, keep that sequencing in the parent agent or a workflow layer.
 
@@ -195,6 +222,8 @@ The locator index is only a pointer for finding runs across cwd boundaries. `run
 | `timeoutMs` | Limit worker execution time for `run`; limit polling duration for `action: "wait"`. Omit it for no runtime kill deadline; `wait` alone defaults to 60s polling. |
 | `visible` | Use a visible tmux-backed worker (`visible: true`). |
 | `concurrency` | Cap parallel run fan-out. |
+| `failFast` | For synchronous parallel runs, stop scheduling new siblings after the first failed result. |
+| `cancelSiblingsOnFailure` | For synchronous parallel runs, abort already-running siblings after the first failed result; implies fail-fast scheduling. |
 | `model` | Select a Pi model/provider for model-backed workers. |
 | `thinking` / `thinkingLevel` / `reasoningLevel` | Set the reasoning level. |
 | `tools` | Tool allowlist. With a named agent this may only narrow agent-declared tools; it cannot expand authority. For agentless runs it sets the full tool allowlist. |

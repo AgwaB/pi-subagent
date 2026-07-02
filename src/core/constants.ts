@@ -16,6 +16,11 @@ export const FAILURE_KINDS = [
 	"sandbox",
 	"rpc",
 	"model",
+	"provider_error",
+	"model_error",
+	"output_schema_error",
+	"guard_failure",
+	"user_cancelled",
 	"tool",
 	"exit",
 	"parse",
@@ -109,6 +114,10 @@ export interface ResolveInput {
 	mode?: ExecutionMode;
 	tasks?: SubagentTaskInput[];
 	concurrency?: number;
+	/** Stop scheduling additional parallel siblings after the first failed result. */
+	failFast?: boolean;
+	/** Abort already-running parallel siblings after the first failed result. Implies fail-fast scheduling. */
+	cancelSiblingsOnFailure?: boolean;
 	asyncDependency?: AsyncDependency;
 	workspace?: WorkspaceInput | WorkspaceMode;
 	worktree?: boolean | string;

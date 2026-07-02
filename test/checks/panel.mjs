@@ -350,6 +350,35 @@ async function main() {
 			backend: "headless",
 			log: "active attempt two result",
 		});
+		await writeFile(
+			join(cwd, ".pi/agent/runs/run_active/events.jsonl"),
+			`${JSON.stringify({
+				schemaVersion: 2,
+				timestamp: "2026-01-01T00:00:01.000Z",
+				type: "child.started",
+				runId: "run_active",
+				status: "running",
+				message: "child task started",
+				data: {
+					childRunId: "run_child_panel",
+					workflowRunId: "workflow_panel",
+					taskId: "task-4",
+				},
+			})}\n${JSON.stringify({
+				schemaVersion: 2,
+				timestamp: "2026-01-01T00:00:02.000Z",
+				type: "child.failed",
+				runId: "run_active",
+				status: "failed",
+				message: "child model failed",
+				data: {
+					childRunId: "run_child_panel",
+					workflowRunId: "workflow_panel",
+					taskId: "task-4",
+					failureKind: "model",
+				},
+			})}\n`,
+		);
 		await writeRun(cwd, "run_queued", "attempt-1", {
 			status: "pending",
 			backend: "headless",
@@ -405,6 +434,9 @@ async function main() {
 		assert.match(text, /Result/);
 		assert.match(text, /Started/);
 		assert.match(text, /Completed/);
+		assert.match(text, /Children/);
+		assert.match(text, /child failures: 1/);
+		assert.match(text, /run_child_panel/);
 		assert.match(text, /LOG TAIL/);
 		assert.match(text, /attempt-1/);
 		assert.match(text, /attempt-2/);

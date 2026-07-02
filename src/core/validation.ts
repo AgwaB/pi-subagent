@@ -572,6 +572,27 @@ export function validateResolveInput(
 		input.concurrency = concurrency;
 	}
 
+	if (raw.failFast !== undefined) {
+		const failFast = validateBoolean(
+			raw.failFast,
+			"failFast",
+			backendForKnownFailure,
+		);
+		if (typeof failFast !== "boolean") return failFast;
+		input.failFast = failFast;
+	}
+
+	if (raw.cancelSiblingsOnFailure !== undefined) {
+		const cancelSiblingsOnFailure = validateBoolean(
+			raw.cancelSiblingsOnFailure,
+			"cancelSiblingsOnFailure",
+			backendForKnownFailure,
+		);
+		if (typeof cancelSiblingsOnFailure !== "boolean")
+			return cancelSiblingsOnFailure;
+		input.cancelSiblingsOnFailure = cancelSiblingsOnFailure;
+	}
+
 	if (raw.chain !== undefined) {
 		return failure(
 			'chain mode is not supported by pi-subagent; use mode:"parallel" for fanout or have the parent orchestrate sequencing.',
