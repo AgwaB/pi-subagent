@@ -1087,7 +1087,7 @@ export class SubagentPanel implements Component {
 	}
 
 	render(width: number): string[] {
-		const safeWidth = Math.max(48, width);
+		const safeWidth = Math.max(1, width);
 		const maxLines = panelLineBudget();
 		const lines: string[] = [];
 		const active = this.snapshot.runs.filter((run) =>

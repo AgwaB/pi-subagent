@@ -210,6 +210,52 @@ function getExecuteParams(first: unknown, second: unknown): unknown {
 	return second === undefined ? first : second;
 }
 
+function isAbortSignalLike(value: unknown): value is AbortSignal {
+	return isRecord(value) && typeof value.aborted === "boolean";
+}
+
+function normalizeExecuteArgs(args: unknown[]): {
+	params: unknown;
+	signal?: AbortSignal;
+	onUpdate?: ToolUpdateCallback;
+	ctx?: unknown;
+} {
+	const [first, second, third, fourth, fifth] = args;
+	const params = getExecuteParams(first, second);
+
+	// Pi has shipped both execute(toolCallId, params, signal, onUpdate, ctx)
+	// and execute(toolCallId, params, onUpdate, ctx, signal) call orders. Support
+	// both so context-scoped metadata (cwd/session) and cancellation survive either
+	// host version.
+	if (typeof third === "function") {
+		return {
+			params,
+			onUpdate: third as ToolUpdateCallback,
+			ctx: fourth,
+			...(isAbortSignalLike(fifth) ? { signal: fifth } : {}),
+		};
+	}
+
+	if (isAbortSignalLike(fifth) && !isAbortSignalLike(third)) {
+		return {
+			params,
+			signal: fifth,
+			...(typeof fourth === "function"
+				? { onUpdate: fourth as ToolUpdateCallback }
+				: { ctx: fourth }),
+		};
+	}
+
+	return {
+		params,
+		...(isAbortSignalLike(third) ? { signal: third } : {}),
+		...(typeof fourth === "function"
+			? { onUpdate: fourth as ToolUpdateCallback }
+			: {}),
+		ctx: fifth,
+	};
+}
+
 function getCwd(ctx: unknown): string {
 	if (isRecord(ctx) && typeof ctx.cwd === "string" && ctx.cwd.length > 0)
 		return ctx.cwd;
@@ -595,9 +641,10 @@ async function writeUnsupportedResult(
 	});
 }
 
-interface ToolUpdateCallback {
-	(update: { content: ToolTextContent[]; details: unknown }): void;
-}
+type ToolUpdateCallback = (update: {
+	content: ToolTextContent[];
+	details: unknown;
+}) => void;
 
 interface NotificationContext {
 	ui?: {
@@ -957,8 +1004,9 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 				: summary;
 			return new SingleLineComponent(`${title} ${theme.fg("muted", rest)}`);
 		},
-		async execute(toolCallIdOrArgs, maybeParams, signal, onUpdate, ctx) {
-			const params = getExecuteParams(toolCallIdOrArgs, maybeParams);
+		async execute(...executeArgs: unknown[]) {
+			const { params, signal, onUpdate, ctx } =
+				normalizeExecuteArgs(executeArgs);
 			const cwd = getCwd(ctx);
 
 			try {

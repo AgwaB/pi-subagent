@@ -484,9 +484,9 @@ async function main() {
 			() => renderText(component).includes("run_cjk"),
 			"cjk run appears",
 		);
-		// The panel enforces a hard minimum render width of 48 columns, so only
-		// widths at/above that floor are exercised here.
-		for (const renderWidth of [48, 72, 120, 200, 272]) {
+		// Regression: even below the preferred layout width, custom panel lines must
+		// respect the host-provided terminal width instead of emitting 48-column rows.
+		for (const renderWidth of [30, 41, 48, 72, 120, 200, 272]) {
 			const rawLines = component.render(renderWidth);
 			for (const rawLine of rawLines) {
 				assert.ok(
@@ -834,6 +834,46 @@ async function main() {
 		scoped.component.handleInput("q");
 		assert.equal(scoped.closeCount(), 1, "q should close session-scoped panel");
 
+		const executeCwd = join(tempRoot, "execute-workspace");
+		await mkdir(executeCwd, { recursive: true });
+		await writeIndexedRun(
+			indexDir,
+			executeCwd,
+			"run_execute_signature",
+			"attempt-1",
+			{
+				status: "completed",
+				backend: "headless",
+				log: "execute signature status",
+			},
+		);
+		const newOrderStatus = await registeredTool.execute(
+			"tool-call-new-order",
+			{ action: "status", runId: "run_execute_signature" },
+			() => {},
+			{ cwd: executeCwd, sessionManager: { getSessionId: () => sessionId } },
+			new AbortController().signal,
+		);
+		const newOrderPayload = JSON.parse(newOrderStatus.content[0].text);
+		assert.equal(
+			newOrderPayload.snapshot?.runId,
+			"run_execute_signature",
+			"execute should read cwd/context from the current Pi tool-call order",
+		);
+		const oldOrderStatus = await registeredTool.execute(
+			"tool-call-old-order",
+			{ action: "status", runId: "run_execute_signature" },
+			new AbortController().signal,
+			undefined,
+			{ cwd: executeCwd },
+		);
+		const oldOrderPayload = JSON.parse(oldOrderStatus.content[0].text);
+		assert.equal(
+			oldOrderPayload.snapshot?.runId,
+			"run_execute_signature",
+			"execute should also support the older Pi tool-call order",
+		);
+
 		console.log(
 			JSON.stringify(
 				{
@@ -856,6 +896,7 @@ async function main() {
 						"session/cwd/all scope switching",
 						"stale/malformed global locator accounting",
 						"raw session id redaction",
+						"tool execute argument order compatibility",
 					],
 				},
 				null,
