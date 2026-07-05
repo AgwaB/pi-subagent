@@ -24,6 +24,7 @@ import {
 	type ResolvedBackend,
 } from "./core/constants.ts";
 import { resolveBackend } from "./core/resolver.ts";
+import { clip } from "./core/text-width.ts";
 import { validateResolveInput } from "./core/validation.ts";
 import {
 	startAsyncParallelSubagentRuns,
@@ -147,36 +148,6 @@ interface ToolResult {
 	content: ToolTextContent[];
 	details: unknown;
 	isError: boolean;
-}
-
-const ANSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
-
-function visibleLength(text: string): number {
-	return text.replace(ANSI_PATTERN, "").length;
-}
-
-function clip(text: string, width: number): string {
-	if (width <= 0) return "";
-	if (visibleLength(text) <= width) return text;
-	if (width <= 1) return "…";
-
-	let output = "";
-	let visible = 0;
-	for (let index = 0; index < text.length && visible < width - 1; ) {
-		if (text.charCodeAt(index) === 0x1b) {
-			ANSI_PATTERN.lastIndex = index;
-			const match = ANSI_PATTERN.exec(text);
-			if (match && match.index === index) {
-				output += match[0];
-				index = ANSI_PATTERN.lastIndex;
-				continue;
-			}
-		}
-		output += text[index];
-		visible += 1;
-		index += 1;
-	}
-	return `${output}…`;
 }
 
 class SingleLineComponent {
@@ -566,6 +537,7 @@ async function lifecycleAction(
 			tool: TOOL_NAME,
 			action,
 			status: waited.status,
+			outcome: waited.outcome,
 			snapshot: waited.snapshot,
 		},
 		isError,
@@ -623,7 +595,7 @@ async function writeUnsupportedResult(
 		cwd,
 		runsDir: input.runsDir,
 	});
-	const sandboxed = input.sandbox !== undefined && input.sandbox !== null;
+	const sandboxed = Boolean(input.sandbox);
 	return await store.writeResult({
 		backend,
 		status: "failed",

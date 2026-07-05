@@ -42,7 +42,7 @@ Every call has an `action`. The default is `run`, so omitting `action` starts a 
 
 State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
 
-Parent orchestrators may record descendant state with `recordSubagentChildEvent`, which appends `child.*` events to the parent run's `events.jsonl` (`child.started`, `child.failed`, `child.completed`, or `child.cancelled`). `status` and `/subagent panel` aggregate those into `childSummary`, including failure counts, active child run IDs, and the latest child failure. This keeps parent status distinct from descendant failures and makes retry attempts distinguishable from newly-started child work.
+Parent orchestrators may record descendant state with `recordSubagentChildEvent`, which appends `child.*` events to the parent run's `events.jsonl` (`child.started`, `child.failed`, `child.completed`, or `child.cancelled`). Event data may include `childRunId` (or legacy aliases `childId` / `descendantRunId`), `workflowRunId`, `taskId`, and `failureKind`. `status` and `/subagent panel` aggregate those into `childSummary`, including failure counts, active child run IDs, and the latest currently failed/cancelled child. This keeps parent status distinct from descendant failures and makes retry attempts distinguishable from newly-started child work.
 
 Model:
 
@@ -126,7 +126,7 @@ Project-local agents are repository-controlled. Project-local agent confirmation
 
 Parallel launches are independent runs started concurrently. The response contains `runIds` and per-run results; there is no aggregate run, aggregate task, dependency scheduling, or fan-in status.
 
-Parallel runs use isolated git worktrees by default so worker mutations do not collide in the base checkout. Explicit shared-checkout parallel mutation is rejected.
+Parallel runs use the shared checkout by default, matching single runs and allowing fan-out in non-git workspaces. Parallel fan-out is therefore safest for read-only review/analysis tasks. If parallel tasks will mutate files, request isolation explicitly with `worktree:true`, `workspace:"worktree"`, or `worktreePolicy:"required"`; shared-checkout mutation is not rejected automatically.
 
 Use `concurrency` to cap parallel fan-out:
 
@@ -190,6 +190,8 @@ Wait for completion:
 { "action": "wait", "runId": "run_...", "timeoutMs": 300000 }
 ```
 
+`wait` reports the wait operation status, not run success. `status:"completed"` with `outcome:"terminal"` means the target run reached any terminal state; inspect `snapshot.status` to distinguish `completed`, `failed`, and `cancelled` runs.
+
 Mark a run as background metadata:
 
 ```json
@@ -212,7 +214,7 @@ For `status`, `logs`, `wait`, `interrupt`, `mark-background`, and `reconcile`, t
 2. Otherwise, check the current cwd's `.pi/agent/runs` for legacy/local records.
 3. Otherwise, resolve `runId` through the global locator index and read the pointed-to run directory.
 
-The locator index is only a pointer for finding runs across cwd boundaries. `run.json`, `events.jsonl`, and attempt `result.json` files remain the source of truth.
+The locator index is only a pointer for finding runs across cwd boundaries. `run.json`, `events.jsonl`, and attempt `result.json` files remain the source of truth. Malformed or oversized locator files older than the locator-prune threshold are removed during index reads; the default threshold is 30 days and can be tuned with `PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS` (`-1` disables pruning). The panel also prunes old missing-directory locators after session/cwd pre-filtering so global scans do not touch every run directory unnecessarily.
 
 ## Common run options
 
@@ -406,7 +408,7 @@ These options may also be set per task in `tasks[]`.
 Timeout notes:
 
 - `timeoutMs` on a run is the worker execution deadline. If omitted, pi-subagent does not impose a run timeout.
-- `action:"wait"` uses `timeoutMs` as a polling deadline and defaults to 60 seconds.
+- `action:"wait"` uses `timeoutMs` as a polling deadline and defaults to 60 seconds. Its `status:"completed"` means polling reached a terminal run; check `snapshot.status` for run success/failure/cancellation.
 - `onComplete:"notify"` uses an internal completion monitor with a long safety window (up to 24h when no `timeoutMs` is set); it does not kill the worker. The monitor polls in the parent process and has no cancellation handle, so long-lived SDK embeddings should prefer `onComplete:"detach"` plus explicit `action:"status"`/`"wait"` polling. Orchestrators that need a 4h or other SLA should pass `timeoutMs` explicitly on the run.
 
 ## Artifacts
@@ -448,7 +450,7 @@ The panel shows run/attempt details, workspace/artifact paths, dependency metada
 
 Status filters are `all`, `running`, `completed`, and `failed`. In the `all` status view, the default list shows all active runs plus recent terminal runs only: 20 for `session`/`cwd`, 50 for `all`. The `completed` and `failed` filters use the same recent terminal cap; `running` is uncapped. The header reports `shown/total`, and when older matching runs are hidden, press `m` in the panel to show more; no separate command is needed. The panel keeps a fixed-height layout, uses an internally scrollable detail pane, and never renders raw `parentSessionId` values.
 
-Stale or malformed locators are counted in the header and skipped. Active runs whose process metadata is dead and whose heartbeat/update timestamp is stale are rendered read-only as `failed` with failure `stale`; the panel does not mutate or delete records. Use `action:"reconcile"` to repair local registry state from durable artifacts when possible.
+Stale or malformed locators are counted in the header and skipped. Active runs whose process metadata is dead and whose heartbeat/update timestamp is stale are rendered read-only as `failed` with failure `stale`; the panel does not mutate run records. It may prune old stale locator pointers only; use `action:"reconcile"` to repair local registry state from durable artifacts when possible.
 
 The panel is for human inspection; existing-run tool actions remain the programmatic interface.
 

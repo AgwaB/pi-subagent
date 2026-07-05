@@ -23,7 +23,8 @@ export interface ReconcileSubagentRunResult {
 		| "already-terminal"
 		| "running"
 		| "committed-result"
-		| "marked-stale";
+		| "marked-stale"
+		| "marked-cancelled";
 	runId: string;
 	record: RunRecord | null;
 }
@@ -124,21 +125,31 @@ export async function reconcileSubagentRun(
 		return { status: "running", runId: options.runId, record };
 	}
 
+	const interrupted = record.interrupt !== undefined;
 	const updated = await upsertRunAttempt({
 		...ref,
 		attemptId: attempt.attemptId,
-		status: "failed",
+		status: interrupted ? "cancelled" : "failed",
 		backend: attempt.backend,
-		failureKind: "stale",
+		failureKind: interrupted ? "user_cancelled" : "stale",
 		startedAt: attempt.startedAt,
 		completedAt: new Date(),
 		activate: true,
 	});
 	await appendRunEvent(ref, {
-		type: "reconcile.failed",
+		type: interrupted ? "reconcile.completed" : "reconcile.failed",
 		attemptId: attempt.attemptId,
-		status: "failed",
-		message: "active attempt is stale/orphaned",
+		status: interrupted ? "cancelled" : "failed",
+		message: interrupted
+			? "interrupted attempt exited without a result; marked cancelled"
+			: "active attempt is stale/orphaned",
+		data: interrupted
+			? { failureKind: "user_cancelled", interrupt: record.interrupt }
+			: { failureKind: "stale" },
 	}).catch(() => undefined);
-	return { status: "marked-stale", runId: options.runId, record: updated };
+	return {
+		status: interrupted ? "marked-cancelled" : "marked-stale",
+		runId: options.runId,
+		record: updated,
+	};
 }

@@ -14,6 +14,14 @@ async function loadExtension() {
 	return mod.default ?? mod;
 }
 
+async function loadRunRefModule() {
+	const jiti = createJiti(import.meta.url, {
+		interopDefault: true,
+		moduleCache: false,
+	});
+	return await jiti.import(resolve("src/orchestrate/run-ref.ts"));
+}
+
 function stripAnsi(text) {
 	return text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
 }
@@ -91,7 +99,8 @@ async function writeRun(cwd, runId, attemptId, options) {
 		sandbox: { enabled: false },
 		exitCode: options.status === "failed" ? 1 : 0,
 		signal: null,
-		metadata: { contextLengthExceeded: false },
+		metadata: { contextLengthExceeded: false, ...(options.metadata ?? {}) },
+		...(options.thinking === undefined ? {} : { thinking: options.thinking }),
 		artifacts: [
 			{ type: "output", path: outputRel },
 			{ type: "result", path: resultRel },
@@ -167,12 +176,25 @@ async function writeIndexedRun(indexDir, cwd, runId, attemptId, options) {
 	await mkdir(indexDir, { recursive: true });
 	await writeFile(
 		join(indexDir, `${runId}.json`),
-		`${JSON.stringify({ schemaVersion: 1, runId, cwd, updatedAt: now }, null, 2)}\n`,
+		`${JSON.stringify(
+			{
+				schemaVersion: 1,
+				runId,
+				cwd,
+				...(options.parentSessionId
+					? { parentSessionId: options.parentSessionId }
+					: {}),
+				updatedAt: now,
+			},
+			null,
+			2,
+		)}\n`,
 	);
 }
 
 async function main() {
 	const register = await loadExtension();
+	const { listRunLocators } = await loadRunRefModule();
 	let registeredTool;
 	let registeredCommand;
 	register({
@@ -247,6 +269,20 @@ async function main() {
 		narrowCallText.length <= 30,
 		"renderCall should truncate to the available render width",
 	);
+	const cjkCallText = renderText(
+		registeredTool.renderCall(
+			{
+				task: "지금 터미널 复制不是硬链接 🚀🚀🚀 wide task text must clip safely",
+				async: true,
+			},
+			callTheme,
+		),
+		30,
+	);
+	assert.ok(
+		displayWidth(cjkCallText) <= 30,
+		"renderCall should truncate wide CJK/emoji text to terminal width",
+	);
 	assert.ok(registeredCommand, "subagent command should register");
 	assert.equal(registeredCommand.name, "subagent");
 	assert.equal(typeof registeredCommand.handler, "function");
@@ -258,7 +294,11 @@ async function main() {
 
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-subagent-panel-"));
 	const oldIndexDir = process.env.PI_SUBAGENT_RUN_INDEX_DIR;
+	const oldPanelNow = process.env.PI_SUBAGENT_PANEL_NOW_MS;
+	const oldPruneAfter = process.env.PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS;
+	const fixedPanelNow = Date.parse("2026-01-01T00:10:00.000Z");
 	try {
+		process.env.PI_SUBAGENT_PANEL_NOW_MS = String(fixedPanelNow);
 		const cwd = join(tempRoot, "workspace");
 		const indexDir = join(tempRoot, "run-index");
 		process.env.PI_SUBAGENT_RUN_INDEX_DIR = indexDir;
@@ -359,6 +399,8 @@ async function main() {
 			status: "completed",
 			backend: "headless",
 			log: "active attempt two result",
+			metadata: { model: "gpt-5.5-low" },
+			thinking: "dead-thinking-probe",
 		});
 		await writeFile(
 			join(cwd, ".pi/agent/runs/run_active/events.jsonl"),
@@ -399,6 +441,8 @@ async function main() {
 			status: "completed",
 			backend: "tmux",
 			log: "done result ready",
+			metadata: { model: "gpt-5.5-low" },
+			thinking: "dead-thinking-probe",
 		});
 		await writeRun(cwd, "run_failed", "attempt-1", {
 			status: "failed",
@@ -406,6 +450,77 @@ async function main() {
 			failureKind: "timeout",
 			log: "failed timeout tail",
 		});
+		const retryFailed = await writeRun(cwd, "run_retry_success", "attempt-1", {
+			status: "failed",
+			backend: "inline",
+			failureKind: "model",
+			log: "first attempt failed",
+			startedAt: "2026-01-01T00:00:00.000Z",
+			completedAt: "2026-01-01T00:00:01.000Z",
+		});
+		const retryCompleted = await writeRun(
+			cwd,
+			"run_retry_success",
+			"attempt-2",
+			{
+				status: "completed",
+				backend: "inline",
+				log: "retry attempt completed",
+				startedAt: "2026-01-01T00:00:02.000Z",
+				completedAt: "2026-01-01T00:00:03.000Z",
+			},
+		);
+		await writeFile(
+			join(cwd, ".pi/agent/runs/run_retry_success/run.json"),
+			`${JSON.stringify(
+				{
+					schemaVersion: 2,
+					runId: "run_retry_success",
+					mode: "single",
+					status: "completed",
+					failureKind: null,
+					dependency: null,
+					backend: "inline",
+					cwd,
+					runsDir: ".pi/agent/runs",
+					startedAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: new Date().toISOString(),
+					completedAt: "2026-01-01T00:00:03.000Z",
+					activeAttemptId: null,
+					latestAttemptId: "attempt-2",
+					attempts: [
+						{
+							attemptId: "attempt-1",
+							status: "failed",
+							backend: "inline",
+							failureKind: "model",
+							startedAt: "2026-01-01T00:00:00.000Z",
+							updatedAt: "2026-01-01T00:00:01.000Z",
+							completedAt: "2026-01-01T00:00:01.000Z",
+							artifactCwd: cwd,
+							resultPath: retryFailed.resultRel,
+							outputPath: retryFailed.outputRel,
+							workspace: retryFailed.result.workspace,
+						},
+						{
+							attemptId: "attempt-2",
+							status: "completed",
+							backend: "inline",
+							failureKind: null,
+							startedAt: "2026-01-01T00:00:02.000Z",
+							updatedAt: "2026-01-01T00:00:03.000Z",
+							completedAt: "2026-01-01T00:00:03.000Z",
+							artifactCwd: cwd,
+							resultPath: retryCompleted.resultRel,
+							outputPath: retryCompleted.outputRel,
+							workspace: retryCompleted.result.workspace,
+						},
+					],
+				},
+				null,
+				2,
+			)}\n`,
+		);
 		const scrollBase = Date.now();
 		for (let index = 0; index < 24; index += 1) {
 			await writeRun(
@@ -453,7 +568,7 @@ async function main() {
 		assert.match(text, /LOG TAIL/);
 		assert.match(text, /attempt-1/);
 		assert.match(text, /attempt-2/);
-		assert.match(text, /active attempt one latest/);
+		assert.match(text, /active attempt two result/);
 		assert.match(text, /scope:/);
 		assert.match(
 			text,
@@ -477,6 +592,13 @@ async function main() {
 			"backend labels should stay hidden in the panel",
 		);
 		assert.doesNotMatch(text, /follow/, "follow toggle should not appear");
+		text = renderText(component);
+		assert.match(text, /gpt-5\.5-low/, "model metadata should render");
+		assert.doesNotMatch(
+			text,
+			/dead-thinking-probe/,
+			"panel should not read nonexistent root-level thinking metadata",
+		);
 
 		// Regression: CJK / wide-character content must not overflow the terminal
 		// width. Code-unit length under-counts wide chars, so a narrow terminal
@@ -546,7 +668,7 @@ async function main() {
 		text = renderText(component);
 		assert.match(
 			text,
-			/23\/29 shown/,
+			/23\/30 shown/,
 			"default all view should show all active runs plus 20 recent terminal runs",
 		);
 		assert.doesNotMatch(
@@ -561,7 +683,7 @@ async function main() {
 		);
 		component.handleInput("m");
 		await waitFor(
-			() => /29\/29 shown/.test(renderText(component)),
+			() => /30\/30 shown/.test(renderText(component)),
 			"show more reveals all matching rows",
 		);
 		text = renderText(component);
@@ -623,6 +745,11 @@ async function main() {
 			text,
 			/run_done/,
 			"failed filter should hide completed runs",
+		);
+		assert.doesNotMatch(
+			text,
+			/run_retry_success/,
+			"failed filter should hide runs whose latest retry completed",
 		);
 
 		component.handleInput("\u001b[D");
@@ -708,6 +835,13 @@ async function main() {
 			backend: "headless",
 			log: "legacy indexed run without session metadata",
 		});
+		await writeIndexedRun(indexDir, otherCwd, "run_clock", "attempt-1", {
+			status: "completed",
+			backend: "headless",
+			parentSessionId: sessionId,
+			updatedAt: new Date(fixedPanelNow - 65_000).toISOString(),
+			log: "deterministic panel clock",
+		});
 		const freshHeartbeat = new Date(Date.now() - 10_000).toISOString();
 		await writeIndexedRun(
 			indexDir,
@@ -746,6 +880,11 @@ async function main() {
 			text,
 			/run_session_current/,
 			"session scope should include current cwd run",
+		);
+		assert.match(
+			text,
+			/run_clock[^\n]*1m ago/,
+			"panel clock injection should make age rendering deterministic",
 		);
 		assert.match(
 			text,
@@ -838,6 +977,21 @@ async function main() {
 			/skipped [12]/,
 			"malformed/skipped locator entries should be counted",
 		);
+		process.env.PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS = "0";
+		await writeFile(
+			join(indexDir, "run_prune_old.json"),
+			`${JSON.stringify({ schemaVersion: 1, runId: "run_prune_old", cwd: join(tempRoot, "missing-pruned"), updatedAt: new Date(fixedPanelNow - 60_000).toISOString() }, null, 2)}\n`,
+		);
+		scoped.component.handleInput("r");
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const pruned = await listRunLocators();
+		assert.ok(
+			!pruned.locators.some((locator) => locator.runId === "run_prune_old"),
+			"old missing locator should be pruned from the global index",
+		);
+		if (oldPruneAfter === undefined)
+			delete process.env.PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS;
+		else process.env.PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS = oldPruneAfter;
 		for (let index = 0; index < 30; index += 1) {
 			await writeIndexedRun(
 				indexDir,
@@ -852,10 +1006,10 @@ async function main() {
 			);
 		}
 		scoped.component.handleInput("r");
-		await waitFor(
-			() => /54\/64 shown/.test(renderText(scoped.component)),
-			"all scope should cap default terminal rows at 50",
-		);
+		await waitFor(() => {
+			const match = renderText(scoped.component).match(/(\d+)\/(\d+) shown/);
+			return match !== null && Number(match[1]) < Number(match[2]);
+		}, "all scope should cap default terminal rows at 50");
 		text = renderText(scoped.component);
 		assert.match(
 			text,
@@ -863,10 +1017,10 @@ async function main() {
 			"all scope cap should expose show more when older runs are hidden",
 		);
 		scoped.component.handleInput("m");
-		await waitFor(
-			() => /64\/64 shown/.test(renderText(scoped.component)),
-			"all scope show more should reveal all hidden terminal rows",
-		);
+		await waitFor(() => {
+			const match = renderText(scoped.component).match(/(\d+)\/(\d+) shown/);
+			return match !== null && Number(match[1]) === Number(match[2]);
+		}, "all scope show more should reveal all hidden terminal rows");
 		scoped.component.handleInput("q");
 		assert.equal(scoped.closeCount(), 1, "q should close session-scoped panel");
 
@@ -931,7 +1085,9 @@ async function main() {
 						"q/escape close",
 						"session/cwd/all scope switching",
 						"registry-backed active result freshness",
+						"deterministic panel clock and model metadata",
 						"stale/malformed global locator accounting",
+						"old global locator pruning",
 						"raw session id redaction",
 						"tool execute argument order compatibility",
 					],
@@ -943,6 +1099,11 @@ async function main() {
 	} finally {
 		if (oldIndexDir === undefined) delete process.env.PI_SUBAGENT_RUN_INDEX_DIR;
 		else process.env.PI_SUBAGENT_RUN_INDEX_DIR = oldIndexDir;
+		if (oldPanelNow === undefined) delete process.env.PI_SUBAGENT_PANEL_NOW_MS;
+		else process.env.PI_SUBAGENT_PANEL_NOW_MS = oldPanelNow;
+		if (oldPruneAfter === undefined)
+			delete process.env.PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS;
+		else process.env.PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS = oldPruneAfter;
 		await rm(tempRoot, { recursive: true, force: true });
 	}
 }

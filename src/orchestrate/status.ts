@@ -14,6 +14,7 @@ import {
 	type RunRecord,
 } from "../artifacts/index.ts";
 import {
+	RESOLVED_BACKENDS,
 	STATUSES,
 	type AsyncDependency,
 	type ExecutionMode,
@@ -124,7 +125,9 @@ export interface WaitForRunOptions extends RunStatusRef {
 }
 
 export interface WaitForRunResult {
+	/** Wait operation status; `completed` means the wait reached any terminal run status. */
 	status: "completed" | "timeout";
+	outcome: "terminal" | "timeout";
 	snapshot: RunStatusSnapshot | null;
 }
 
@@ -237,6 +240,25 @@ export function isStatus(value: unknown): value is Status {
 	);
 }
 
+function isResolvedBackend(value: unknown): value is ResolvedBackend {
+	return (
+		typeof value === "string" &&
+		(RESOLVED_BACKENDS as readonly string[]).includes(value)
+	);
+}
+
+function durationFrom(
+	startedAt: string,
+	completedAt: string | null,
+): number | null {
+	if (completedAt === null) return null;
+	const start = Date.parse(startedAt);
+	const end = Date.parse(completedAt);
+	return Number.isFinite(start) && Number.isFinite(end)
+		? Math.max(0, end - start)
+		: null;
+}
+
 export function isTerminalStatus(status: Status): boolean {
 	return (
 		status === "completed" || status === "failed" || status === "cancelled"
@@ -288,7 +310,6 @@ export function summarizeChildEvents(
 			timestamp: string;
 		}
 	>();
-	let latestFailure: RunChildFailureSummary | null = null;
 	let anonymous = 0;
 
 	for (const event of events) {
@@ -315,19 +336,6 @@ export function summarizeChildEvents(
 			timestamp: event.timestamp,
 		};
 		children.set(childRunId, child);
-		if (status === "failed" || status === "cancelled") {
-			latestFailure = {
-				childRunId,
-				...(child.workflowRunId === undefined
-					? {}
-					: { workflowRunId: child.workflowRunId }),
-				...(child.taskId === undefined ? {} : { taskId: child.taskId }),
-				status,
-				failureKind,
-				...(event.message === undefined ? {} : { message: event.message }),
-				timestamp: event.timestamp,
-			};
-		}
 	}
 
 	if (children.size === 0) return undefined;
@@ -336,6 +344,7 @@ export function summarizeChildEvents(
 	let completed = 0;
 	let failed = 0;
 	let cancelled = 0;
+	let latestCurrentFailure: RunChildFailureSummary | null = null;
 	const activeChildRunIds: string[] = [];
 	for (const [childRunId, child] of children) {
 		if (child.status === "pending") pending += 1;
@@ -345,6 +354,26 @@ export function summarizeChildEvents(
 		else if (child.status === "cancelled") cancelled += 1;
 		if (child.status === "pending" || child.status === "running")
 			activeChildRunIds.push(childRunId);
+		if (child.status === "failed" || child.status === "cancelled") {
+			const currentFailure: RunChildFailureSummary = {
+				childRunId,
+				...(child.workflowRunId === undefined
+					? {}
+					: { workflowRunId: child.workflowRunId }),
+				...(child.taskId === undefined ? {} : { taskId: child.taskId }),
+				status: child.status,
+				failureKind: child.failureKind,
+				...(child.message === undefined ? {} : { message: child.message }),
+				timestamp: child.timestamp,
+			};
+			if (
+				latestCurrentFailure === null ||
+				Date.parse(currentFailure.timestamp) >=
+					Date.parse(latestCurrentFailure.timestamp)
+			) {
+				latestCurrentFailure = currentFailure;
+			}
+		}
 	}
 	return {
 		total: children.size,
@@ -354,7 +383,7 @@ export function summarizeChildEvents(
 		failed,
 		cancelled,
 		activeChildRunIds,
-		latestFailure,
+		latestFailure: latestCurrentFailure,
 		worstDescendantStatus:
 			failed > 0
 				? "failed"
@@ -426,8 +455,8 @@ function coerceResultEnvelope(value: unknown): ResultEnvelope | null {
 	const raw = value as Partial<ResultEnvelope> & { taskId?: string };
 	if (
 		typeof raw.runId !== "string" ||
-		typeof raw.backend !== "string" ||
-		typeof raw.status !== "string" ||
+		!isResolvedBackend(raw.backend) ||
+		!isStatus(raw.status) ||
 		typeof raw.cwd !== "string"
 	)
 		return null;
@@ -541,6 +570,7 @@ function snapshotFromRecord(
 	events: RunEvent[],
 ): RunStatusSnapshot {
 	const attempt = selectedAttempt(record, ref);
+	const startedAt = attempt?.startedAt ?? record.startedAt;
 	return {
 		runId: record.runId,
 		attemptId:
@@ -553,9 +583,9 @@ function snapshotFromRecord(
 		backend: attempt?.backend ?? record.backend ?? "headless",
 		status: record.status,
 		failureKind: record.failureKind,
-		startedAt: attempt?.startedAt ?? record.startedAt,
+		startedAt,
 		completedAt: record.completedAt,
-		durationMs: null,
+		durationMs: durationFrom(startedAt, record.completedAt),
 		logs: attempt === undefined ? [] : recordLogs(attempt),
 		resultPath: attempt?.resultPath ?? null,
 		metadata: { contextLengthExceeded: false },
@@ -673,8 +703,8 @@ export async function waitForRun(
 	while (Date.now() <= deadline) {
 		snapshot = await getRunStatus(options);
 		if (snapshot !== null && isTerminalStatus(snapshot.status))
-			return { status: "completed", snapshot };
+			return { status: "completed", outcome: "terminal", snapshot };
 		await sleep(pollIntervalMs);
 	}
-	return { status: "timeout", snapshot };
+	return { status: "timeout", outcome: "timeout", snapshot };
 }

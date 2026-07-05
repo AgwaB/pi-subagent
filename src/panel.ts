@@ -4,7 +4,13 @@ import type { Component } from "@earendil-works/pi-tui";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ResultEnvelope, RunEvent } from "./artifacts/index.ts";
 import type { Status } from "./core/constants.ts";
-import { listRunLocators, type RunRefLocator } from "./orchestrate/run-ref.ts";
+import { clip, stripAnsi, visibleLength } from "./core/text-width.ts";
+import {
+	listRunLocators,
+	locatorOlderThanPruneThreshold,
+	removeRunLocator,
+	type RunRefLocator,
+} from "./orchestrate/run-ref.ts";
 import {
 	summarizeChildEvents,
 	type RunChildSummary,
@@ -108,100 +114,6 @@ function bold(theme: PanelTheme, text: string): string {
 	return theme.bold?.(text) ?? text;
 }
 
-const ANSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
-
-// Terminal display width of a single Unicode code point, in columns.
-// Wide East Asian / fullwidth / emoji code points occupy 2 columns; combining
-// marks and control characters occupy 0. This must stay aligned with how the
-// host TUI measures lines, otherwise CJK-heavy text under-counts and overflows
-// the terminal width (which crashes the renderer).
-function charWidth(cp: number): number {
-	// C0/C1 control characters render with no horizontal advance here.
-	if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
-	// Zero-width and combining ranges.
-	if (
-		cp === 0x200b || // zero width space
-		(cp >= 0x0300 && cp <= 0x036f) || // combining diacritical marks
-		(cp >= 0x1ab0 && cp <= 0x1aff) ||
-		(cp >= 0x1dc0 && cp <= 0x1dff) ||
-		(cp >= 0x20d0 && cp <= 0x20ff) ||
-		(cp >= 0xfe00 && cp <= 0xfe0f) || // variation selectors
-		(cp >= 0xfe20 && cp <= 0xfe2f)
-	) {
-		return 0;
-	}
-	// Wide (2-column) ranges.
-	if (
-		(cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
-		cp === 0x2329 ||
-		cp === 0x232a ||
-		(cp >= 0x2e80 && cp <= 0x303e) || // CJK radicals, Kangxi, punctuation
-		(cp >= 0x3041 && cp <= 0x33ff) || // Hiragana..CJK compatibility
-		(cp >= 0x3400 && cp <= 0x4dbf) || // CJK ext A
-		(cp >= 0x4e00 && cp <= 0x9fff) || // CJK unified
-		(cp >= 0xa000 && cp <= 0xa4cf) || // Yi
-		(cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
-		(cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
-		(cp >= 0xfe10 && cp <= 0xfe19) || // vertical forms
-		(cp >= 0xfe30 && cp <= 0xfe6f) || // CJK compatibility forms
-		(cp >= 0xff00 && cp <= 0xff60) || // fullwidth forms
-		(cp >= 0xffe0 && cp <= 0xffe6) ||
-		(cp >= 0x1f300 && cp <= 0x1faff) || // emoji & pictographs
-		(cp >= 0x20000 && cp <= 0x3fffd) // CJK ext B+
-	) {
-		return 2;
-	}
-	return 1;
-}
-
-// Measure the visible terminal width of a string, ignoring ANSI escapes and
-// accounting for wide characters.
-function visibleLength(text: string): number {
-	let width = 0;
-	for (let index = 0; index < text.length; ) {
-		if (text.charCodeAt(index) === 0x1b) {
-			ANSI_PATTERN.lastIndex = index;
-			const match = ANSI_PATTERN.exec(text);
-			if (match && match.index === index) {
-				index = ANSI_PATTERN.lastIndex;
-				continue;
-			}
-		}
-		const cp = text.codePointAt(index) ?? 0;
-		width += charWidth(cp);
-		index += cp > 0xffff ? 2 : 1;
-	}
-	return width;
-}
-
-function clip(text: string, width: number): string {
-	if (width <= 0) return "";
-	if (visibleLength(text) <= width) return text;
-	if (width <= 1) return "…";
-
-	let output = "";
-	let visible = 0;
-	for (let index = 0; index < text.length; ) {
-		if (text.charCodeAt(index) === 0x1b) {
-			ANSI_PATTERN.lastIndex = index;
-			const match = ANSI_PATTERN.exec(text);
-			if (match && match.index === index) {
-				output += match[0];
-				index = ANSI_PATTERN.lastIndex;
-				continue;
-			}
-		}
-		const cp = text.codePointAt(index) ?? 0;
-		const w = charWidth(cp);
-		// Reserve one column for the ellipsis.
-		if (visible + w > width - 1) break;
-		output += String.fromCodePoint(cp);
-		visible += w;
-		index += cp > 0xffff ? 2 : 1;
-	}
-	return `${output}…`;
-}
-
 function pad(text: string, width: number): string {
 	const visible = visibleLength(text);
 	return visible >= width
@@ -210,8 +122,7 @@ function pad(text: string, width: number): string {
 }
 
 function sanitizeRunText(text: string, currentSessionId?: string): string {
-	let sanitized = text
-		.replace(ANSI_PATTERN, "")
+	let sanitized = stripAnsi(text)
 		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
 		.replace(/\r/g, "");
 	if (currentSessionId && currentSessionId.length > 0)
@@ -219,7 +130,16 @@ function sanitizeRunText(text: string, currentSessionId?: string): string {
 	return sanitized;
 }
 
-function fmtAge(ms: number, now = Date.now()): string {
+function nowMs(): number {
+	const raw = process.env.PI_SUBAGENT_PANEL_NOW_MS;
+	if (raw !== undefined && raw.length > 0) {
+		const parsed = Number.parseInt(raw, 10);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return Date.now();
+}
+
+function fmtAge(ms: number, now = nowMs()): string {
 	const delta = Math.max(0, now - ms);
 	if (delta < 1_000) return "now";
 	if (delta < 60_000) return `${Math.floor(delta / 1_000)}s ago`;
@@ -229,7 +149,7 @@ function fmtAge(ms: number, now = Date.now()): string {
 
 function fmtElapsed(startedAt: string, completedAt: string | null): string {
 	const start = Date.parse(startedAt);
-	const end = completedAt === null ? Date.now() : Date.parse(completedAt);
+	const end = completedAt === null ? nowMs() : Date.parse(completedAt);
 	if (!Number.isFinite(start) || !Number.isFinite(end)) return "—";
 	const seconds = Math.max(0, Math.floor((end - start) / 1_000));
 	const mins = Math.floor(seconds / 60);
@@ -246,6 +166,10 @@ function statusPriority(status: Status): number {
 }
 
 function aggregateRunStatus(attempts: TaskRow[]): Status {
+	return attempts.at(-1)?.status ?? "pending";
+}
+
+function aggregateLegacyRunStatus(attempts: TaskRow[]): Status {
 	if (attempts.some((attempt) => attempt.status === "running"))
 		return "running";
 	if (attempts.some((attempt) => attempt.status === "pending"))
@@ -253,7 +177,7 @@ function aggregateRunStatus(attempts: TaskRow[]): Status {
 	if (attempts.some((attempt) => attempt.status === "failed")) return "failed";
 	if (attempts.some((attempt) => attempt.status === "cancelled"))
 		return "cancelled";
-	return "completed";
+	return attempts.length === 0 ? "pending" : "completed";
 }
 
 function isEscapeKey(data: string): boolean {
@@ -379,7 +303,7 @@ function timestampFresh(
 ): boolean {
 	if (value === undefined) return false;
 	const time = Date.parse(value);
-	return Number.isFinite(time) && Date.now() - time <= staleAfterMs;
+	return Number.isFinite(time) && nowMs() - time <= staleAfterMs;
 }
 
 function runKey(cwd: string, runsDir: string, runId: string): string {
@@ -495,15 +419,9 @@ async function readLogTail(
 }
 
 function modelLabel(result: ResultEnvelope): string {
-	const pieces: string[] = [];
-	const maybeResult = result as ResultEnvelope & {
-		model?: string;
-		thinking?: string;
-	};
-	if (typeof maybeResult.model === "string") pieces.push(maybeResult.model);
-	if (typeof maybeResult.thinking === "string")
-		pieces.push(maybeResult.thinking);
-	return pieces.join(" · ");
+	return typeof result.metadata?.model === "string"
+		? result.metadata.model
+		: "";
 }
 
 async function readTask(
@@ -519,7 +437,7 @@ async function readTask(
 	const log = await readLogTail(cwd, parsed, loadTails, currentSessionId);
 	const stale =
 		isActive(parsed.status) &&
-		(options.staleOverride ?? Date.now() - mtimeMs > STALE_RUN_AFTER_MS);
+		(options.staleOverride ?? nowMs() - mtimeMs > STALE_RUN_AFTER_MS);
 	return {
 		attemptId: parsed.attemptId ?? parsed.taskId ?? "unknown",
 		status: stale ? "failed" : parsed.status,
@@ -606,11 +524,14 @@ async function readTaskFromRegistry(
 		status: stale ? "failed" : task.status,
 		backend: task.backend ?? "unknown",
 		failureKind: stale ? "stale" : (task.failureKind ?? null),
-		startedAt: task.startedAt ?? task.updatedAt ?? new Date().toISOString(),
+		startedAt:
+			task.startedAt ?? task.updatedAt ?? new Date(nowMs()).toISOString(),
 		completedAt:
 			task.completedAt ??
 			(stale
-				? (task.updatedAt ?? task.heartbeatAt ?? new Date().toISOString())
+				? (task.updatedAt ??
+					task.heartbeatAt ??
+					new Date(nowMs()).toISOString())
 				: null),
 		durationMs: null,
 		resultPath: task.resultPath ?? "—",
@@ -647,7 +568,6 @@ async function readRunFromRegistry(
 			readTaskFromRegistry(cwd, task, loadTails, currentSessionId),
 		),
 	);
-	if (tasks.length === 0) return null;
 	tasks.sort((a, b) =>
 		a.attemptId.localeCompare(b.attemptId, undefined, { numeric: true }),
 	);
@@ -656,11 +576,15 @@ async function readRunFromRegistry(
 		runId: registry.runId,
 		sourceCwd: cwd,
 		runsDir,
-		status: aggregateRunStatus(tasks),
-		backend: registry.backend ?? tasks[0]?.backend ?? "unknown",
+		status: registry.status ?? aggregateRunStatus(tasks),
+		backend:
+			registry.backend ??
+			tasks.at(-1)?.backend ??
+			tasks[0]?.backend ??
+			"unknown",
 		updatedMs: Number.isFinite(Date.parse(registry.updatedAt))
 			? Date.parse(registry.updatedAt)
-			: Date.now(),
+			: nowMs(),
 		startedAt: registry.startedAt,
 		completedAt: registry.completedAt,
 		dependency: registry.dependency ?? null,
@@ -756,7 +680,7 @@ async function loadRunsFromCwd(
 		tasks.sort((a, b) =>
 			a.attemptId.localeCompare(b.attemptId, undefined, { numeric: true }),
 		);
-		const status = aggregateRunStatus(tasks);
+		const status = aggregateLegacyRunStatus(tasks);
 		runs.push({
 			key: runKey(cwd, DEFAULT_RUNS_DIR, runEntry.name),
 			runId: runEntry.name,
@@ -786,26 +710,38 @@ async function loadRunsFromCwd(
 async function loadRunFromLocator(
 	locator: RunRefLocator,
 	options: Pick<LoadOptions, "scope" | "currentSessionId">,
-): Promise<{ row: RunRow | null; stale: boolean; invalid: boolean }> {
+): Promise<{
+	row: RunRow | null;
+	stale: boolean;
+	invalid: boolean;
+	pruned: boolean;
+}> {
 	try {
 		const cwd = resolve(locator.cwd);
 		const runsDir = locator.runsDir ?? DEFAULT_RUNS_DIR;
 		const absoluteRunsDir = resolve(cwd, runsDir);
 		if (!isInsideOrEqual(cwd, absoluteRunsDir))
-			return { row: null, stale: false, invalid: true };
+			return { row: null, stale: false, invalid: true, pruned: false };
 		const runDir = join(absoluteRunsDir, locator.runId);
 		const runDirStat = await stat(runDir).catch(() => null);
-		if (runDirStat === null || !runDirStat.isDirectory())
-			return { row: null, stale: true, invalid: false };
+		if (runDirStat === null || !runDirStat.isDirectory()) {
+			if (
+				locatorOlderThanPruneThreshold(locator) &&
+				(await removeRunLocator(locator.runId))
+			) {
+				return { row: null, stale: false, invalid: false, pruned: true };
+			}
+			return { row: null, stale: true, invalid: false, pruned: false };
+		}
 		const registry = await readJson(join(runDir, "run.json"));
 		if (!isRegistryRunRecord(registry))
-			return { row: null, stale: false, invalid: true };
+			return { row: null, stale: false, invalid: true, pruned: false };
 		if (options.scope === "session") {
 			if (
 				options.currentSessionId === undefined ||
 				registry.parentSessionId !== options.currentSessionId
 			)
-				return { row: null, stale: false, invalid: false };
+				return { row: null, stale: false, invalid: false, pruned: false };
 		}
 		const row = await readRunFromRegistry(
 			cwd,
@@ -815,9 +751,9 @@ async function loadRunFromLocator(
 			false,
 			options.currentSessionId,
 		);
-		return { row, stale: row === null, invalid: false };
+		return { row, stale: row === null, invalid: false, pruned: false };
 	} catch {
-		return { row: null, stale: false, invalid: true };
+		return { row: null, stale: false, invalid: true, pruned: false };
 	}
 }
 
@@ -900,7 +836,7 @@ async function loadRuns(options: LoadOptions): Promise<PanelSnapshot> {
 		runs: limited.runs,
 		totalRuns: filtered.length,
 		hiddenRuns: limited.hiddenRuns,
-		loadedAt: new Date(),
+		loadedAt: new Date(nowMs()),
 		staleLocators: loaded.stale,
 		invalidLocators: loaded.invalid,
 		skippedLocators: loaded.skipped,
@@ -956,16 +892,29 @@ async function loadRunsFromIndex(options: LoadOptions): Promise<{
 	skipped: number;
 }> {
 	const listed = await listRunLocators();
+	const locators =
+		options.scope === "session" && options.currentSessionId !== undefined
+			? listed.locators.filter(
+					(locator) => locator.parentSessionId === options.currentSessionId,
+				)
+			: listed.locators;
 	const runs: RunRow[] = [];
 	let stale = 0;
 	let invalid = listed.invalidCount;
-	for (const locator of listed.locators) {
+	let pruned = listed.prunedCount;
+	for (const locator of locators) {
 		const loaded = await loadRunFromLocator(locator, options);
 		if (loaded.row !== null) runs.push(loaded.row);
 		if (loaded.stale) stale += 1;
 		if (loaded.invalid) invalid += 1;
+		if (loaded.pruned) pruned += 1;
 	}
-	return { runs, stale, invalid, skipped: listed.skippedCount };
+	return {
+		runs,
+		stale,
+		invalid,
+		skipped: listed.skippedCount + pruned,
+	};
 }
 
 function splitLine(left: string, right: string, width: number): string {
@@ -1006,7 +955,7 @@ export class SubagentPanel implements Component {
 	private snapshot: PanelSnapshot = {
 		runs: [],
 		totalRuns: 0,
-		loadedAt: new Date(),
+		loadedAt: new Date(nowMs()),
 		hiddenRuns: 0,
 		staleLocators: 0,
 		invalidLocators: 0,
@@ -1132,7 +1081,7 @@ export class SubagentPanel implements Component {
 			this.snapshot.runs[
 				Math.min(this.selectedRun, this.snapshot.runs.length - 1)
 			];
-		const selectedTask = selectedRun.tasks[0];
+		const selectedTask = selectedRun.tasks.at(-1);
 		const bodyHeight = Math.max(1, maxLines - lines.length - 2);
 		const runLines = this.renderRuns(leftWidth, bodyHeight);
 		const detailLines = this.renderDetailWindow(
@@ -1351,7 +1300,11 @@ export class SubagentPanel implements Component {
 		return [...detailLines.slice(this.detailOffset, end), clip(hint, width)];
 	}
 
-	private renderDetail(run: RunRow, task: TaskRow, width: number): string[] {
+	private renderDetail(
+		run: RunRow,
+		task: TaskRow | undefined,
+		width: number,
+	): string[] {
 		const lines: string[] = [];
 		const labelWidth = Math.max(8, Math.min(12, Math.floor(width * 0.18)));
 		const divider = (): void => {
@@ -1395,6 +1348,13 @@ export class SubagentPanel implements Component {
 					: `total ${run.childSummary.total} · failed ${run.childSummary.failed} · latest ${latest.childRunId}${latest.taskId ? `/${latest.taskId}` : ""}${latest.failureKind ? ` · ${latest.failureKind}` : ""}`,
 				childFailureCount(run.childSummary) > 0 ? "error" : "muted",
 			);
+			if (run.childSummary.activeChildRunIds.length > 0) {
+				field(
+					"Active children",
+					clip(run.childSummary.activeChildRunIds.join(", "), width - 16),
+					"muted",
+				);
+			}
 		}
 
 		section("ATTEMPT");
@@ -1407,6 +1367,10 @@ export class SubagentPanel implements Component {
 				)
 				.join(" · "),
 		);
+		if (task === undefined) {
+			field("Selected", "no attempts recorded", "muted");
+			return lines;
+		}
 		field(
 			"Selected",
 			`${run.tasks.indexOf(task) + 1}/${run.tasks.length} · ${task.attemptId} · ${statusLabel(task.status)} · ${fmtElapsed(task.startedAt, task.completedAt)}${task.modelLabel ? ` · ${task.modelLabel}` : ""}`,

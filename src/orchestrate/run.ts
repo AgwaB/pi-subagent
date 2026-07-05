@@ -3,6 +3,7 @@ import { loadAgentByName, type AgentDefinition } from "../agents.ts";
 import {
 	appendRunEvent,
 	beginRunRecord,
+	createAttemptArtifactStore,
 	createAttemptId,
 	createRunId,
 	finishAttemptFromResult,
@@ -11,7 +12,12 @@ import {
 	type ProcessMetadata,
 	type ResultEnvelope,
 } from "../artifacts/index.ts";
-import type { ResolveInput, SubagentTaskInput } from "../core/constants.ts";
+import type {
+	FailureKind,
+	ResolveInput,
+	ResolvedBackend,
+	SubagentTaskInput,
+} from "../core/constants.ts";
 import { resolveBackend } from "../core/resolver.ts";
 import { runHeadlessModel } from "../runners/headless-model.ts";
 import { runInlineModel } from "../runners/inline.ts";
@@ -117,6 +123,79 @@ function resolveEffectiveTools(
 		);
 	}
 	return input.tools;
+}
+
+function failureKindFromError(error: unknown): FailureKind {
+	const candidate =
+		typeof error === "object" && error !== null && "failureKind" in error
+			? (error as { failureKind?: unknown }).failureKind
+			: undefined;
+	return candidate === "validation" ? "validation" : "internal";
+}
+
+async function writeParallelErrorResult(options: {
+	taskInput: ResolveInput;
+	cwd: string;
+	runId: string;
+	attemptId: string;
+	error: unknown;
+	cancelled: boolean;
+}): Promise<ResultEnvelope> {
+	const message =
+		options.error instanceof Error
+			? options.error.message
+			: String(options.error);
+	const resolved = resolveBackend(options.taskInput);
+	const backend: ResolvedBackend =
+		resolved.status === "failed" ? "inline" : resolved.backend;
+	const store = await createAttemptArtifactStore({
+		cwd: options.cwd,
+		runId: options.runId,
+		attemptId: options.attemptId,
+		runsDir: options.taskInput.runsDir,
+	});
+	const stderr = await store.writeTextArtifact("stderr", `${message}\n`);
+	const output = await store.writeTextArtifact("output", "");
+	const result = await store.writeResult({
+		backend,
+		status: options.cancelled ? "cancelled" : "failed",
+		failureKind: options.cancelled
+			? "cancelled"
+			: failureKindFromError(options.error),
+		cwd: options.cwd,
+		startedAt: new Date(),
+		completedAt: new Date(),
+		workspace: { mode: "shared", cwd: options.cwd },
+		sandbox: { enabled: Boolean(options.taskInput.sandbox) },
+		exitCode: null,
+		signal: options.cancelled ? "SIGABRT" : null,
+		artifacts: [stderr, output],
+		correlationId: options.taskInput.correlationId,
+		metadata: { contextLengthExceeded: false },
+	});
+	await finishAttemptFromResult(
+		{
+			cwd: options.cwd,
+			runsDir: options.taskInput.runsDir,
+			runId: options.runId,
+		},
+		result,
+	).catch(() => undefined);
+	await appendRunEvent(
+		{
+			cwd: options.cwd,
+			runsDir: options.taskInput.runsDir,
+			runId: options.runId,
+		},
+		{
+			type: options.cancelled ? "attempt.cancelled" : "attempt.failed",
+			attemptId: options.attemptId,
+			status: result.status,
+			message,
+			data: { failureKind: result.failureKind },
+		},
+	).catch(() => undefined);
+	return result;
 }
 
 export async function runSubagentTask(
@@ -345,7 +424,6 @@ export async function runParallelSubagentTasks(
 	let failFastTriggered = false;
 	let parentAbortTriggered = false;
 	let siblingCancelTriggered = false;
-	const workerErrors: unknown[] = [];
 
 	function triggerFailFast(): void {
 		if (!failFast) return;
@@ -361,8 +439,8 @@ export async function runParallelSubagentTasks(
 		parentAbortTriggered = true;
 		controller?.abort();
 	}
-	if (controller !== undefined && signal !== undefined) {
-		if (signal.aborted) controller.abort();
+	if (signal !== undefined) {
+		if (signal.aborted) onParentAbort();
 		else signal.addEventListener("abort", onParentAbort, { once: true });
 	}
 
@@ -374,24 +452,39 @@ export async function runParallelSubagentTasks(
 			if (index >= tasks.length) return;
 			startedCount += 1;
 			const taskInput = mergeTaskInput(input, tasks[index]!);
+			const runId = createRunId();
+			const attemptId = createAttemptId();
 			try {
 				const result = await runSubagentTask({
 					input: taskInput,
 					cwd: runCwd,
 					signal: childSignal,
+					runId,
+					attemptId,
 					taskIndex: index,
 				});
 				resultSlots[index] = result;
-				if (result.status !== "completed") triggerFailFast();
+				const parentCancelled =
+					(parentAbortTriggered || signal?.aborted === true) &&
+					(result.status === "cancelled" || result.failureKind === "abort");
+				if (result.status !== "completed" && !parentCancelled)
+					triggerFailFast();
 			} catch (error) {
+				if (parentAbortTriggered || signal?.aborted === true) throw error;
 				const siblingAbort =
 					controller?.signal.aborted === true &&
 					siblingCancelTriggered &&
 					!parentAbortTriggered;
-				triggerFailFast();
-				if (!failFast || !siblingAbort) throw error;
-				workerErrors.push(error);
-				return;
+				const result = await writeParallelErrorResult({
+					taskInput,
+					cwd: runCwd,
+					runId,
+					attemptId,
+					error,
+					cancelled: siblingAbort,
+				});
+				resultSlots[index] = result;
+				if (!siblingAbort) triggerFailFast();
 			}
 		}
 	}
@@ -405,9 +498,8 @@ export async function runParallelSubagentTasks(
 				workerResult.status === "rejected",
 		);
 		if (rejected !== undefined) throw rejected.reason;
-		if (workerErrors.length > 0) failFastTriggered = true;
 	} finally {
-		if (controller !== undefined && signal !== undefined)
+		if (signal !== undefined)
 			signal.removeEventListener("abort", onParentAbort);
 	}
 

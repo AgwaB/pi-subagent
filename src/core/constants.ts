@@ -71,9 +71,15 @@ export interface SandboxOptionsInput {
 export type SandboxInput = true | SandboxOptionsInput;
 
 export function sandboxAllowedDomains(
-	sandbox: SandboxInput | null | undefined,
+	sandbox: SandboxInput | false | null | undefined,
 ): string[] {
-	if (sandbox === undefined || sandbox === null || sandbox === true) return [];
+	if (
+		sandbox === undefined ||
+		sandbox === null ||
+		sandbox === false ||
+		sandbox === true
+	)
+		return [];
 	return sandbox.allowedDomains ?? [];
 }
 
@@ -88,7 +94,7 @@ export interface SubagentTaskInput {
 	roleContext?: string;
 	agentScope?: AgentScope;
 	confirmProjectAgents?: boolean;
-	sandbox?: SandboxInput | null;
+	sandbox?: SandboxInput | false | null;
 	visible?: boolean;
 	cwd?: string;
 	timeoutMs?: number;
@@ -104,7 +110,7 @@ export interface SubagentTaskInput {
 
 export interface ResolveInput {
 	backend?: Backend;
-	sandbox?: SandboxInput | null;
+	sandbox?: SandboxInput | false | null;
 	visible?: boolean;
 	agent?: string;
 	task?: string;

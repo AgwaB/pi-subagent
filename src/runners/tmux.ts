@@ -39,7 +39,7 @@ interface RunTmuxProcessOptions {
 	runsDir?: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
-	sandbox?: SandboxInput | null;
+	sandbox?: SandboxInput | false | null;
 	workspace?: Partial<ResultWorkspace>;
 }
 

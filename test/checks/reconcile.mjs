@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import {
 	beginRunRecord,
 	createAttemptArtifactStore,
+	recordInterruptRequest,
 } from "../../src/artifacts/index.ts";
 import { reconcileSubagentRun } from "../../src/orchestrate/reconcile.ts";
 import { getSubagentStatus, waitForSubagent } from "../../api.mjs";
@@ -163,6 +164,30 @@ try {
 	assert.equal(stale.status, "marked-stale");
 	assert.equal(stale.record?.status, "failed");
 	assert.equal(stale.record?.failureKind, "stale");
+
+	const interruptedCwd = join(tempRoot, "interrupted");
+	await createRunningAttempt(
+		interruptedCwd,
+		"run_reconcile_interrupted",
+		"attempt_interrupted",
+		{
+			process: { pid: 99999999 },
+			heartbeatAt: new Date(Date.now() - 60_000).toISOString(),
+		},
+	);
+	await recordInterruptRequest(
+		{ cwd: interruptedCwd, runId: "run_reconcile_interrupted" },
+		"SIGINT",
+		"test cancellation",
+	);
+	const interrupted = await reconcileSubagentRun({
+		cwd: interruptedCwd,
+		runId: "run_reconcile_interrupted",
+		staleAfterMs: 1,
+	});
+	assert.equal(interrupted.status, "marked-cancelled");
+	assert.equal(interrupted.record?.status, "cancelled");
+	assert.equal(interrupted.record?.failureKind, "user_cancelled");
 
 	const liveCwd = join(tempRoot, "live-worker");
 	await createRunningAttempt(liveCwd, "run_reconcile_live", "attempt_live", {

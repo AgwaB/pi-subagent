@@ -43,7 +43,7 @@ export interface RunHeadlessModelOptions {
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	piCommand?: string;
-	sandbox?: SandboxInput | null;
+	sandbox?: SandboxInput | false | null;
 	workspace?: Partial<ResultWorkspace>;
 	model?: string;
 	thinking?: ThinkingLevel;

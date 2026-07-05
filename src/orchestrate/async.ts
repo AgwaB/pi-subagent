@@ -77,7 +77,7 @@ function mergeTaskInput(
 }
 
 function sandboxEnabled(input: ResolveInput): boolean {
-	return input.sandbox !== undefined && input.sandbox !== null;
+	return Boolean(input.sandbox);
 }
 
 function armCompletionMonitor(
@@ -155,30 +155,49 @@ export async function startAsyncParallelSubagentRuns(
 			);
 	}
 
-	const concurrency = Math.min(parallelConcurrency(input), input.tasks.length);
-	const results: ResultEnvelope[] = new Array(input.tasks.length);
+	const taskPlans = input.tasks.map((task, index) => {
+		const taskInput = mergeTaskInput(input, task);
+		const resolved = resolveBackend(taskInput);
+		if (resolved.status === "failed")
+			throw new SubagentToolAuthorityError(
+				`parallel tasks[${index}] backend resolution failed: ${resolved.error}`,
+			);
+		return { index, taskInput, backend: resolved.backend };
+	});
+	const concurrency = Math.min(parallelConcurrency(input), taskPlans.length);
+	const results: ResultEnvelope[] = new Array(taskPlans.length);
 	let nextIndex = 0;
 
 	async function worker(): Promise<void> {
 		while (true) {
 			const index = nextIndex;
 			nextIndex += 1;
-			if (index >= input.tasks!.length) return;
-			const taskInput = mergeTaskInput(input, input.tasks![index]);
-			const resolved = resolveBackend(taskInput);
-			if (resolved.status === "failed")
-				throw new SubagentToolAuthorityError(resolved.error);
-			results[index] = await startAsyncSubagentRun({
-				input: taskInput,
-				cwd: taskInput.cwd ?? cwd,
-				backend: resolved.backend,
+			const plan = taskPlans[index];
+			if (plan === undefined) return;
+			results[plan.index] = await startAsyncSubagentRun({
+				input: plan.taskInput,
+				cwd: plan.taskInput.cwd ?? cwd,
+				backend: plan.backend,
 				signal,
 				onComplete,
 			});
 		}
 	}
 
-	await Promise.all(Array.from({ length: concurrency }, () => worker()));
+	try {
+		await Promise.all(Array.from({ length: concurrency }, () => worker()));
+	} catch (error) {
+		const startedResults = results.filter(
+			(result): result is ResultEnvelope => result !== undefined,
+		);
+		if (startedResults.length > 0 && error && typeof error === "object") {
+			Object.assign(error, {
+				startedRunIds: startedResults.map((result) => result.runId),
+				startedResults,
+			});
+		}
+		throw error;
+	}
 	return {
 		mode: "parallel",
 		runIds: results.map((result) => result.runId),

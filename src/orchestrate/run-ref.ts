@@ -4,6 +4,7 @@ import {
 	readFile,
 	rename,
 	stat,
+	unlink,
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -39,6 +40,7 @@ export interface RunLocatorListResult {
 	locators: RunRefLocator[];
 	invalidCount: number;
 	skippedCount: number;
+	prunedCount: number;
 }
 
 function assertSafeId(name: string, value: string): void {
@@ -80,6 +82,50 @@ function runIndexDir(): string {
 function runLocatorPath(runId: string): string {
 	assertSafeId("runId", runId);
 	return join(runIndexDir(), `${runId}.json`);
+}
+
+const DEFAULT_LOCATOR_PRUNE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
+
+function locatorPruneAfterMs(): number {
+	const raw = process.env.PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS;
+	if (raw !== undefined && raw.length > 0) {
+		const parsed = Number.parseInt(raw, 10);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return DEFAULT_LOCATOR_PRUNE_AFTER_MS;
+}
+
+function olderThanPruneThreshold(
+	timestampMs: number,
+	now = Date.now(),
+): boolean {
+	const threshold = locatorPruneAfterMs();
+	return (
+		threshold >= 0 &&
+		Number.isFinite(timestampMs) &&
+		now - timestampMs >= threshold
+	);
+}
+
+export function locatorOlderThanPruneThreshold(
+	locator: Pick<RunRefLocator, "updatedAt">,
+	now = Date.now(),
+): boolean {
+	const parsed = Date.parse(locator.updatedAt);
+	return olderThanPruneThreshold(Number.isFinite(parsed) ? parsed : now, now);
+}
+
+async function pruneLocator(path: string): Promise<boolean> {
+	try {
+		await unlink(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export async function removeRunLocator(runId: string): Promise<boolean> {
+	return await pruneLocator(runLocatorPath(runId));
 }
 
 function isRunRefLocator(value: unknown): value is RunRefLocator {
@@ -160,6 +206,7 @@ export async function listRunLocators(): Promise<RunLocatorListResult> {
 	const locators: RunRefLocator[] = [];
 	let invalidCount = 0;
 	let skippedCount = 0;
+	let prunedCount = 0;
 
 	for (const entry of entries) {
 		if (!entry.isFile()) {
@@ -176,12 +223,24 @@ export async function listRunLocators(): Promise<RunLocatorListResult> {
 			const path = join(indexDir, entry.name);
 			const info = await stat(path);
 			if (!info.isFile() || info.size > 64 * 1024) {
-				invalidCount += 1;
+				if (olderThanPruneThreshold(info.mtimeMs) && (await pruneLocator(path)))
+					prunedCount += 1;
+				else invalidCount += 1;
 				continue;
 			}
-			const parsed = JSON.parse(await readFile(path, "utf8"));
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(await readFile(path, "utf8"));
+			} catch {
+				if (olderThanPruneThreshold(info.mtimeMs) && (await pruneLocator(path)))
+					prunedCount += 1;
+				else invalidCount += 1;
+				continue;
+			}
 			if (!isRunRefLocator(parsed) || parsed.runId !== runId) {
-				invalidCount += 1;
+				if (olderThanPruneThreshold(info.mtimeMs) && (await pruneLocator(path)))
+					prunedCount += 1;
+				else invalidCount += 1;
 				continue;
 			}
 			const cwd = normalizeCwd(parsed.cwd);
@@ -192,7 +251,7 @@ export async function listRunLocators(): Promise<RunLocatorListResult> {
 		}
 	}
 
-	return { locators, invalidCount, skippedCount };
+	return { locators, invalidCount, skippedCount, prunedCount };
 }
 
 export async function resolveRunRef<T extends LocatableRunRef>(

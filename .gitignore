@@ -2,6 +2,7 @@ node_modules/
 .pi/
 .harness/
 .harness-archive/
+.harness-project/
 internal/
 *.tgz
 .DS_Store
