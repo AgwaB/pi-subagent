@@ -8,6 +8,7 @@ import {
 	commitAttemptResultIfActive,
 	createAttemptArtifactStore,
 	finishAttemptFromResult,
+	readRunEvents,
 	readRunRecord,
 	recordAttemptHeartbeat,
 	updateAttemptProcess,
@@ -133,6 +134,21 @@ try {
 	assert.equal(eventsStatus?.childSummary?.failed, 0);
 	assert.equal(eventsStatus?.childSummary?.completed, 1);
 	assert.equal(eventsStatus?.childSummary?.latestFailure, null);
+	const cachedEvents = await readRunEvents({ cwd, runId: eventsRun }, Infinity);
+	assert.ok(cachedEvents.length > 0, "expected cached events to be readable");
+	cachedEvents.length = 0;
+	const cachedAgain = await readRunEvents({ cwd, runId: eventsRun }, Infinity);
+	assert.ok(
+		cachedAgain.length > 0,
+		"mutating a readRunEvents result must not corrupt the event cache",
+	);
+	cachedAgain[0].type = "run.failed";
+	const cachedThird = await readRunEvents({ cwd, runId: eventsRun }, Infinity);
+	assert.notEqual(
+		cachedThird[0]?.type,
+		"run.failed",
+		"mutating a returned event object must not corrupt the event cache",
+	);
 
 	const multiChildRun = "run_lifecycle_multi_child";
 	const multiChildAttempt = "attempt_lifecycle_multi_child";
@@ -229,7 +245,10 @@ try {
 	});
 
 	const previousDelay = process.env.PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS;
+	const previousTerminalDelay =
+		process.env.PI_SUBAGENT_DURABLE_WORKER_TERMINAL_WRITE_DELAY_MS;
 	process.env.PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS = "3000";
+	process.env.PI_SUBAGENT_DURABLE_WORKER_TERMINAL_WRITE_DELAY_MS = "250";
 	try {
 		const interruptible = await startAsyncSubagentRun({
 			cwd,
@@ -245,6 +264,8 @@ try {
 			runId: interruptible.runId,
 			attemptId: interruptible.attemptId,
 			reason: "lifecycle test cancellation",
+			escalateAfterMs: 10,
+			killAfterMs: 3000,
 		});
 		assert.equal(interrupted.status, "interrupt-requested");
 		const interruptedWait = await waitForSubagent({
@@ -257,10 +278,26 @@ try {
 		assert.equal(interruptedWait.status, "completed");
 		assert.equal(interruptedWait.snapshot?.status, "cancelled");
 		assert.equal(interruptedWait.snapshot?.failureKind, "user_cancelled");
+		const interruptedEvents = await readRunEvents(
+			{ cwd, runId: interruptible.runId },
+			Infinity,
+		);
+		assert.equal(
+			interruptedEvents.some(
+				(event) => event.type === "attempt.stale_result_ignored",
+			),
+			false,
+			"duplicate signal/failure writes should not emit stale-result noise",
+		);
 	} finally {
 		if (previousDelay === undefined)
 			delete process.env.PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS;
 		else process.env.PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS = previousDelay;
+		if (previousTerminalDelay === undefined)
+			delete process.env.PI_SUBAGENT_DURABLE_WORKER_TERMINAL_WRITE_DELAY_MS;
+		else
+			process.env.PI_SUBAGENT_DURABLE_WORKER_TERMINAL_WRITE_DELAY_MS =
+				previousTerminalDelay;
 	}
 
 	console.log(

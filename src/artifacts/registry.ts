@@ -1060,6 +1060,22 @@ const eventReadCache = new Map<
 	{ size: number; mtimeMs: number; events: RunEvent[] }
 >();
 
+function cloneRunEvent(event: RunEvent): RunEvent {
+	return {
+		...event,
+		...(event.data === undefined
+			? {}
+			: { data: structuredClone(event.data) as Record<string, unknown> }),
+	};
+}
+
+function cloneRunEvents(events: RunEvent[], limit: number): RunEvent[] {
+	const selected = Number.isFinite(limit)
+		? events.slice(-limit)
+		: events.slice();
+	return selected.map(cloneRunEvent);
+}
+
 function rememberRunEvents(
 	path: string,
 	entry: { size: number; mtimeMs: number; events: RunEvent[] },
@@ -1098,7 +1114,7 @@ export async function readRunEvents(
 		// Refresh recency for the bounded LRU cache.
 		eventReadCache.delete(paths.eventsPath);
 		eventReadCache.set(paths.eventsPath, cached);
-		return Number.isFinite(limit) ? cached.events.slice(-limit) : cached.events;
+		return cloneRunEvents(cached.events, limit);
 	}
 	const text = await readFile(paths.eventsPath, "utf8");
 	const lines = text.split(/\r?\n/).filter(Boolean);
@@ -1116,5 +1132,5 @@ export async function readRunEvents(
 		mtimeMs: info.mtimeMs,
 		events,
 	});
-	return Number.isFinite(limit) ? events.slice(-limit) : events;
+	return cloneRunEvents(events, limit);
 }

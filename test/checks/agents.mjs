@@ -9,7 +9,25 @@ import { runSubagent, SubagentValidationError } from "../../api.mjs";
 
 const tempRoot = await mkdtemp(join(tmpdir(), "pi-subagent-agents-"));
 try {
+  const sharedAgentsDir = join(tempRoot, ".pi", "agents");
+  await mkdir(sharedAgentsDir, { recursive: true });
+  await writeFile(join(sharedAgentsDir, "inherited.md"), `---
+name: inherited
+---
+SHOULD_NOT_LOAD_FROM_SHARED_PARENT
+`);
+
+  const emptyRepo = join(tempRoot, "empty-repo");
+  await mkdir(join(emptyRepo, ".git"), { recursive: true });
+  const inherited = await loadAgentByName("inherited", emptyRepo, "project");
+  assert.equal(
+    inherited,
+    undefined,
+    "project agents must not be inherited from above the git boundary",
+  );
+
   const cwd = join(tempRoot, "repo");
+  await mkdir(join(cwd, ".git"), { recursive: true });
   const agentsDir = join(cwd, ".pi", "agents", "review");
   await mkdir(agentsDir, { recursive: true });
   await writeFile(join(agentsDir, "security.md"), `---

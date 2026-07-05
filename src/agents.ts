@@ -122,6 +122,16 @@ function parseSimpleYaml(yaml: string): Record<string, unknown> {
   return result;
 }
 
+async function hasGitBoundary(directory: string): Promise<boolean> {
+  try {
+    const info = await lstat(join(directory, ".git"));
+    return info.isDirectory() || info.isFile() || info.isSymbolicLink();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function findNearestProjectAgentsDir(cwd: string): Promise<string | null> {
   let current = resolve(cwd);
   while (true) {
@@ -133,6 +143,7 @@ async function findNearestProjectAgentsDir(cwd: string): Promise<string | null> 
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
+    if (await hasGitBoundary(current)) return null;
     const parent = dirname(current);
     if (parent === current) return null;
     current = parent;

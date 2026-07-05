@@ -23,20 +23,47 @@ const heartbeatMs = Math.max(
 const runRef = { cwd, runId, runsDir: input?.runsDir };
 const workerProcessGroupId =
 	process.platform === "win32" ? undefined : process.pid;
-let terminalWriteInProgress = false;
+let terminalWritePromise;
 let heartbeat;
 
-async function writeTerminalResult({
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function maybeDelayTerminalWriteForTests() {
+	const delayMs = Number.parseInt(
+		process.env.PI_SUBAGENT_DURABLE_WORKER_TERMINAL_WRITE_DELAY_MS ?? "0",
+		10,
+	);
+	if (Number.isFinite(delayMs) && delayMs > 0) await sleep(delayMs);
+}
+
+async function readExistingAttempt() {
+	const record = await artifacts.readRunRecord(runRef).catch(() => null);
+	return record?.attempts?.find((candidate) => candidate.attemptId === attemptId);
+}
+
+async function writeTerminalResultOnce({
 	status,
 	failureKind,
 	message,
 	signal = null,
 	exitCode = null,
 }) {
-	if (terminalWriteInProgress) return;
-	terminalWriteInProgress = true;
 	if (heartbeat !== undefined) clearInterval(heartbeat);
 	try {
+		const existingAttempt = await readExistingAttempt();
+		const existingAttemptTerminal = TERMINAL_STATUSES.has(
+			existingAttempt?.status,
+		);
+		const shouldBackfillDuplicateResult =
+			existingAttemptTerminal &&
+			existingAttempt?.status === status &&
+			(existingAttempt.failureKind ?? null) === failureKind;
+		if (existingAttemptTerminal && !shouldBackfillDuplicateResult) return;
+		await maybeDelayTerminalWriteForTests();
 		const store = await artifacts.createAttemptArtifactStore({
 			cwd,
 			runId,
@@ -60,6 +87,12 @@ async function writeTerminalResult({
 			correlationId: input?.correlationId,
 			metadata: { contextLengthExceeded: false },
 		});
+		if (shouldBackfillDuplicateResult) {
+			await artifacts
+				.finishAttemptFromResult(runRef, result)
+				.catch(() => undefined);
+			return;
+		}
 		const committed = await artifacts
 			.commitAttemptResultIfActive(runRef, result)
 			.catch(() => ({ committed: false }));
@@ -91,8 +124,9 @@ async function writeTerminalResult({
 	}
 }
 
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+function writeTerminalResult(options) {
+	terminalWritePromise ??= writeTerminalResultOnce(options);
+	return terminalWritePromise;
 }
 
 async function maybeDelayStartForTests() {
