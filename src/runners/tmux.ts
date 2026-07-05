@@ -301,7 +301,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 				return {
 					result: {
 						meta: {
-							status: "failed",
+							status: stopKind === "abort" ? "cancelled" : "failed",
 							failureKind: stopKind,
 							exitCode: null,
 							signal: "SIGTERM",

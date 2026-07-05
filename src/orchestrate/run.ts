@@ -148,6 +148,42 @@ async function writeParallelErrorResult(options: {
 	const resolved = resolveBackend(options.taskInput);
 	const backend: ResolvedBackend =
 		resolved.status === "failed" ? "inline" : resolved.backend;
+	const startedAt = new Date();
+	const completedAt = new Date();
+	const runRef = {
+		cwd: options.cwd,
+		runId: options.runId,
+		runsDir: options.taskInput.runsDir,
+	};
+	await beginRunRecord({
+		...runRef,
+		mode: "single",
+		backend,
+		startedAt,
+		dependency: options.taskInput.asyncDependency ?? null,
+		correlationId: options.taskInput.correlationId,
+		parentSessionId: options.taskInput.parentSessionId,
+		activeAttemptId: options.attemptId,
+		attempts: [
+			{
+				attemptId: options.attemptId,
+				status: "running",
+				backend,
+				startedAt: startedAt.toISOString(),
+			},
+		],
+	});
+	await writeRunLocator({
+		...runRef,
+		parentSessionId: options.taskInput.parentSessionId,
+		correlationId: options.taskInput.correlationId,
+	}).catch(() => undefined);
+	await appendRunEvent(runRef, {
+		type: "run.started",
+		status: "running",
+		message: "parallel task error run started",
+		data: { attemptId: options.attemptId },
+	}).catch(() => undefined);
 	const store = await createAttemptArtifactStore({
 		cwd: options.cwd,
 		runId: options.runId,
@@ -163,8 +199,8 @@ async function writeParallelErrorResult(options: {
 			? "cancelled"
 			: failureKindFromError(options.error),
 		cwd: options.cwd,
-		startedAt: new Date(),
-		completedAt: new Date(),
+		startedAt,
+		completedAt,
 		workspace: { mode: "shared", cwd: options.cwd },
 		sandbox: { enabled: Boolean(options.taskInput.sandbox) },
 		exitCode: null,
@@ -173,28 +209,19 @@ async function writeParallelErrorResult(options: {
 		correlationId: options.taskInput.correlationId,
 		metadata: { contextLengthExceeded: false },
 	});
-	await finishAttemptFromResult(
-		{
-			cwd: options.cwd,
-			runsDir: options.taskInput.runsDir,
-			runId: options.runId,
-		},
-		result,
-	).catch(() => undefined);
-	await appendRunEvent(
-		{
-			cwd: options.cwd,
-			runsDir: options.taskInput.runsDir,
-			runId: options.runId,
-		},
-		{
-			type: options.cancelled ? "attempt.cancelled" : "attempt.failed",
-			attemptId: options.attemptId,
-			status: result.status,
-			message,
-			data: { failureKind: result.failureKind },
-		},
-	).catch(() => undefined);
+	await finishAttemptFromResult(runRef, result).catch(() => undefined);
+	await appendRunEvent(runRef, {
+		type: options.cancelled ? "attempt.cancelled" : "attempt.failed",
+		attemptId: options.attemptId,
+		status: result.status,
+		message,
+		data: { failureKind: result.failureKind },
+	}).catch(() => undefined);
+	await appendRunEvent(runRef, {
+		type: options.cancelled ? "run.cancelled" : "run.failed",
+		status: result.status,
+		message: `run ${result.status}`,
+	}).catch(() => undefined);
 	return result;
 }
 

@@ -585,7 +585,7 @@ async function runProcess(
 
 	if (abortSignal?.aborted) {
 		return await finishWith({
-			status: "failed",
+			status: "cancelled",
 			failureKind: "abort",
 			exitCode: null,
 			signal: null,
@@ -714,7 +714,12 @@ async function runProcess(
 			}
 			const failureKind = stopKind ?? (exitCode === 0 ? null : "model");
 			settle({
-				status: failureKind === null ? "completed" : "failed",
+				status:
+					failureKind === null
+						? "completed"
+						: failureKind === "abort"
+							? "cancelled"
+							: "failed",
 				failureKind,
 				exitCode,
 				signal,

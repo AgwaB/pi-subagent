@@ -184,27 +184,39 @@ export async function startAsyncParallelSubagentRuns(
 		}
 	}
 
-	try {
-		await Promise.all(Array.from({ length: concurrency }, () => worker()));
-	} catch (error) {
+	const workers = await Promise.allSettled(
+		Array.from({ length: concurrency }, () => worker()),
+	);
+	const rejected = workers.find(
+		(workerResult): workerResult is PromiseRejectedResult =>
+			workerResult.status === "rejected",
+	);
+	if (rejected !== undefined) {
 		const startedResults = results.filter(
 			(result): result is ResultEnvelope => result !== undefined,
 		);
-		if (startedResults.length > 0 && error && typeof error === "object") {
-			Object.assign(error, {
+		if (
+			startedResults.length > 0 &&
+			rejected.reason &&
+			typeof rejected.reason === "object"
+		) {
+			Object.assign(rejected.reason, {
 				startedRunIds: startedResults.map((result) => result.runId),
 				startedResults,
 			});
 		}
-		throw error;
+		throw rejected.reason;
 	}
+	const completedResults = results.filter(
+		(result): result is ResultEnvelope => result !== undefined,
+	);
 	return {
 		mode: "parallel",
-		runIds: results.map((result) => result.runId),
-		results,
+		runIds: completedResults.map((result) => result.runId),
+		results: completedResults,
 		concurrency,
 		totalTasks: input.tasks.length,
-		startedCount: results.length,
+		startedCount: completedResults.length,
 		skippedCount: 0,
 		failFastTriggered: false,
 	};

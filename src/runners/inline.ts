@@ -362,7 +362,12 @@ export async function runInlineModel(options: RunInlineModelOptions): Promise<Re
   toolCallArtifactRefs = await flushToolCallTelemetry(toolCallTelemetry, store);
 
   const completedAt = new Date();
-  const status = failureKind === null ? "completed" : "failed";
+  const status =
+    failureKind === null
+      ? "completed"
+      : failureKind === "abort"
+        ? "cancelled"
+        : "failed";
   const artifacts: ArtifactRef[] = [
     await store.writeTextArtifact("stderr", stderrText),
     await store.writeTextArtifact("output", outputText),

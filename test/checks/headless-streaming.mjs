@@ -291,6 +291,30 @@ process.stdout.write(JSON.stringify({ type: "error", error: { message: "fatal st
 	assert.deepEqual(fatal.metadata.streamErrors, ["fatal stream error"]);
 	assert.equal(fatal.metadata.nonFatalStreamErrors, undefined);
 
+	const abortPi = join(tempRoot, "fake-pi-abort.mjs");
+	await writeFile(
+		abortPi,
+		`#!/usr/bin/env node
+setInterval(() => undefined, 1000);
+`,
+		"utf8",
+	);
+	await chmod(abortPi, 0o700);
+	const abortController = new AbortController();
+	const aborted = await runHeadlessModel({
+		cwd,
+		runId: "run_check_headless_abort",
+		attemptId: "attempt-abort",
+		piCommand: abortPi,
+		agent: "stream-worker",
+		task: "stay alive until aborted",
+		timeoutMs: 30_000,
+		signal: abortController.signal,
+		onProcessStart: () => abortController.abort(),
+	});
+	assert.equal(aborted.status, "cancelled");
+	assert.equal(aborted.failureKind, "abort");
+
 	console.log(
 		JSON.stringify(
 			{ name: "check-headless-streaming", status: "completed" },
