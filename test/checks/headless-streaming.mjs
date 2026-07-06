@@ -64,6 +64,9 @@ for (let index = 0; index < 768; index += 1) {
 process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "fetch_content", args: { url: "https://user:pass@docs.example.test/a/b?token=secret#fragment", headers: { Authorization: "Bearer secret-token", Cookie: "cookie-secret" }, nested: { apiKey: "api-key-secret" }, prompt: "summarize this page" } }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "tool_execution_update", toolCallId: "tool-1", toolName: "fetch_content", args: {}, partialResult: { text: "should-not-appear-update-secret" } }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "fetch_content", result: { content: [{ type: "text", text: "result-body-secret" + filler }], url: "https://docs.example.test/a/b?token=secret#fragment" }, isError: false }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolCallId: "tool-2", toolName: "read", args: { path: "/tmp/missing-evidence.json", limit: 20, url: "https://user:pass@files.example.test/private?token=secret#fragment", headers: { Authorization: "Bearer failed-secret" }, nested: { token: "nested-token-secret", safe: "safe-value" }, items: Array.from({ length: 18 }, (_, index) => index), deep: { a: { b: { c: "too-deep" } } } } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "tool_execution_update", toolCallId: "tool-2", toolName: "read", partialResult: { content: "failed-update-secret" } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "tool_execution_end", toolCallId: "tool-2", toolName: "read", result: { content: "File not found: /tmp/missing-evidence.json", diagnosticUrl: "https://user:pass@errors.example.test/detail?token=secret#fragment", longText: filler, secret: "result-secret-redacted", nested: { password: "password-secret", message: "safe-message" } }, isError: true }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "stream-parser-ok" }], provider: "fake", model: "fake/model", usage: { inputTokens: 1, outputTokens: 1 }, stopReason: "end" } }) + "\\n");
 `,
 		"utf8",
@@ -143,25 +146,64 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		.trim()
 		.split("\n")
 		.map((line) => JSON.parse(line));
-	assert.equal(callRecords.length, 1);
+	assert.equal(callRecords.length, 2);
 	assert.equal(callRecords[0].toolCallId, "tool-1");
 	assert.equal(callRecords[0].toolName, "fetch_content");
 	assert.equal(callRecords[0].category, "network");
 	assert.equal(callRecords[0].status, "completed");
 	assert.equal(callRecords[0].isError, false);
+	assert.equal(callRecords[0].failedArgs, undefined);
+	assert.equal(callRecords[0].failedResult, undefined);
 	assert.ok(callRecords[0].durationMs >= 0);
-	assert.deepEqual(summary.callsByTool, { fetch_content: 1 });
+	assert.equal(callRecords[1].toolCallId, "tool-2");
+	assert.equal(callRecords[1].toolName, "read");
+	assert.equal(callRecords[1].category, "filesystem");
+	assert.equal(callRecords[1].status, "failed");
+	assert.equal(callRecords[1].isError, true);
+	assert.equal(
+		callRecords[1].failedArgs.value.path,
+		"/tmp/missing-evidence.json",
+	);
+	assert.equal(
+		callRecords[1].failedArgs.value.url,
+		"https://files.example.test/private",
+	);
+	assert.equal(callRecords[1].failedArgs.value.headers, "[REDACTED]");
+	assert.equal(callRecords[1].failedArgs.value.nested.token, "[REDACTED]");
+	assert.equal(callRecords[1].failedArgs.value.items.length, 16);
+	assert.equal(callRecords[1].failedArgs.value.deep.a.b, "[truncated]");
+	assert.equal(callRecords[1].failedArgs.truncated, true);
+	assert.equal(
+		callRecords[1].failedResult.value.content,
+		"File not found: /tmp/missing-evidence.json",
+	);
+	assert.equal(
+		callRecords[1].failedResult.value.diagnosticUrl,
+		"https://errors.example.test/detail",
+	);
+	assert.ok(callRecords[1].failedResult.value.longText.length <= 500);
+	assert.equal(callRecords[1].failedResult.value.secret, "[REDACTED]");
+	assert.equal(callRecords[1].failedResult.value.nested.password, "[REDACTED]");
+	assert.equal(callRecords[1].failedResult.truncated, true);
+	assert.deepEqual(summary.callsByTool, { fetch_content: 1, read: 1 });
 	assert.equal(summary.callsByCategory.network, 1);
-	assert.equal(summary.totalCalls, 1);
+	assert.equal(summary.callsByCategory.filesystem, 1);
+	assert.equal(summary.errorsByTool.read, 1);
+	assert.equal(summary.totalCalls, 2);
 	assert.equal(summary.limits.updatesCaptured, false);
 	assert.equal(summary.limits.fullArgsStored, false);
 	assert.equal(summary.limits.fullResultsStored, false);
+	assert.equal(summary.limits.failedArgsStored, true);
+	assert.equal(summary.limits.failedResultsStored, true);
+	assert.equal(summary.limits.maxDetailStringLength, 500);
+	assert.equal(summary.limits.maxDetailArrayItems, 16);
+	assert.equal(summary.limits.maxDetailDepth, 3);
 	assert.ok(summary.resources.urls.includes("https://docs.example.test/a/b"));
 	assert.ok(summary.resources.hosts.includes("docs.example.test"));
 	assert.match(callsText, /"redactedKeys":\["headers"\]/);
 	assert.doesNotMatch(
 		callsText,
-		/Bearer secret-token|cookie-secret|api-key-secret|result-body-secret|should-not-appear-update-secret|token=secret|#fragment/,
+		/Bearer secret-token|cookie-secret|api-key-secret|Bearer failed-secret|nested-token-secret|result-body-secret|result-secret-redacted|password-secret|should-not-appear-update-secret|failed-update-secret|user:pass@|token=secret|#fragment/,
 	);
 
 	const nonFatalErrorPi = join(tempRoot, "fake-pi-non-fatal-error.mjs");
