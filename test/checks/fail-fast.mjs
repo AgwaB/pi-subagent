@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	mkdtemp,
+	readFile,
+	readdir,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runParallelSubagentTasks } from "../../src/orchestrate/run.ts";
@@ -57,10 +64,9 @@ try {
 	);
 	assert.equal(firstFailureRecord.parentSessionId, "session-fail-fast");
 	assert.equal(firstFailureRecord.correlationId, "corr-fail-fast");
-	const firstFailureEvents = (await readFile(
-		join(firstFailureDir, "events.jsonl"),
-		"utf8",
-	))
+	const firstFailureEvents = (
+		await readFile(join(firstFailureDir, "events.jsonl"), "utf8")
+	)
 		.trim()
 		.split("\n")
 		.map((line) => JSON.parse(line));

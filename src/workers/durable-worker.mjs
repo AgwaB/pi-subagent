@@ -42,7 +42,9 @@ async function maybeDelayTerminalWriteForTests() {
 
 async function readExistingAttempt() {
 	const record = await artifacts.readRunRecord(runRef).catch(() => null);
-	return record?.attempts?.find((candidate) => candidate.attemptId === attemptId);
+	return record?.attempts?.find(
+		(candidate) => candidate.attemptId === attemptId,
+	);
 }
 
 async function writeTerminalResultOnce({
