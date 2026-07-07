@@ -88,6 +88,16 @@ export interface WorkspaceInput {
 	path?: string;
 }
 
+export interface ToolResultBudgetInput {
+	/**
+	 * Cumulative character budget across retained child tool results. When a
+	 * new tool result would exceed it, the oldest retained results are evicted
+	 * (replaced with short placeholders) until it fits; the newest result is
+	 * never evicted. Invalid values are ignored with a recorded warning.
+	 */
+	maxTotalChars: number;
+}
+
 export interface SubagentTaskInput {
 	agent?: string;
 	task?: string;
@@ -106,6 +116,8 @@ export interface SubagentTaskInput {
 	skills?: string[];
 	extensions?: string[];
 	captureToolCalls?: boolean;
+	/** Opt-in transcript hygiene for child tool results (headless backend). */
+	toolResultBudget?: ToolResultBudgetInput;
 }
 
 export interface ResolveInput {
@@ -139,6 +151,8 @@ export interface ResolveInput {
 	skills?: string[];
 	extensions?: string[];
 	captureToolCalls?: boolean;
+	/** Opt-in transcript hygiene for child tool results (headless backend). */
+	toolResultBudget?: ToolResultBudgetInput;
 	runsDir?: string;
 	correlationId?: string;
 	/** Pi session id to attach a child headless run to when explicitly set by code API. */

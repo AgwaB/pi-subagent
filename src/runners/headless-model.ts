@@ -1,8 +1,9 @@
 import { once } from "node:events";
 import { createReadStream, createWriteStream } from "node:fs";
-import { realpath, stat, writeFile } from "node:fs/promises";
+import { readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
 import {
 	createAttemptArtifactStore,
@@ -10,6 +11,7 @@ import {
 	type ProcessMetadata,
 	type ResultEnvelope,
 	type ResultMetadata,
+	type ToolResultBudgetMetadata,
 } from "../artifacts/index.ts";
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import type {
@@ -18,6 +20,7 @@ import type {
 	SandboxInput,
 	Status,
 	ThinkingLevel,
+	ToolResultBudgetInput,
 } from "../core/constants.ts";
 import { sandboxAllowedDomains } from "../core/constants.ts";
 import { SandboxUnavailableError, withSandboxedArgv } from "../sandbox/srt.ts";
@@ -25,6 +28,14 @@ import {
 	flushToolCallTelemetry,
 	ToolCallTelemetryCollector,
 } from "./tool-call-telemetry.ts";
+import {
+	CONTEXT_RECOVERY_EVICT_FRACTION,
+	normalizeToolResultBudget,
+	TOOL_RESULT_BUDGET_ENV,
+	TOOL_RESULT_BUDGET_STATE_FILENAME,
+	type NormalizedToolResultBudget,
+	type ToolResultBudgetState,
+} from "./tool-result-budget.ts";
 
 export interface RunHeadlessModelOptions {
 	agent: string;
@@ -53,6 +64,12 @@ export interface RunHeadlessModelOptions {
 	extensions?: string[];
 	agentDefinition?: AgentDefinition;
 	captureToolCalls?: boolean;
+	/**
+	 * Opt-in transcript hygiene: cumulative character budget for retained
+	 * child tool results, enforced by a child extension before every model
+	 * call. Default off; invalid values are ignored with a recorded warning.
+	 */
+	toolResultBudget?: ToolResultBudgetInput;
 	onProcessStart?: (process: ProcessMetadata) => void | Promise<void>;
 }
 
@@ -527,8 +544,56 @@ export function buildPiArgv(
 	else
 		for (const extension of options.extensions ?? [])
 			argv.push("--extension", extension);
+	if (normalizeToolResultBudget(options.toolResultBudget).budget !== undefined)
+		argv.push("--extension", toolResultBudgetExtensionPath());
 	argv.push(buildPrompt(options));
 	return argv as [string, ...string[]];
+}
+
+export function toolResultBudgetExtensionPath(): string {
+	return fileURLToPath(
+		new URL("./tool-result-budget-extension.ts", import.meta.url),
+	);
+}
+
+async function readToolResultBudgetState(
+	statePath: string | undefined,
+): Promise<ToolResultBudgetState | undefined> {
+	if (statePath === undefined) return undefined;
+	try {
+		const parsed = JSON.parse(await readFile(statePath, "utf8")) as unknown;
+		if (typeof parsed !== "object" || parsed === null) return undefined;
+		const state = parsed as ToolResultBudgetState;
+		return typeof state.evictableCount === "number" &&
+			typeof state.evictedCount === "number"
+			? state
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function toolResultBudgetMetadata(
+	budget: NormalizedToolResultBudget,
+	state: ToolResultBudgetState | undefined,
+): ToolResultBudgetMetadata | undefined {
+	if (budget.warning !== undefined)
+		return { enabled: false, warning: budget.warning };
+	if (budget.budget === undefined) return undefined;
+	return {
+		enabled: true,
+		maxTotalChars: budget.budget.maxTotalChars,
+		...(state === undefined
+			? {}
+			: {
+					toolResults: state.toolResults,
+					retainedChars: state.retainedChars,
+					evictedCount: state.evictedCount,
+					evictedChars: state.evictedChars,
+					evictableCount: state.evictableCount,
+					forcedEvictionApplied: state.forcedEvictionApplied,
+				}),
+	};
 }
 
 async function fileBytes(path: string): Promise<number> {
@@ -759,82 +824,143 @@ export async function runHeadlessModel(
 		runsDir: options.runsDir,
 	});
 	const argv = buildPiArgv(options);
-	let processResult: ProcessResult;
-	try {
-		processResult = options.sandbox
-			? await withSandboxedArgv(
-					argv,
-					{
-						sandbox: options.sandbox,
-						cwd,
-						writablePaths: [store.taskDir],
-						signal: options.signal,
-					},
-					(launch) =>
-						runProcess(
-							launch.argv,
+	const budget = normalizeToolResultBudget(options.toolResultBudget);
+	const budgetStatePath =
+		budget.budget === undefined
+			? undefined
+			: join(store.attemptDir, TOOL_RESULT_BUDGET_STATE_FILENAME);
+	const budgetEnv =
+		budget.budget === undefined || budgetStatePath === undefined
+			? undefined
+			: {
+					[TOOL_RESULT_BUDGET_ENV.maxTotalChars]: String(
+						budget.budget.maxTotalChars,
+					),
+					[TOOL_RESULT_BUDGET_ENV.statePath]: budgetStatePath,
+				};
+
+	async function executeAttempt(
+		forceEvictFraction?: number,
+	): Promise<ProcessResult> {
+		const attemptEnv =
+			budgetEnv === undefined
+				? undefined
+				: {
+						...budgetEnv,
+						...(forceEvictFraction === undefined
+							? {}
+							: {
+									[TOOL_RESULT_BUDGET_ENV.forceEvictFraction]:
+										String(forceEvictFraction),
+								}),
+					};
+		try {
+			return options.sandbox
+				? await withSandboxedArgv(
+						argv,
+						{
+							sandbox: options.sandbox,
 							cwd,
-							timeoutMs,
-							store,
-							options.captureToolCalls,
-							options.signal,
-							launch.env,
-							options.onProcessStart,
-						),
-				)
-			: await runProcess(
-					argv,
-					cwd,
-					timeoutMs,
-					store,
-					options.captureToolCalls,
-					options.signal,
-					undefined,
-					options.onProcessStart,
-				);
-	} catch (error) {
-		if (!(error instanceof SandboxUnavailableError)) throw error;
-		const stderrRef = await store.writeTextArtifact(
-			"stderr",
-			`${error.message}\n`,
+							writablePaths: [store.taskDir],
+							signal: options.signal,
+						},
+						(launch) =>
+							runProcess(
+								launch.argv,
+								cwd,
+								timeoutMs,
+								store,
+								options.captureToolCalls,
+								options.signal,
+								attemptEnv === undefined
+									? launch.env
+									: { ...(launch.env ?? process.env), ...attemptEnv },
+								options.onProcessStart,
+							),
+					)
+				: await runProcess(
+						argv,
+						cwd,
+						timeoutMs,
+						store,
+						options.captureToolCalls,
+						options.signal,
+						attemptEnv === undefined
+							? undefined
+							: { ...process.env, ...attemptEnv },
+						options.onProcessStart,
+					);
+		} catch (error) {
+			if (!(error instanceof SandboxUnavailableError)) throw error;
+			const stderrRef = await store.writeTextArtifact(
+				"stderr",
+				`${error.message}\n`,
+			);
+			return {
+				outcome: {
+					status: "failed",
+					failureKind: "sandbox",
+					exitCode: null,
+					signal: null,
+				},
+				stderrRef,
+				toolCallArtifactRefs: [],
+				parsed: emptyParseResult(),
+				stderrText: `${error.message}\n`,
+				stderrContextLengthExceeded: detectContextLengthExceeded({
+					stderrText: error.message,
+				}),
+			};
+		}
+	}
+
+	function analyzeAttempt(attempt: ProcessResult): {
+		contextLength: ContextLengthResolution;
+		outcome: ProcessOutcome;
+	} {
+		const rawContextLengthExceeded =
+			attempt.stderrContextLengthExceeded ||
+			detectContextLengthExceeded({
+				stderrText: attempt.stderrText,
+				errors: attempt.parsed.errors,
+			});
+		const resolvedContextLength = resolveContextLengthState(
+			attempt.parsed,
+			rawContextLengthExceeded,
 		);
-		processResult = {
-			outcome: {
-				status: "failed",
-				failureKind: "sandbox",
-				exitCode: null,
-				signal: null,
-			},
-			stderrRef,
-			toolCallArtifactRefs: [],
-			parsed: emptyParseResult(),
-			stderrText: `${error.message}\n`,
-			stderrContextLengthExceeded: detectContextLengthExceeded({
-				stderrText: error.message,
-			}),
+		return {
+			contextLength: resolvedContextLength,
+			outcome: resolvePiJsonOutcome(
+				attempt.outcome,
+				attempt.parsed,
+				resolvedContextLength.contextLengthExceeded,
+			),
 		};
 	}
 
-	const {
-		outcome: processOutcome,
-		stderrRef,
-		toolCallArtifactRefs,
-		parsed,
-		stderrText,
-		stderrContextLengthExceeded,
-	} = processResult;
-	const rawContextLengthExceeded =
-		stderrContextLengthExceeded ||
-		detectContextLengthExceeded({ stderrText, errors: parsed.errors });
-	const contextLength = resolveContextLengthState(
-		parsed,
-		rawContextLengthExceeded,
-	);
+	let processResult = await executeAttempt();
+	let { contextLength, outcome } = analyzeAttempt(processResult);
+	let contextRecovered = false;
+	if (
+		budget.budget !== undefined &&
+		outcome.status === "failed" &&
+		contextLength.contextLengthExceeded
+	) {
+		const budgetState = await readToolResultBudgetState(budgetStatePath);
+		if (budgetState !== undefined && budgetState.evictableCount >= 1) {
+			// Single-recovery guard: exactly one evict-and-retry per run. The
+			// retry instructs the child extension to evict the oldest ~25% of
+			// retained tool-result chars before its first model call.
+			processResult = await executeAttempt(CONTEXT_RECOVERY_EVICT_FRACTION);
+			({ contextLength, outcome } = analyzeAttempt(processResult));
+			contextRecovered = outcome.status === "completed";
+		}
+	}
 
-	const outcome = resolvePiJsonOutcome(
-		processOutcome,
-		parsed,
-		contextLength.contextLengthExceeded,
+	const { stderrRef, toolCallArtifactRefs, parsed } = processResult;
+	const budgetMetadata = toolResultBudgetMetadata(
+		budget,
+		await readToolResultBudgetState(budgetStatePath),
 	);
 
 	const completedAt = new Date();
@@ -869,6 +995,10 @@ export async function runHeadlessModel(
 			...(options.parentSessionId === undefined
 				? {}
 				: { parentSessionId: options.parentSessionId }),
+			...(contextRecovered ? { contextRecovered: true } : {}),
+			...(budgetMetadata === undefined
+				? {}
+				: { toolResultBudget: budgetMetadata }),
 		},
 	});
 }

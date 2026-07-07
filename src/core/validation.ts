@@ -22,6 +22,7 @@ import {
 	type SandboxInput,
 	type SandboxOptionsInput,
 	type SubagentTaskInput,
+	type ToolResultBudgetInput,
 	type WorkspaceInput,
 } from "./constants.ts";
 
@@ -399,6 +400,12 @@ function validateTaskItem(
 		task.captureToolCalls = captureToolCalls;
 	}
 
+	if (value.toolResultBudget !== undefined) {
+		// Deliberately lenient: invalid budgets never fail validation. The
+		// headless runner ignores them and records a warning in run metadata.
+		task.toolResultBudget = value.toolResultBudget as ToolResultBudgetInput;
+	}
+
 	const thinking = validateThinkingAliases(value, fieldName, backend);
 	if (thinking && typeof thinking !== "string") return thinking;
 	if (thinking !== undefined) task.thinking = thinking;
@@ -763,6 +770,12 @@ export function validateResolveInput(
 		);
 		if (typeof captureToolCalls !== "boolean") return captureToolCalls;
 		input.captureToolCalls = captureToolCalls;
+	}
+
+	if (raw.toolResultBudget !== undefined) {
+		// Deliberately lenient: invalid budgets never fail validation. The
+		// headless runner ignores them and records a warning in run metadata.
+		input.toolResultBudget = raw.toolResultBudget as ToolResultBudgetInput;
 	}
 
 	const thinking = validateThinkingAliases(

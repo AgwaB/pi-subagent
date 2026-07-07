@@ -55,6 +55,7 @@
     "check:run-lock": "node ./test/checks/run-lock.mjs",
     "check:reconcile": "node ./test/checks/reconcile.mjs",
     "check:headless-streaming": "node ./test/checks/headless-streaming.mjs",
+    "check:tool-result-budget": "node ./test/checks/tool-result-budget.mjs",
     "check:model:inline": "node ./test/integration/inline-model.mjs",
     "check:model:headless": "node ./test/integration/headless-model.mjs",
     "check:model:tmux": "node ./test/integration/tmux-model.mjs",
@@ -63,7 +64,7 @@
     "release:check": "node ./scripts/release-check.mjs",
     "check": "npm run check:static",
     "check:types": "tsc -p tsconfig.json",
-    "check:static": "npm run check:types && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:parent-session && npm run check:panel-session-scope && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:lifecycle && npm run check:fail-fast && npm run check:schema-sync && npm run check:run-lock && npm run check:reconcile && npm run check:headless-streaming",
+    "check:static": "npm run check:types && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:parent-session && npm run check:panel-session-scope && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:lifecycle && npm run check:fail-fast && npm run check:schema-sync && npm run check:run-lock && npm run check:reconcile && npm run check:headless-streaming && npm run check:tool-result-budget",
     "check:integration": "npm run check:model:inline && npm run check:model:headless && npm run check:model:tmux"
   },
   "dependencies": {

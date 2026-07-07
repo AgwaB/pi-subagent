@@ -78,9 +78,25 @@ export interface ResultSessionMetadata {
 	reason?: ResultSessionReason;
 }
 
+export interface ToolResultBudgetMetadata {
+	enabled: boolean;
+	maxTotalChars?: number;
+	/** Present when an invalid budget option was ignored. */
+	warning?: string;
+	toolResults?: number;
+	retainedChars?: number;
+	evictedCount?: number;
+	evictedChars?: number;
+	evictableCount?: number;
+	forcedEvictionApplied?: boolean;
+}
+
 export interface ResultMetadata {
 	contextLengthExceeded: boolean;
 	contextOverflowRecovered?: boolean;
+	/** True when a context-length failure was recovered by budget eviction + one retry. */
+	contextRecovered?: boolean;
+	toolResultBudget?: ToolResultBudgetMetadata;
 	provider?: string;
 	model?: string;
 	usage?: unknown;
@@ -204,6 +220,12 @@ function normalizeMetadata(input: ResultEnvelopeInput): ResultMetadata {
 		...(metadata.contextOverflowRecovered === undefined
 			? {}
 			: { contextOverflowRecovered: metadata.contextOverflowRecovered }),
+		...(metadata.contextRecovered === undefined
+			? {}
+			: { contextRecovered: metadata.contextRecovered }),
+		...(metadata.toolResultBudget === undefined
+			? {}
+			: { toolResultBudget: metadata.toolResultBudget }),
 		...(metadata.provider === undefined ? {} : { provider: metadata.provider }),
 		...(metadata.model === undefined ? {} : { model: metadata.model }),
 		...(metadata.usage === undefined ? {} : { usage: metadata.usage }),

@@ -238,6 +238,7 @@ The locator index is only a pointer for finding runs across cwd boundaries. `run
 | `runsDir` | Safe relative artifact root under `cwd`; default `.pi/agent/runs`. |
 | `correlationId` | Optional external trace label, e.g. a workflow run id. It has no scheduling or aggregation semantics. |
 | `captureToolCalls` | Optional redacted debug telemetry for child tool calls. Defaults to `false`; when `true`, supported live event backends write completed tool call summaries as artifacts without full args/results or update streams. |
+| `toolResultBudget` | Opt-in transcript hygiene for headless children (code API): `{ maxTotalChars }` caps cumulative retained tool-result characters. When a new tool result would exceed the budget, the oldest retained results are replaced with `[evicted tool result: <tool>, <n> chars]` placeholders (the newest result is never evicted); eviction counts land in `metadata.toolResultBudget`. On a context-length failure with at least one evictable result, the run evicts the oldest ~25% of retained tool-result chars and retries once (`metadata.contextRecovered`). Invalid values are ignored with a recorded warning. Default off; behavior without the option is unchanged. |
 
 ## Sandbox
 
