@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
@@ -137,16 +136,54 @@ function findPackageRoot(
 	return undefined;
 }
 
+function resolveSdkSourceForDiagnostics(): string {
+	try {
+		const entryPath = fs.realpathSync(
+			new URL(import.meta.resolve("@earendil-works/pi-coding-agent")),
+		);
+		return (
+			findPackageRoot(entryPath, "@earendil-works/pi-coding-agent") ??
+			dirname(entryPath)
+		);
+	} catch {
+		return "@earendil-works/pi-coding-agent";
+	}
+}
+
+function findPackageRootFromShimScript(binPath: string): string | undefined {
+	// pnpm installs bins as shell-script shims rather than symlinks, so
+	// realpathSync() never leaves the bin directory and the package-root walk
+	// finds nothing. The shim embeds the resolved package path in the
+	// NODE_PATH exports it sets, so recover the package root from the script.
+	let text: string;
+	try {
+		const stats = fs.statSync(binPath);
+		if (!stats.isFile() || stats.size > 64 * 1024) return undefined;
+		text = fs.readFileSync(binPath, "utf8");
+	} catch {
+		return undefined;
+	}
+	const match = text.match(
+		/[^"':\s]+\/node_modules\/@earendil-works\/pi-coding-agent(?=[/"':\s])/,
+	);
+	if (!match) return undefined;
+	try {
+		return findPackageRoot(match[0], "@earendil-works/pi-coding-agent");
+	} catch {
+		return undefined;
+	}
+}
+
 async function importPiSdk(): Promise<SdkImportResult> {
 	try {
-		const require = createRequire(import.meta.url);
-		const packageJson = require.resolve(
-			"@earendil-works/pi-coding-agent/package.json",
-		);
-		return {
-			module: (await import("@earendil-works/pi-coding-agent")) as PiSdkModule,
-			source: dirname(packageJson),
-		};
+		// Resolve through normal node_modules lookup. This must be an ESM
+		// import of the bare specifier: the engine's "exports" map only
+		// defines "." with an "import" condition, so require.resolve() of the
+		// bare name or of "./package.json" always throws.
+		const module = (await import(
+			"@earendil-works/pi-coding-agent"
+		)) as PiSdkModule;
+		return { module, source: resolveSdkSourceForDiagnostics() };
 	} catch (projectError) {
 		let piBin: string;
 		try {
@@ -162,10 +199,9 @@ async function importPiSdk(): Promise<SdkImportResult> {
 		}
 
 		const realPiBin = fs.realpathSync(piBin);
-		const packageRoot = findPackageRoot(
-			realPiBin,
-			"@earendil-works/pi-coding-agent",
-		);
+		const packageRoot =
+			findPackageRoot(realPiBin, "@earendil-works/pi-coding-agent") ??
+			findPackageRootFromShimScript(realPiBin);
 		if (!packageRoot)
 			throw new Error(
 				`Found pi at ${realPiBin}, but could not locate @earendil-works/pi-coding-agent.`,
