@@ -64,6 +64,18 @@ try {
 		failureKind: "model",
 		message: "child model failed",
 	});
+	const childUsageEvent = await recordSubagentChildEvent({
+		cwd,
+		runId,
+		event: "completed",
+		childRunId: "run_child_api_usage",
+		childTaskId: "task-5",
+		usage: { totalTokens: 1234, costUsd: 0.05 },
+	});
+	assert.deepEqual(childUsageEvent.data?.usage, {
+		totalTokens: 1234,
+		costUsd: 0.05,
+	});
 
 	const status = await getSubagentStatus({ cwd, runId, attemptId });
 	assert.equal(status?.status, "completed");

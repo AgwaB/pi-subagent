@@ -65,6 +65,8 @@ export interface RecordSubagentChildEventOptions extends RunStatusRef {
 	status?: Status;
 	failureKind?: FailureKind | string | null;
 	message?: string;
+	/** Child usage totals (tokens/cost), usually sent with terminal events. */
+	usage?: Record<string, unknown>;
 }
 
 export class SubagentValidationError extends Error {
@@ -305,6 +307,7 @@ export async function recordSubagentChildEvent(
 		childTaskId,
 		failureKind,
 		message,
+		usage,
 	} = options;
 	const ref = await resolveRunRef(options);
 	return await appendRunEvent(ref, {
@@ -316,6 +319,7 @@ export async function recordSubagentChildEvent(
 			...(workflowRunId === undefined ? {} : { workflowRunId }),
 			...(childTaskId === undefined ? {} : { taskId: childTaskId }),
 			...(failureKind === undefined ? {} : { failureKind }),
+			...(usage === undefined ? {} : { usage }),
 		},
 	});
 }
