@@ -94,6 +94,17 @@ export interface PiJsonParseResult {
 	errors: string[];
 	parseErrors: string[];
 	metadata: Partial<ResultMetadata>;
+	usageAccumulation?: PiUsageAccumulation;
+}
+
+export interface PiUsageAccumulationSlot {
+	count: number;
+	total: unknown;
+}
+
+export interface PiUsageAccumulation {
+	messageEnd: PiUsageAccumulationSlot;
+	turnEnd: PiUsageAccumulationSlot;
 }
 
 export interface ContextLengthResolution {
@@ -243,6 +254,55 @@ function errorText(value: unknown): string | undefined {
 	return undefined;
 }
 
+/**
+ * Deep-sums numeric usage fields so multi-turn runs report whole-run totals.
+ * Pi reports per-request usage on each assistant message; keeping only the
+ * last one drops every earlier turn's tokens and cost.
+ */
+function sumUsageValues(total: unknown, next: unknown): unknown {
+	if (typeof next === "number") {
+		if (!Number.isFinite(next)) return total;
+		return typeof total === "number" ? total + next : next;
+	}
+	if (typeof next === "object" && next !== null && !Array.isArray(next)) {
+		const base: Record<string, unknown> =
+			typeof total === "object" && total !== null && !Array.isArray(total)
+				? { ...(total as Record<string, unknown>) }
+				: {};
+		for (const [key, value] of Object.entries(next)) {
+			const merged = sumUsageValues(base[key], value);
+			if (merged !== undefined) base[key] = merged;
+		}
+		return base;
+	}
+	return next ?? total;
+}
+
+function accumulateAssistantUsage(
+	parsed: PiJsonParseResult,
+	eventType: "message_end" | "turn_end",
+	usage: unknown,
+): void {
+	const accumulation = (parsed.usageAccumulation ??= {
+		messageEnd: { count: 0, total: undefined },
+		turnEnd: { count: 0, total: undefined },
+	});
+	const slot =
+		eventType === "message_end"
+			? accumulation.messageEnd
+			: accumulation.turnEnd;
+	slot.count += 1;
+	slot.total = sumUsageValues(slot.total, usage);
+	// Pi emits both message_end and turn_end for the same assistant message, so
+	// summing across both streams would double-count. message_end fires once per
+	// assistant request and is authoritative; turn_end totals only back up runs
+	// whose stream never surfaced a usable message_end.
+	parsed.metadata.usage =
+		accumulation.messageEnd.count > 0
+			? accumulation.messageEnd.total
+			: accumulation.turnEnd.total;
+}
+
 const PARSED_EVENT_PATTERN =
 	/"type"\s*:\s*"(?:message_end|turn_end|agent_end|error)"/;
 const TOOL_CALL_EVENT_PATTERN =
@@ -310,7 +370,11 @@ function parsePiJsonLine(
 			if (typeof assistant.model === "string")
 				parsed.metadata.model = assistant.model;
 			if (assistant.usage !== undefined)
-				parsed.metadata.usage = assistant.usage;
+				accumulateAssistantUsage(
+					parsed,
+					type as "message_end" | "turn_end",
+					assistant.usage,
+				);
 			if (typeof assistant.stopReason === "string")
 				parsed.metadata.stopReason = assistant.stopReason;
 			if (assistant.stopReason === "error") {
