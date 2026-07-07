@@ -333,6 +333,7 @@ export async function runSubagentTask(
 		const modelOptions = {
 			...common,
 			captureToolCalls: input.captureToolCalls,
+			toolResultBudget: input.toolResultBudget,
 			agent: requestedAgent,
 			task: input.task,
 			roleContext: input.roleContext,
