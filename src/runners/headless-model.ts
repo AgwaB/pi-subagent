@@ -1,8 +1,8 @@
 import { once } from "node:events";
-import { createReadStream, createWriteStream, existsSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { createReadStream, createWriteStream, existsSync, realpathSync } from "node:fs";
 import { readFile, realpath, stat, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
 import {
@@ -560,10 +560,62 @@ function buildPrompt(options: RunHeadlessModelOptions): string {
 		.join("\n\n");
 }
 
+// Normalize MSYS/Git-Bash style paths (/c/Users/...) to Windows drive paths
+// (C:/Users/...) so native Node fs calls work when pi is launched from bash.
+function normalizeHostPath(p: string): string {
+	if (process.platform !== "win32") return p;
+	const m = /^\/[a-zA-Z]\//.exec(p);
+	if (m) return `${m[0][1].toUpperCase()}:${p.slice(2)}`;
+	return p;
+}
+
+// True when the path looks like pi's cli entry (dist/cli.js inside the
+// pi-coding-agent package). Guards against mistaking unrelated scripts for
+// pi — e.g. the durable worker that hosts async runs is itself a node script
+// with argv[1] pointing at durable-worker.mjs, not at pi.
+function isPiCliScript(p: string): boolean {
+	const base = basename(p).toLowerCase();
+	if (base !== "cli.js" && base !== "cli") return false;
+	return /pi-coding-agent/.test(p.replaceAll("\\", "/"));
+}
+
+// Locate pi's cli script from PATH (npm shim / symlink installs), so child
+// workers can be spawned as node <cli.js> on every platform, including from
+// the durable worker where process.argv[1] is not pi's script.
+function resolvePiCliFromPath(): string | undefined {
+	try {
+		const found = execFileSync(
+			process.platform === "win32" ? "where" : "which",
+			["pi"],
+			{ encoding: "utf8" },
+		)
+			.trim()
+			.split(/\r?\n/)[0];
+		if (found.length === 0) return undefined;
+		const real = realpathSync(normalizeHostPath(found));
+		if (isPiCliScript(real) && existsSync(real)) return real;
+		// Windows npm: the bin is a real shim next to node_modules with the package.
+		const siblingCli = join(
+			dirname(real),
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			"dist",
+			"cli.js",
+		);
+		if (existsSync(siblingCli)) return siblingCli;
+		// POSIX npm: the bin is a symlink; realpath already points into the
+		// package, so the first check catches it. Handle walk-up as a fallback.
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 // Resolve how to launch the child pi process. On Windows, pi is installed as a
 // .cmd shim / bash script which cannot be spawned with shell:false (ENOENT, see
 // earendil-works/pi#2464); spawning the node runtime with the actual cli script
-// (the one running us) avoids that on every platform.
+// avoids that on every platform.
 function resolvePiInvocation(): { command: string; args: string[] } {
 	const execName = basename(process.execPath).toLowerCase();
 	if (!/^(node|bun)(\.exe)?$/.test(execName)) {
@@ -573,8 +625,12 @@ function resolvePiInvocation(): { command: string; args: string[] } {
 		return { command: process.execPath, args: [] };
 	}
 	const currentScript = process.argv[1];
-	if (currentScript && existsSync(currentScript)) {
+	if (currentScript && isPiCliScript(currentScript) && existsSync(currentScript)) {
 		return { command: process.execPath, args: [currentScript] };
+	}
+	const fromPath = resolvePiCliFromPath();
+	if (fromPath !== undefined) {
+		return { command: process.execPath, args: [fromPath] };
 	}
 	return { command: "pi", args: [] };
 }
