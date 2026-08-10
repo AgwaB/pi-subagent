@@ -18,7 +18,12 @@ pi install npm:@agwab/pi-subagent
 
 Then reload Pi.
 
-Requires Node.js `>=22.19.0` on macOS or Linux. Native Windows is not supported (POSIX process groups, tmux, and `which`-based Pi discovery); use WSL2.
+Requires Node.js `>=22.19.0`.
+
+Platform support:
+
+- **Linux / macOS** — fully supported. Visible workers use `tmux` (must be installed and on `PATH`).
+- **Windows (native)** — `inline` and `headless` backends work out of the box. Visible workers use **`herdr`** ([herdr.dev](https://herdr.dev), a terminal workspace manager for coding agents) instead of tmux; request them with `backend: "herdr"` (or `visible: true` together with `backend: "herdr"`). The `tmux` backend is not available on native Windows; WSL2 is an option if you prefer tmux.
 
 For local development, add this package as a Pi extension source and reload Pi.
 
@@ -41,6 +46,29 @@ Start a background audit and let me inspect it in /subagent panel.
 ## What it does
 
 Tool: `subagent`
+
+### Backends
+
+Workers run in one of four backends:
+
+| Backend | Platforms | Visible | Notes |
+|---------|-----------|---------|-------|
+| `inline` (default) | all | no | In-process SDK session; no child process |
+| `headless` | all | no | Spawns a `pi --mode json` child process |
+| `tmux` | Linux / macOS | yes | Worker runs in a detached tmux session |
+| `herdr` | Windows, Linux, macOS | yes | Worker runs in a herdr workspace/pane |
+
+`backend` defaults to `auto`: `visible` → `tmux`, `sandbox` → `headless`, otherwise `inline`. Pass `backend` explicitly to force one. On native Windows, `herdr` is the only visible backend:
+
+```json
+{
+  "backend": "herdr",
+  "agent": "worker",
+  "task": "Run the tests and report the results."
+}
+```
+
+The result envelope reports `herdr: { workspaceId, tabId, paneId }` for herdr runs. Requires the `herdr` CLI and a running herdr server (automatic once Herdr is installed).
 
 ### Sandbox
 
