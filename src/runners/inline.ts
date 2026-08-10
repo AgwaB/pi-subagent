@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildAgentSystemPrompt, type AgentDefinition } from "../agents.ts";
@@ -137,21 +136,52 @@ function findPackageRoot(
 	return undefined;
 }
 
+// Normalize MSYS/Git-Bash style paths (/c/Users/...) to Windows drive paths
+// (C:/Users/...) so native Node fs calls work when pi is launched from bash.
+function normalizeHostPath(p: string): string {
+	if (process.platform !== "win32") return p;
+	const m = /^\/[a-zA-Z]\//.exec(p);
+	if (m) return `${m[0][1].toUpperCase()}:${p.slice(2)}`;
+	return p;
+}
+
 async function importPiSdk(): Promise<SdkImportResult> {
+	// Primary: bare ESM import. When loaded as a pi extension the loader
+	// aliases/virtualizes this specifier to the live SDK, so this works on
+	// any platform (npm .cmd shims, MSYS paths, pnpm shims, ...).
 	try {
-		const require = createRequire(import.meta.url);
-		const packageJson = require.resolve(
-			"@earendil-works/pi-coding-agent/package.json",
-		);
-		return {
-			module: (await import("@earendil-works/pi-coding-agent")) as PiSdkModule,
-			source: dirname(packageJson),
-		};
+		const module = (await import(
+			"@earendil-works/pi-coding-agent",
+		)) as unknown as PiSdkModule;
+		return { module, source: "runtime" };
 	} catch (projectError) {
-		let piBin: string;
+		// Fallback: locate the SDK on disk from a pi entry point. Prefer the
+		// cli script that is actually running us (process.argv[1]); otherwise
+		// resolve pi via `where` (Windows) / `which` (POSIX).
+		let piEntry: string | undefined;
 		try {
-			piBin = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
+			const currentScript = process.argv[1];
+			if (currentScript && fs.existsSync(currentScript)) {
+				piEntry = currentScript;
+			}
 		} catch {
+			/* ignore */
+		}
+		if (piEntry === undefined) {
+			try {
+				const found = execFileSync(
+					process.platform === "win32" ? "where" : "which",
+					["pi"],
+					{ encoding: "utf8" },
+				)
+					.trim()
+					.split(/\r?\n/)[0];
+				if (found.length > 0) piEntry = found;
+			} catch {
+				/* fall through */
+			}
+		}
+		if (piEntry === undefined) {
 			const message =
 				projectError instanceof Error
 					? projectError.message
@@ -161,14 +191,26 @@ async function importPiSdk(): Promise<SdkImportResult> {
 			);
 		}
 
-		const realPiBin = fs.realpathSync(piBin);
-		const packageRoot = findPackageRoot(
-			realPiBin,
-			"@earendil-works/pi-coding-agent",
+		const realPiEntry = fs.realpathSync(normalizeHostPath(piEntry));
+		// Walk up from the entry (cli.js resolves to the package root); also
+		// check a sibling node_modules for shim-style installs (npm on Windows).
+		const siblingPkg = join(
+			dirname(realPiEntry),
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
 		);
+		const siblingValid =
+			fs.existsSync(join(siblingPkg, "package.json")) &&
+			JSON.parse(
+				fs.readFileSync(join(siblingPkg, "package.json"), "utf8"),
+			).name === "@earendil-works/pi-coding-agent";
+		const packageRoot =
+			findPackageRoot(realPiEntry, "@earendil-works/pi-coding-agent") ??
+			(siblingValid ? siblingPkg : undefined);
 		if (!packageRoot)
 			throw new Error(
-				`Found pi at ${realPiBin}, but could not locate @earendil-works/pi-coding-agent.`,
+				`Found pi at ${realPiEntry}, but could not locate @earendil-works/pi-coding-agent.`,
 			);
 		return {
 			module: (await import(

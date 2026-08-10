@@ -148,7 +148,7 @@ async function killTmuxSession(sessionName: string): Promise<void> {
 	}
 }
 
-function workerScript(
+export function workerScript(
 	argv: readonly [string, ...string[]],
 	cwd: string,
 	eventPath: string,
