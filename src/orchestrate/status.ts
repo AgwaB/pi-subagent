@@ -492,6 +492,7 @@ function coerceResultEnvelope(value: unknown): ResultEnvelope | null {
 		artifacts: Array.isArray(raw.artifacts) ? raw.artifacts : [],
 		metadata: raw.metadata ?? { contextLengthExceeded: false },
 		...(raw.tmux === undefined ? {} : { tmux: raw.tmux }),
+		...(raw.herdr === undefined ? {} : { herdr: raw.herdr }),
 		...(raw.completion === undefined ? {} : { completion: raw.completion }),
 	} as ResultEnvelope;
 }

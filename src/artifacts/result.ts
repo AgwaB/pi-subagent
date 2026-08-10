@@ -55,6 +55,12 @@ export interface ResultTmuxMetadata {
 	paneId: string | null;
 }
 
+export interface ResultHerdrMetadata {
+	workspaceId: string;
+	tabId: string | null;
+	paneId: string | null;
+}
+
 export interface CompletionMetadata {
 	onComplete: string | null;
 	notified: boolean;
@@ -127,6 +133,7 @@ export interface ResultEnvelopeInput {
 	signal?: string | null;
 	artifacts?: ArtifactRef[];
 	tmux?: ResultTmuxMetadata;
+	herdr?: ResultHerdrMetadata;
 	completion?: CompletionMetadata;
 	metadata?: Partial<ResultMetadata> | null;
 	/** @deprecated v1 compatibility only. */
@@ -152,6 +159,7 @@ export interface ResultEnvelope {
 	artifacts: ArtifactRef[];
 	metadata: ResultMetadata;
 	tmux?: ResultTmuxMetadata;
+	herdr?: ResultHerdrMetadata;
 	completion?: CompletionMetadata;
 	/** @deprecated v1 compatibility only. */
 	taskId?: string;
@@ -316,6 +324,7 @@ export function createResultEnvelope(
 		artifacts: dedupeArtifactRefs(input.artifacts ?? []),
 		metadata: normalizeMetadata(input),
 		...(input.tmux === undefined ? {} : { tmux: input.tmux }),
+		...(input.herdr === undefined ? {} : { herdr: input.herdr }),
 		...(input.completion === undefined ? {} : { completion: input.completion }),
 		...(input.taskId === undefined ? {} : { taskId: input.taskId }),
 	};

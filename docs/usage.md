@@ -222,7 +222,7 @@ The locator index is only a pointer for finding runs across cwd boundaries. `run
 |---|---|
 | `cwd` | Run from a specific project directory. Existing-run actions accept `cwd` to force a registry location; if omitted, recent runs can be found by global locator and older runs fall back to the current cwd. |
 | `timeoutMs` | Limit worker execution time for `run`; limit polling duration for `action: "wait"`. Omit it for no runtime kill deadline; `wait` alone defaults to 60s polling. |
-| `visible` | Use a visible tmux-backed worker (`visible: true`). |
+| `visible` | Use a visible worker (`visible: true`): tmux on Linux/macOS, or pair with `backend: "herdr"` on Windows. |
 | `concurrency` | Cap parallel run fan-out. |
 | `failFast` | For synchronous parallel runs, stop scheduling new siblings after the first failed result. |
 | `cancelSiblingsOnFailure` | For synchronous parallel runs, abort already-running siblings after the first failed result; implies fail-fast scheduling. |
@@ -341,7 +341,7 @@ Backend is optional. When omitted, the engine uses auto-selection:
 | `sandbox: true` | `headless`, unless tmux/visible is explicit |
 | normal `agent`/`task` | `inline` |
 
-Supported explicit backend values are `auto`, `inline`, `headless`, and `tmux`. Most users should omit `backend`. Use `visible: true` only when you want a tmux-backed visible worker.
+Supported explicit backend values are `auto`, `inline`, `headless`, `tmux`, and `herdr`. Most users should omit `backend`. Use `visible: true` only when you want a visible worker: `tmux` on Linux/macOS, or pass `backend: "herdr"` on native Windows — herdr is the only visible backend there and requires the herdr CLI plus a running herdr server.
 
 Child sessions load Pi's normal ambient extensions and skills by default, so package tools such as web access are available when enabled in Pi settings. Pass `extensions: []` or `skills: []` for a hermetic child. Recursive subagent spawning is blocked by excluding the `subagent` tool from child sessions.
 

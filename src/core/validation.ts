@@ -789,9 +789,14 @@ export function validateResolveInput(
 	const requested = backend ?? "auto";
 	const sandboxed = input.sandbox !== undefined && input.sandbox !== null;
 
-	if (input.visible === true && requested !== "auto" && requested !== "tmux") {
+	if (
+		input.visible === true &&
+		requested !== "auto" &&
+		requested !== "tmux" &&
+		requested !== "herdr"
+	) {
 		return failure(
-			'visible execution requires backend "tmux" or "auto"; explicit non-tmux backends cannot run visibly.',
+			'visible execution requires backend "tmux", "herdr", or "auto"; explicit non-tmux/herdr backends cannot run visibly.',
 			failureBackend(backend),
 		);
 	}

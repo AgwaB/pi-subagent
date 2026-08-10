@@ -20,6 +20,7 @@ import type {
 	ArtifactRef,
 	ResultEnvelope,
 	ResultTmuxMetadata,
+	ResultHerdrMetadata,
 	ResultWorkspace,
 } from "./result.ts";
 
@@ -84,6 +85,7 @@ export interface RunAttemptRecord {
 	workspace?: Partial<ResultWorkspace>;
 	process?: ProcessMetadata;
 	tmux?: ResultTmuxMetadata;
+	herdr?: ResultHerdrMetadata;
 }
 
 export interface RunRecord {
@@ -179,6 +181,7 @@ export interface UpsertAttemptOptions extends RunRef {
 	workspace?: Partial<ResultWorkspace>;
 	process?: ProcessMetadata;
 	tmux?: ResultTmuxMetadata;
+	herdr?: ResultHerdrMetadata;
 	activate?: boolean;
 	/** No-op when patching an existing terminal attempt. Used by heartbeats/process updates. */
 	onlyIfActive?: boolean;
@@ -362,6 +365,10 @@ function coerceV1Record(value: unknown, paths: RunPaths): RunRecord | null {
 			tmux:
 				typeof task.tmux === "object" && task.tmux !== null
 					? (task.tmux as ResultTmuxMetadata)
+					: undefined,
+			herdr:
+				typeof task.herdr === "object" && task.herdr !== null
+					? (task.herdr as ResultHerdrMetadata)
 					: undefined,
 		};
 	});
@@ -595,6 +602,7 @@ function normalizeAttemptSeed(
 		workspace: task.workspace,
 		process: task.process,
 		tmux: task.tmux,
+		herdr: task.herdr,
 	};
 }
 
@@ -732,6 +740,7 @@ export async function upsertRunAttempt(
 			workspace: options.workspace,
 			process: options.process,
 			tmux: options.tmux,
+			herdr: options.herdr,
 		};
 		const baseRecord: RunRecord = existing ?? {
 			schemaVersion: RUN_RECORD_SCHEMA_VERSION,
@@ -871,6 +880,7 @@ export async function finishAttemptFromResult(
 		outputPath: artifactPath(result, "output"),
 		workspace: result.workspace,
 		tmux: result.tmux,
+		herdr: result.herdr,
 		activate: true,
 	});
 }
@@ -953,6 +963,7 @@ async function finishAttemptFromResultUnlocked(
 		outputPath: artifactPath(result, "output"),
 		workspace: result.workspace,
 		tmux: result.tmux,
+		herdr: result.herdr,
 	};
 	if (index >= 0) attempts[index] = attempt;
 	else attempts.push(attempt);
