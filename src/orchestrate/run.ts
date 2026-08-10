@@ -20,6 +20,7 @@ import type {
 } from "../core/constants.ts";
 import { resolveBackend } from "../core/resolver.ts";
 import { runHeadlessModel } from "../runners/headless-model.ts";
+import { runHerdrModel } from "../runners/herdr.ts";
 import { runInlineModel } from "../runners/inline.ts";
 import { runTmuxModel } from "../runners/tmux.ts";
 import {
@@ -351,9 +352,11 @@ export async function runSubagentTask(
 		let result: ResultEnvelope =
 			backend === "tmux"
 				? await runTmuxModel(modelOptions)
-				: backend === "inline"
-					? await runInlineModel(modelOptions)
-					: await runHeadlessModel(modelOptions);
+				: backend === "herdr"
+					? await runHerdrModel(modelOptions)
+					: backend === "inline"
+						? await runInlineModel(modelOptions)
+						: await runHeadlessModel(modelOptions);
 		result = await finalizeWorktreeResult(workspace, result);
 
 		await finishAttemptFromResult(runRef, result);

@@ -288,6 +288,7 @@ function compactResult(result: ResultEnvelope, error?: string) {
 		sandbox: result.sandbox,
 		workspace: result.workspace,
 		...(result.tmux === undefined ? {} : { tmux: result.tmux }),
+		...(result.herdr === undefined ? {} : { herdr: result.herdr }),
 		...(result.completion === undefined
 			? {}
 			: { completion: result.completion }),
@@ -570,8 +571,13 @@ function unsupportedPathError(
 			: undefined;
 	}
 
-	if (backend !== "inline" && backend !== "headless" && backend !== "tmux") {
-		return `backend "${backend}" is not implemented in this MVP; only inline, headless, and tmux execution are supported.`;
+	if (
+		backend !== "inline" &&
+		backend !== "headless" &&
+		backend !== "tmux" &&
+		backend !== "herdr"
+	) {
+		return `backend "${backend}" is not implemented in this MVP; only inline, headless, tmux, and herdr execution are supported.`;
 	}
 
 	if (hasAnyKey(raw, AGENT_TASK_KEYS) && input.task === undefined) {
@@ -794,7 +800,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 		name: TOOL_NAME,
 		label: "Subagent",
 		description:
-			"Subagent engine. Executes headless/tmux/inline workers; supports workspace:auto/worktree isolation, bounded parallel fanout, async lifecycle lookup, mark-background, reconcile, and conservative interrupt. Workspaces default to shared; set worktree:true for parallel tasks that mutate files.",
+			"Subagent engine. Executes headless/tmux/herdr/inline workers; supports workspace:auto/worktree isolation, bounded parallel fanout, async lifecycle lookup, mark-background, reconcile, and conservative interrupt. Workspaces default to shared; set worktree:true for parallel tasks that mutate files.",
 		parameters: Type.Object({
 			backend: Type.Optional(
 				Type.Union(BACKENDS.map((value) => Type.Literal(value))),

@@ -1,5 +1,10 @@
-export const BACKENDS = ["inline", "headless", "tmux", "auto"] as const;
-export const RESOLVED_BACKENDS = ["inline", "headless", "tmux"] as const;
+export const BACKENDS = ["inline", "headless", "tmux", "herdr", "auto"] as const;
+export const RESOLVED_BACKENDS = [
+	"inline",
+	"headless",
+	"tmux",
+	"herdr",
+] as const;
 export const STATUSES = [
 	"pending",
 	"running",
