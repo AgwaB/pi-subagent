@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createJiti } from "jiti";
 
+import { installDurableWorkerBinding } from "./durable-worker-binding.mjs";
+
 const payloadPath = process.argv[2];
 if (!payloadPath) {
 	console.error("durable worker missing payload path");
@@ -180,13 +182,14 @@ heartbeat.unref?.();
 try {
 	await maybeDelayStartForTests();
 	if (input?.durableLaunchBarrier) {
-		await launchBarrier.awaitDurableLaunchBarrier({
+		const ack = await launchBarrier.awaitDurableLaunchBarrier({
 			descriptor: input.durableLaunchBarrier,
 			runId,
 			attemptId,
 			launchPayloadSha256,
 			workerProcessGroupId,
 		});
+		installDurableWorkerBinding({ payload, launchPayloadSha256, ack });
 	}
 	await runSubagentTask({
 		input: { ...input, async: false, onComplete: undefined },
