@@ -101,6 +101,45 @@ await recordSubagentChildEvent({
 
 The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import internal files such as `src/orchestrate/*` because only documented package subpaths are public.
 
+### General durable launch barrier
+
+Code API orchestrators that must durably commit their own authority or accounting state before a child can execute a model/provider may opt into a general two-phase barrier:
+
+```ts
+import {
+  createDurableLaunchBarrier,
+  durableLaunchBarrierDigest,
+  releaseDurableLaunchBarrier,
+  runSubagent,
+  waitForDurableLaunchBarrierAck,
+  waitForDurableLaunchBarrierReady,
+} from "@agwab/pi-subagent/api";
+
+const barrier = await createDurableLaunchBarrier({
+  directory: "/absolute/private/path/attempt-barrier",
+  subjectSha256: durableLaunchBarrierDigest({ operation: "my-operation" }),
+});
+const run = await runSubagent({
+  cwd: process.cwd(),
+  backend: "headless",
+  task: "Perform the bounded operation.",
+  async: true,
+  onComplete: "detach",
+  durableLaunchBarrier: barrier,
+});
+const ready = await waitForDurableLaunchBarrierReady(barrier);
+
+// Persist and crash-durably sync the caller's authorization/accounting state here.
+const release = await releaseDurableLaunchBarrier(
+  barrier,
+  ready,
+  durableLaunchBarrierDigest({ authorityState: "consumed" }),
+);
+await waitForDurableLaunchBarrierAck(barrier, release);
+```
+
+The worker writes an owner-only, fsynced ready record and waits without entering the model/provider runner. Release and acknowledgement records are challenge-, subject-, run-, attempt-, and payload-bound. Timeout, path/identity drift, duplicate release, or malformed records fail closed. The barrier is a general code-API primitive: pi-subagent does not interpret or grant the caller's authority, and the public `subagent` model tool does not expose this field. Parallel children require distinct barriers.
+
 Project-local agents are repository-controlled. Project-local agent confirmation is disabled by default; use trusted repositories or constrain lookup with `agentScope:"global"`. The code API has no interactive prompt, so setting `confirmProjectAgents:true` rejects project-local agents instead of prompting.
 
 ## Single run

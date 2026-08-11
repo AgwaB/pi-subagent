@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createJiti } from "jiti";
 
@@ -9,12 +10,15 @@ if (!payloadPath) {
 }
 
 const jiti = createJiti(import.meta.url, { interopDefault: false });
-const [{ runSubagentTask }, artifacts] = await Promise.all([
+const [{ runSubagentTask }, artifacts, launchBarrier] = await Promise.all([
 	jiti.import("../orchestrate/run.ts"),
 	jiti.import("../artifacts/index.ts"),
+	jiti.import("../durable-launch-barrier.ts"),
 ]);
 
-const payload = JSON.parse(await readFile(payloadPath, "utf8"));
+const payloadBytes = await readFile(payloadPath);
+const launchPayloadSha256 = createHash("sha256").update(payloadBytes).digest("hex");
+const payload = JSON.parse(payloadBytes.toString("utf8"));
 const { input, cwd, runId, attemptId } = payload;
 const heartbeatMs = Math.max(
 	50,
@@ -175,6 +179,15 @@ heartbeat = setInterval(() => {
 heartbeat.unref?.();
 try {
 	await maybeDelayStartForTests();
+	if (input?.durableLaunchBarrier) {
+		await launchBarrier.awaitDurableLaunchBarrier({
+			descriptor: input.durableLaunchBarrier,
+			runId,
+			attemptId,
+			launchPayloadSha256,
+			workerProcessGroupId,
+		});
+	}
 	await runSubagentTask({
 		input: { ...input, async: false, onComplete: undefined },
 		cwd,

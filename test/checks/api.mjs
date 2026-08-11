@@ -4,13 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
 import {
+	createDurableLaunchBarrier,
+	durableLaunchBarrierDigest,
 	getSubagentLogs,
 	getSubagentStatus,
 	interruptSubagent,
 	reconcileSubagentRun,
 	recordSubagentChildEvent,
+	releaseDurableLaunchBarrier,
 	runSubagent,
 	SubagentValidationError,
+	waitForDurableLaunchBarrierAck,
+	waitForDurableLaunchBarrierReady,
 	waitForSubagent,
 } from "../../api.mjs";
 import { createAttemptArtifactStore } from "../../src/artifacts/index.ts";
@@ -25,6 +30,11 @@ assert.equal(typeof waitForSubagent, "function");
 assert.equal(typeof interruptSubagent, "function");
 assert.equal(typeof reconcileSubagentRun, "function");
 assert.equal(typeof recordSubagentChildEvent, "function");
+assert.equal(typeof createDurableLaunchBarrier, "function");
+assert.equal(typeof durableLaunchBarrierDigest, "function");
+assert.equal(typeof releaseDurableLaunchBarrier, "function");
+assert.equal(typeof waitForDurableLaunchBarrierAck, "function");
+assert.equal(typeof waitForDurableLaunchBarrierReady, "function");
 
 let cwd;
 try {

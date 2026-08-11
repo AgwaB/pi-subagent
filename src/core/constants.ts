@@ -1,3 +1,5 @@
+import type { DurableLaunchBarrierDescriptor } from "../durable-launch-barrier.ts";
+
 export const BACKENDS = ["inline", "headless", "tmux", "auto"] as const;
 export const RESOLVED_BACKENDS = ["inline", "headless", "tmux"] as const;
 export const STATUSES = [
@@ -159,6 +161,8 @@ export interface ResolveInput {
 	sessionId?: string;
 	/** Pi session id of the parent that launched this run. Injected from ctx, not a model-settable tool arg. */
 	parentSessionId?: string;
+	/** Optional general two-phase gate that pauses a durable worker before model/provider execution. */
+	durableLaunchBarrier?: DurableLaunchBarrierDescriptor;
 }
 
 export interface ResolveSuccess {

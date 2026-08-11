@@ -25,6 +25,7 @@ import {
 	type ToolResultBudgetInput,
 	type WorkspaceInput,
 } from "./constants.ts";
+import { assertDurableLaunchBarrierDescriptor } from "../durable-launch-barrier.ts";
 
 export type ResolveValidationResult =
 	| { ok: true; input: ResolveInput }
@@ -694,6 +695,18 @@ export function validateResolveInput(
 		input.async = asyncValue;
 	}
 
+	if (raw.durableLaunchBarrier !== undefined) {
+		try {
+			assertDurableLaunchBarrierDescriptor(raw.durableLaunchBarrier);
+		} catch (error) {
+			return failure(
+				error instanceof Error ? error.message : String(error),
+				backendForKnownFailure,
+			);
+		}
+		input.durableLaunchBarrier = raw.durableLaunchBarrier;
+	}
+
 	if (raw.onComplete !== undefined) {
 		if (!isOnCompleteAction(raw.onComplete)) {
 			return failure(
@@ -788,6 +801,25 @@ export function validateResolveInput(
 
 	const requested = backend ?? "auto";
 	const sandboxed = input.sandbox !== undefined && input.sandbox !== null;
+
+	if (input.durableLaunchBarrier !== undefined) {
+		if (input.mode === "parallel" || input.tasks !== undefined) {
+			return failure(
+				"durableLaunchBarrier supports one durable run only; parallel tasks need distinct barriers.",
+				backendForKnownFailure,
+			);
+		}
+		if (
+			input.async !== true &&
+			input.onComplete !== "detach" &&
+			input.onComplete !== "notify"
+		) {
+			return failure(
+				"durableLaunchBarrier requires durable async execution.",
+				backendForKnownFailure,
+			);
+		}
+	}
 
 	if (input.visible === true && requested !== "auto" && requested !== "tmux") {
 		return failure(

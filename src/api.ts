@@ -45,6 +45,18 @@ import {
 	type WaitForRunResult,
 } from "./orchestrate/status.ts";
 
+export {
+	createDurableLaunchBarrier,
+	durableLaunchBarrierDigest,
+	releaseDurableLaunchBarrier,
+	waitForDurableLaunchBarrierAck,
+	waitForDurableLaunchBarrierReady,
+	type DurableLaunchBarrierAck,
+	type DurableLaunchBarrierDescriptor,
+	type DurableLaunchBarrierReady,
+	type DurableLaunchBarrierRelease,
+} from "./durable-launch-barrier.ts";
+
 export interface RunSubagentOptions extends ResolveInput {
 	signal?: AbortSignal;
 }
