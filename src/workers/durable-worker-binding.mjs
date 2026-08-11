@@ -4,6 +4,8 @@ export const EXTERNAL_LAUNCH_GRANT_SHA256_ENV =
 	"PI_WORKFLOW_EXTERNAL_LAUNCH_GRANT_SHA256";
 export const DURABLE_WORKER_BINDING_ENV =
 	"PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON";
+export const REQUIRE_EXTERNAL_LAUNCH_GRANT_ENV =
+	"PI_WORKFLOW_REQUIRE_EXTERNAL_LAUNCH_GRANT";
 
 function sha256Text(value) {
 	return createHash("sha256").update(value).digest("hex");
@@ -32,6 +34,11 @@ export function buildDurableWorkerBinding({
 	if (!descriptor) throw new Error("durable launch barrier is required");
 	if (!Number.isInteger(workerPid) || workerPid <= 0)
 		throw new Error("durable worker pid is invalid");
+	if (
+		externalLaunchGrantSha256 === undefined &&
+		process.env[REQUIRE_EXTERNAL_LAUNCH_GRANT_ENV] === "1"
+	)
+		throw new Error("required external launch grant digest is absent");
 	if (
 		externalLaunchGrantSha256 !== undefined &&
 		!/^[a-f0-9]{64}$/u.test(externalLaunchGrantSha256)

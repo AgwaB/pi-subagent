@@ -51,6 +51,17 @@ assert.deepEqual(binding, {
 	ackSha256: "5".repeat(64),
 	externalLaunchGrantSha256: grant,
 });
+process.env.PI_WORKFLOW_REQUIRE_EXTERNAL_LAUNCH_GRANT = "1";
+assert.throws(
+	() =>
+		buildDurableWorkerBinding({
+			payload,
+			launchPayloadSha256: "7".repeat(64),
+			ack,
+			workerPid: 1234,
+		}),
+	/required external launch grant digest is absent/u,
+);
 process.env.PI_WORKFLOW_EXTERNAL_LAUNCH_GRANT_SHA256 = grant;
 const installed = installDurableWorkerBinding({
 	payload,
@@ -70,6 +81,7 @@ assert.throws(
 	/external launch grant digest/u,
 );
 delete process.env.PI_WORKFLOW_EXTERNAL_LAUNCH_GRANT_SHA256;
+delete process.env.PI_WORKFLOW_REQUIRE_EXTERNAL_LAUNCH_GRANT;
 delete process.env[DURABLE_WORKER_BINDING_ENV];
 console.log(
 	JSON.stringify({
