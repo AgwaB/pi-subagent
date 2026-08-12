@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import {
 	buildDurableWorkerBinding,
 	DURABLE_WORKER_BINDING_ENV,
+	executionInputAfterDurableLaunch,
 	installDurableWorkerBinding,
 } from "../../src/workers/durable-worker-binding.mjs";
 
@@ -28,6 +29,19 @@ const ack = {
 	ackSha256: "5".repeat(64),
 };
 const grant = "6".repeat(64);
+const executionInput = executionInputAfterDurableLaunch({
+	...payload.input,
+	async: true,
+	onComplete: "detach",
+});
+assert.equal(executionInput.async, false);
+assert.equal(executionInput.onComplete, undefined);
+assert.equal(executionInput.durableLaunchBarrier, undefined);
+assert.equal(executionInput.correlationId, payload.input.correlationId);
+assert.throws(
+	() => executionInputAfterDurableLaunch({ async: true }),
+	/durable launch barrier is required before execution/u,
+);
 const binding = buildDurableWorkerBinding({
 	payload,
 	launchPayloadSha256: "7".repeat(64),
@@ -89,5 +103,6 @@ console.log(
 		grantBound: true,
 		barrierBound: true,
 		workerBound: true,
+		barrierConsumedBeforeSynchronousExecution: true,
 	}),
 );

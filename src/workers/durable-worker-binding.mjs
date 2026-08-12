@@ -78,6 +78,17 @@ export function buildDurableWorkerBinding({
 	});
 }
 
+export function executionInputAfterDurableLaunch(input) {
+	if (!input?.durableLaunchBarrier)
+		throw new Error("durable launch barrier is required before execution");
+	return Object.freeze({
+		...input,
+		async: false,
+		onComplete: undefined,
+		durableLaunchBarrier: undefined,
+	});
+}
+
 export function installDurableWorkerBinding(options) {
 	const binding = buildDurableWorkerBinding(options);
 	process.env[DURABLE_WORKER_BINDING_ENV] = JSON.stringify(binding);

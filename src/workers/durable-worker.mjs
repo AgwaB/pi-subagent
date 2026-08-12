@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createJiti } from "jiti";
 
-import { installDurableWorkerBinding } from "./durable-worker-binding.mjs";
+import {
+	executionInputAfterDurableLaunch,
+	installDurableWorkerBinding,
+} from "./durable-worker-binding.mjs";
 
 const payloadPath = process.argv[2];
 if (!payloadPath) {
@@ -191,8 +194,11 @@ try {
 		});
 		installDurableWorkerBinding({ payload, launchPayloadSha256, ack });
 	}
+	const executionInput = input?.durableLaunchBarrier
+		? executionInputAfterDurableLaunch(input)
+		: { ...input, async: false, onComplete: undefined };
 	await runSubagentTask({
-		input: { ...input, async: false, onComplete: undefined },
+		input: executionInput,
 		cwd,
 		runId,
 		attemptId,
