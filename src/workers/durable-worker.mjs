@@ -6,6 +6,8 @@ import { createJiti } from "jiti";
 import {
 	executionInputAfterDurableLaunch,
 	installDurableWorkerBinding,
+	isDurableWorkerGuardError,
+	prepareDurableWorkerBinding,
 } from "./durable-worker-binding.mjs";
 
 const payloadPath = process.argv[2];
@@ -185,6 +187,10 @@ heartbeat.unref?.();
 try {
 	await maybeDelayStartForTests();
 	if (input?.durableLaunchBarrier) {
+		const preflight = prepareDurableWorkerBinding({
+			payload,
+			launchPayloadSha256,
+		});
 		const ack = await launchBarrier.awaitDurableLaunchBarrier({
 			descriptor: input.durableLaunchBarrier,
 			runId,
@@ -192,7 +198,12 @@ try {
 			launchPayloadSha256,
 			workerProcessGroupId,
 		});
-		installDurableWorkerBinding({ payload, launchPayloadSha256, ack });
+		installDurableWorkerBinding({
+			payload,
+			launchPayloadSha256,
+			ack,
+			preflight,
+		});
 	}
 	const executionInput = input?.durableLaunchBarrier
 		? executionInputAfterDurableLaunch(input)
@@ -207,7 +218,11 @@ try {
 	const message = error instanceof Error ? error.message : String(error);
 	await writeTerminalResult({
 		status: "failed",
-		failureKind: "internal",
+		failureKind:
+			isDurableWorkerGuardError(error) ||
+			launchBarrier.isDurableLaunchBarrierError?.(error)
+				? "guard_failure"
+				: "internal",
 		message,
 		exitCode: null,
 	});

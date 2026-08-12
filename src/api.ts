@@ -48,9 +48,11 @@ import {
 export {
 	createDurableLaunchBarrier,
 	durableLaunchBarrierDigest,
+	isDurableLaunchBarrierError,
 	releaseDurableLaunchBarrier,
 	waitForDurableLaunchBarrierAck,
 	waitForDurableLaunchBarrierReady,
+	DurableLaunchBarrierError,
 	type DurableLaunchBarrierAck,
 	type DurableLaunchBarrierDescriptor,
 	type DurableLaunchBarrierReady,

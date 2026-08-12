@@ -118,6 +118,9 @@ import {
 const barrier = await createDurableLaunchBarrier({
   directory: "/absolute/private/path/attempt-barrier",
   subjectSha256: durableLaunchBarrierDigest({ operation: "my-operation" }),
+  // Optional: bind caller-verified per-run authority without giving
+  // pi-subagent responsibility for interpreting or validating that authority.
+  authorityBindingSha256: durableLaunchBarrierDigest({ grantId: "grant-123" }),
 });
 const run = await runSubagent({
   cwd: process.cwd(),
@@ -138,7 +141,7 @@ const release = await releaseDurableLaunchBarrier(
 await waitForDurableLaunchBarrierAck(barrier, release);
 ```
 
-The worker writes an owner-only, fsynced ready record and waits without entering the model/provider runner. Release and acknowledgement records are challenge-, subject-, run-, attempt-, and payload-bound. Timeout, path/identity drift, duplicate release, or malformed records fail closed. The barrier is a general code-API primitive: pi-subagent does not interpret or grant the caller's authority, and the public `subagent` model tool does not expose this field. Parallel children require distinct barriers.
+The worker validates all execution prerequisites before writing the owner-only, fsynced ready record, then waits without entering the model/provider runner. An acknowledgement means the released operation has passed worker preflight and may now enter execution; a preflight failure produces no acknowledgement. Release and acknowledgement records are challenge-, subject-, optional authority-binding-, run-, attempt-, and payload-bound. Matching record writes are idempotently recoverable after a partial filesystem commit. Timeout, path/identity drift, conflicting duplicate release, or malformed records fail closed as `guard_failure`. The barrier is a general code-API primitive: pi-subagent does not interpret, authenticate, or grant the caller's authority, and the public `subagent` model tool does not expose this field. `correlationId` and `runsDir` remain optional; omitted `runsDir` resolves to `.pi/agent/runs` under `cwd`. Parallel children require distinct barriers.
 
 Project-local agents are repository-controlled. Project-local agent confirmation is disabled by default; use trusted repositories or constrain lookup with `agentScope:"global"`. The code API has no interactive prompt, so setting `confirmProjectAgents:true` rejects project-local agents instead of prompting.
 

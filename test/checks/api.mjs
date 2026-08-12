@@ -6,9 +6,11 @@ import pkg from "../../package.json" with { type: "json" };
 import {
 	createDurableLaunchBarrier,
 	durableLaunchBarrierDigest,
+	DurableLaunchBarrierError,
 	getSubagentLogs,
 	getSubagentStatus,
 	interruptSubagent,
+	isDurableLaunchBarrierError,
 	reconcileSubagentRun,
 	recordSubagentChildEvent,
 	releaseDurableLaunchBarrier,
@@ -32,6 +34,11 @@ assert.equal(typeof reconcileSubagentRun, "function");
 assert.equal(typeof recordSubagentChildEvent, "function");
 assert.equal(typeof createDurableLaunchBarrier, "function");
 assert.equal(typeof durableLaunchBarrierDigest, "function");
+assert.equal(typeof DurableLaunchBarrierError, "function");
+assert.equal(typeof isDurableLaunchBarrierError, "function");
+const barrierError = new DurableLaunchBarrierError("blocked");
+assert.equal(isDurableLaunchBarrierError(barrierError), true);
+assert.equal(barrierError.failureKind, "guard_failure");
 assert.equal(typeof releaseDurableLaunchBarrier, "function");
 assert.equal(typeof waitForDurableLaunchBarrierAck, "function");
 assert.equal(typeof waitForDurableLaunchBarrierReady, "function");

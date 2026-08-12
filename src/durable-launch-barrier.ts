@@ -1,10 +1,25 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, mkdir, open, rm } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 
 const SHA256 = /^[a-f0-9]{64}$/u;
 const NONCE = /^[a-f0-9]{64}$/u;
+
+export class DurableLaunchBarrierError extends Error {
+	readonly failureKind = "guard_failure" as const;
+
+	constructor(message: string) {
+		super(message);
+		this.name = "DurableLaunchBarrierError";
+	}
+}
+
+export function isDurableLaunchBarrierError(
+	error: unknown,
+): error is DurableLaunchBarrierError {
+	return error instanceof DurableLaunchBarrierError;
+}
 
 export interface DurableLaunchBarrierDescriptor {
 	schema: "pi-subagent-durable-launch-barrier-v1";
@@ -15,6 +30,8 @@ export interface DurableLaunchBarrierDescriptor {
 	ackPath: string;
 	challenge: string;
 	subjectSha256: string;
+	/** Optional caller-verified per-run authority digest; pi-subagent binds but does not interpret it. */
+	authorityBindingSha256?: string;
 	directoryIdentity: {
 		device: number;
 		inode: number;
@@ -29,6 +46,7 @@ export interface DurableLaunchBarrierReady {
 	barrierIdentitySha256: string;
 	challenge: string;
 	subjectSha256: string;
+	authorityBindingSha256?: string;
 	runId: string;
 	attemptId: string;
 	workerPid: number;
@@ -42,6 +60,7 @@ export interface DurableLaunchBarrierRelease {
 	barrierIdentitySha256: string;
 	challenge: string;
 	subjectSha256: string;
+	authorityBindingSha256?: string;
 	runId: string;
 	attemptId: string;
 	readySha256: string;
@@ -85,12 +104,12 @@ export function durableLaunchBarrierDigest(value: unknown): string {
 
 function assertSha256(label: string, value: unknown): asserts value is string {
 	if (typeof value !== "string" || !SHA256.test(value))
-		throw new Error(`${label} is not SHA-256`);
+		throw new DurableLaunchBarrierError(`${label} is not SHA-256`);
 }
 
 function assertNonEmpty(label: string, value: unknown): asserts value is string {
 	if (typeof value !== "string" || value.length === 0)
-		throw new Error(`${label} is empty`);
+		throw new DurableLaunchBarrierError(`${label} is empty`);
 }
 
 function assertPositiveInteger(
@@ -105,7 +124,7 @@ function assertPositiveInteger(
 		value < minimum ||
 		value > maximum
 	)
-		throw new Error(`${label} is outside the supported range`);
+		throw new DurableLaunchBarrierError(`${label} is outside the supported range`);
 }
 
 async function assertOwnerOnlyDirectory(
@@ -114,12 +133,12 @@ async function assertOwnerOnlyDirectory(
 ): Promise<DurableLaunchBarrierDescriptor["directoryIdentity"]> {
 	const info = await lstat(path);
 	if (!info.isDirectory() || info.isSymbolicLink())
-		throw new Error("durable launch barrier directory is not a real directory");
+		throw new DurableLaunchBarrierError("durable launch barrier directory is not a real directory");
 	if ((info.mode & 0o777) !== 0o700)
-		throw new Error("durable launch barrier directory is not owner-only 0700");
+		throw new DurableLaunchBarrierError("durable launch barrier directory is not owner-only 0700");
 	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
 	if (uid !== undefined && info.uid !== uid)
-		throw new Error("durable launch barrier directory owner mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier directory owner mismatch");
 	const identity = {
 		device: info.dev,
 		inode: info.ino,
@@ -131,7 +150,7 @@ async function assertOwnerOnlyDirectory(
 			expected.inode !== identity.inode ||
 			expected.uid !== identity.uid)
 	)
-		throw new Error("durable launch barrier directory was replaced");
+		throw new DurableLaunchBarrierError("durable launch barrier directory was replaced");
 	return identity;
 }
 
@@ -144,53 +163,174 @@ async function syncDirectory(path: string): Promise<void> {
 	}
 }
 
-async function writeDurableExclusive(path: string, value: unknown): Promise<void> {
-	const bytes = Buffer.from(`${canonicalJson(value)}\n`, "utf8");
-	const temporary = `${path}.${randomBytes(8).toString("hex")}.tmp`;
-	const handle = await open(
-		temporary,
-		constants.O_WRONLY |
-			constants.O_CREAT |
-			constants.O_EXCL |
-			(constants.O_NOFOLLOW ?? 0),
-		0o600,
-	);
-	try {
-		await handle.writeFile(bytes);
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	try {
-		await link(temporary, path);
-		await rm(temporary);
-		await syncDirectory(resolve(path, ".."));
-	} catch (error) {
-		await rm(temporary, { force: true }).catch(() => undefined);
-		throw error;
-	}
+function transientCommitError(): NodeJS.ErrnoException {
+	const error = new DurableLaunchBarrierError("durable launch barrier file commit is still in progress") as NodeJS.ErrnoException;
+	error.code = "EAGAIN";
+	return error;
 }
 
-async function readStrictJson(path: string): Promise<unknown> {
-	const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+async function assertTransactionLink(
+	path: string,
+	transactionPath: string,
+): Promise<void> {
+	const [finalInfo, transactionInfo] = await Promise.all([
+		lstat(path),
+		lstat(transactionPath),
+	]);
+	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+	if (
+		!finalInfo.isFile() ||
+		finalInfo.isSymbolicLink() ||
+		!transactionInfo.isFile() ||
+		transactionInfo.isSymbolicLink() ||
+		finalInfo.dev !== transactionInfo.dev ||
+		finalInfo.ino !== transactionInfo.ino ||
+		finalInfo.nlink !== 2 ||
+		transactionInfo.nlink !== 2 ||
+		(finalInfo.mode & 0o777) !== 0o600 ||
+		(transactionInfo.mode & 0o777) !== 0o600 ||
+		(uid !== undefined &&
+			(finalInfo.uid !== uid || transactionInfo.uid !== uid))
+	)
+		throw new DurableLaunchBarrierError("durable launch barrier transaction identity mismatch");
+}
+
+async function writeDurableExclusive(
+	descriptor: DurableLaunchBarrierDescriptor,
+	path: string,
+	value: unknown,
+): Promise<void> {
+	const bytes = Buffer.from(`${canonicalJson(value)}\n`, "utf8");
+	const transactionPath = `${path}.txn`;
+	const pendingPath = `${path}.pending`;
+	await assertOwnerOnlyDirectory(
+		descriptor.directory,
+		descriptor.directoryIdentity,
+	);
+	let pending;
 	try {
-		const info = await handle.stat();
-		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-		if (info.nlink === 2) {
-			const transient = new Error(
-				"durable launch barrier file commit is still in progress",
-			) as NodeJS.ErrnoException;
-			transient.code = "EAGAIN";
-			throw transient;
+		pending = await open(
+			pendingPath,
+			constants.O_WRONLY |
+				constants.O_CREAT |
+				constants.O_EXCL |
+				(constants.O_NOFOLLOW ?? 0),
+			0o600,
+		);
+		await pending.writeFile("pending\n");
+		await pending.sync();
+		await pending.close();
+		pending = undefined;
+		await syncDirectory(descriptor.directory);
+	} catch (error) {
+		await pending?.close().catch(() => undefined);
+		if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+	}
+	let transaction;
+	try {
+		transaction = await open(
+			transactionPath,
+			constants.O_RDWR |
+				constants.O_CREAT |
+				constants.O_EXCL |
+				(constants.O_NOFOLLOW ?? 0),
+			0o600,
+		);
+		await transaction.writeFile(bytes);
+		await transaction.sync();
+		await syncDirectory(descriptor.directory);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+		transaction = await open(
+			transactionPath,
+			constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
+		);
+	}
+	try {
+		await assertOwnerOnlyDirectory(
+			descriptor.directory,
+			descriptor.directoryIdentity,
+		);
+		try {
+			await link(transactionPath, path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
 		}
+		await assertTransactionLink(path, transactionPath);
+		await syncDirectory(descriptor.directory);
+		const current = await readFile(transactionPath);
+		if (!current.equals(bytes))
+			throw new DurableLaunchBarrierError(
+				"durable launch barrier duplicate payload mismatch",
+			);
+	} finally {
+		await transaction.close();
+	}
+	await assertOwnerOnlyDirectory(
+		descriptor.directory,
+		descriptor.directoryIdentity,
+	);
+	await rm(pendingPath);
+	await syncDirectory(descriptor.directory);
+}
+
+async function pendingCommitExists(path: string): Promise<boolean> {
+	try {
+		const info = await lstat(`${path}.pending`);
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
 		if (
 			!info.isFile() ||
+			info.isSymbolicLink() ||
 			info.nlink !== 1 ||
 			(info.mode & 0o777) !== 0o600 ||
 			(uid !== undefined && info.uid !== uid)
 		)
-			throw new Error("durable launch barrier file identity mismatch");
-		return JSON.parse((await handle.readFile()).toString("utf8"));
+			throw new DurableLaunchBarrierError(
+				"durable launch barrier pending fence identity mismatch",
+			);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+async function readStrictJson(
+	descriptor: DurableLaunchBarrierDescriptor,
+	path: string,
+): Promise<unknown> {
+	await assertOwnerOnlyDirectory(
+		descriptor.directory,
+		descriptor.directoryIdentity,
+	);
+	if (await pendingCommitExists(path)) throw transientCommitError();
+	const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+	try {
+		const info = await handle.stat();
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+		if (
+			!info.isFile() ||
+			(info.nlink !== 1 && info.nlink !== 2) ||
+			(info.mode & 0o777) !== 0o600 ||
+			(uid !== undefined && info.uid !== uid)
+		)
+			throw new DurableLaunchBarrierError("durable launch barrier file identity mismatch");
+		const bytes = await handle.readFile();
+		let value: unknown;
+		try {
+			value = JSON.parse(bytes.toString("utf8"));
+		} catch {
+			if (info.nlink === 2) throw transientCommitError();
+			throw new DurableLaunchBarrierError("durable launch barrier record is not valid JSON");
+		}
+		if (info.nlink === 2)
+			await assertTransactionLink(path, `${path}.txn`);
+		await assertOwnerOnlyDirectory(
+			descriptor.directory,
+			descriptor.directoryIdentity,
+		);
+		if (await pendingCommitExists(path)) throw transientCommitError();
+		return value;
 	} finally {
 		await handle.close();
 	}
@@ -206,7 +346,7 @@ async function waitForFile(
 ): Promise<unknown> {
 	const deadline = Date.now() + descriptor.timeoutMs;
 	while (Date.now() <= deadline) {
-		const value = await readStrictJson(path).catch(
+		const value = await readStrictJson(descriptor, path).catch(
 			(error: NodeJS.ErrnoException) => {
 				if (error?.code === "ENOENT" || error?.code === "EAGAIN")
 					return undefined;
@@ -216,22 +356,28 @@ async function waitForFile(
 		if (value !== undefined) return value;
 		await sleep(descriptor.pollIntervalMs);
 	}
-	throw new Error("durable launch barrier timed out");
+	throw new DurableLaunchBarrierError("durable launch barrier timed out");
 }
 
 export async function createDurableLaunchBarrier(options: {
 	directory: string;
 	subjectSha256: string;
+	authorityBindingSha256?: string;
 	challenge?: string;
 	timeoutMs?: number;
 	pollIntervalMs?: number;
 }): Promise<DurableLaunchBarrierDescriptor> {
 	if (!isAbsolute(options.directory))
-		throw new Error("durable launch barrier directory must be absolute");
+		throw new DurableLaunchBarrierError("durable launch barrier directory must be absolute");
 	assertSha256("durable launch barrier subject", options.subjectSha256);
+	if (options.authorityBindingSha256 !== undefined)
+		assertSha256(
+			"durable launch barrier authority binding",
+			options.authorityBindingSha256,
+		);
 	const challenge = options.challenge ?? randomBytes(32).toString("hex");
 	if (!NONCE.test(challenge))
-		throw new Error("durable launch barrier challenge is invalid");
+		throw new DurableLaunchBarrierError("durable launch barrier challenge is invalid");
 	const directory = resolve(options.directory);
 	await mkdir(directory, { mode: 0o700 });
 	const directoryIdentity = await assertOwnerOnlyDirectory(directory);
@@ -243,6 +389,9 @@ export async function createDurableLaunchBarrier(options: {
 		ackPath: join(directory, "ack.json"),
 		challenge,
 		subjectSha256: options.subjectSha256,
+		...(options.authorityBindingSha256 === undefined
+			? {}
+			: { authorityBindingSha256: options.authorityBindingSha256 }),
 		directoryIdentity,
 		timeoutMs: options.timeoutMs ?? 30_000,
 		pollIntervalMs: options.pollIntervalMs ?? 10,
@@ -259,15 +408,20 @@ export function assertDurableLaunchBarrierDescriptor(
 	value: unknown,
 ): asserts value is DurableLaunchBarrierDescriptor {
 	if (!value || typeof value !== "object")
-		throw new Error("durable launch barrier descriptor is invalid");
+		throw new DurableLaunchBarrierError("durable launch barrier descriptor is invalid");
 	const descriptor = value as DurableLaunchBarrierDescriptor;
 	if (descriptor.schema !== "pi-subagent-durable-launch-barrier-v1")
-		throw new Error("durable launch barrier schema mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier schema mismatch");
 	if (!isAbsolute(descriptor.directory) || resolve(descriptor.directory) !== descriptor.directory)
-		throw new Error("durable launch barrier directory identity mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier directory identity mismatch");
 	if (!NONCE.test(descriptor.challenge))
-		throw new Error("durable launch barrier challenge is invalid");
+		throw new DurableLaunchBarrierError("durable launch barrier challenge is invalid");
 	assertSha256("durable launch barrier subject", descriptor.subjectSha256);
+	if (descriptor.authorityBindingSha256 !== undefined)
+		assertSha256(
+			"durable launch barrier authority binding",
+			descriptor.authorityBindingSha256,
+		);
 	assertSha256("durable launch barrier identity", descriptor.identitySha256);
 	assertPositiveInteger("durable launch barrier timeout", descriptor.timeoutMs, 100, 120_000);
 	assertPositiveInteger("durable launch barrier poll interval", descriptor.pollIntervalMs, 1, 1_000);
@@ -295,10 +449,10 @@ export function assertDurableLaunchBarrierDescriptor(
 		descriptor.releasePath !== join(descriptor.directory, "release.json") ||
 		descriptor.ackPath !== join(descriptor.directory, "ack.json")
 	)
-		throw new Error("durable launch barrier path identity mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier path identity mismatch");
 	const { identitySha256, ...body } = descriptor;
 	if (durableLaunchBarrierDigest(body) !== identitySha256)
-		throw new Error("durable launch barrier identity digest mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier identity digest mismatch");
 }
 
 function assertReady(
@@ -306,7 +460,7 @@ function assertReady(
 	value: unknown,
 ): DurableLaunchBarrierReady {
 	if (!value || typeof value !== "object")
-		throw new Error("durable launch barrier ready record is invalid");
+		throw new DurableLaunchBarrierError("durable launch barrier ready record is invalid");
 	const ready = value as DurableLaunchBarrierReady;
 	const { readySha256, ...body } = ready;
 	if (
@@ -314,19 +468,20 @@ function assertReady(
 		ready.barrierIdentitySha256 !== descriptor.identitySha256 ||
 		ready.challenge !== descriptor.challenge ||
 		ready.subjectSha256 !== descriptor.subjectSha256 ||
+		ready.authorityBindingSha256 !== descriptor.authorityBindingSha256 ||
 		!Number.isSafeInteger(ready.workerPid) ||
 		ready.workerPid <= 0 ||
 		(ready.workerProcessGroupId !== undefined &&
 			(!Number.isSafeInteger(ready.workerProcessGroupId) ||
 				ready.workerProcessGroupId <= 0))
 	)
-		throw new Error("durable launch barrier ready record mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier ready record mismatch");
 	assertNonEmpty("durable launch barrier run id", ready.runId);
 	assertNonEmpty("durable launch barrier attempt id", ready.attemptId);
 	assertSha256("durable launch barrier payload", ready.launchPayloadSha256);
 	assertSha256("durable launch barrier ready digest", readySha256);
 	if (durableLaunchBarrierDigest(body) !== readySha256)
-		throw new Error("durable launch barrier ready digest mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier ready digest mismatch");
 	return ready;
 }
 
@@ -358,6 +513,9 @@ export async function releaseDurableLaunchBarrier(
 		barrierIdentitySha256: descriptor.identitySha256,
 		challenge: descriptor.challenge,
 		subjectSha256: descriptor.subjectSha256,
+		...(descriptor.authorityBindingSha256 === undefined
+			? {}
+			: { authorityBindingSha256: descriptor.authorityBindingSha256 }),
 		runId: ready.runId,
 		attemptId: ready.attemptId,
 		readySha256: ready.readySha256,
@@ -367,7 +525,7 @@ export async function releaseDurableLaunchBarrier(
 		...body,
 		releaseSha256: durableLaunchBarrierDigest(body),
 	};
-	await writeDurableExclusive(descriptor.releasePath, release);
+	await writeDurableExclusive(descriptor, descriptor.releasePath, release);
 	return release;
 }
 
@@ -377,7 +535,7 @@ function assertRelease(
 	value: unknown,
 ): DurableLaunchBarrierRelease {
 	if (!value || typeof value !== "object")
-		throw new Error("durable launch barrier release record is invalid");
+		throw new DurableLaunchBarrierError("durable launch barrier release record is invalid");
 	const release = value as DurableLaunchBarrierRelease;
 	const { releaseSha256, ...body } = release;
 	if (
@@ -385,15 +543,16 @@ function assertRelease(
 		release.barrierIdentitySha256 !== descriptor.identitySha256 ||
 		release.challenge !== descriptor.challenge ||
 		release.subjectSha256 !== descriptor.subjectSha256 ||
+		release.authorityBindingSha256 !== descriptor.authorityBindingSha256 ||
 		release.runId !== ready.runId ||
 		release.attemptId !== ready.attemptId ||
 		release.readySha256 !== ready.readySha256
 	)
-		throw new Error("durable launch barrier release record mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier release record mismatch");
 	assertSha256("durable launch barrier release payload", release.releasePayloadSha256);
 	assertSha256("durable launch barrier release digest", releaseSha256);
 	if (durableLaunchBarrierDigest(body) !== releaseSha256)
-		throw new Error("durable launch barrier release digest mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier release digest mismatch");
 	return release;
 }
 
@@ -418,6 +577,9 @@ export async function awaitDurableLaunchBarrier(options: {
 		barrierIdentitySha256: descriptor.identitySha256,
 		challenge: descriptor.challenge,
 		subjectSha256: descriptor.subjectSha256,
+		...(descriptor.authorityBindingSha256 === undefined
+			? {}
+			: { authorityBindingSha256: descriptor.authorityBindingSha256 }),
 		runId: options.runId,
 		attemptId: options.attemptId,
 		workerPid: process.pid,
@@ -430,7 +592,7 @@ export async function awaitDurableLaunchBarrier(options: {
 		...readyBody,
 		readySha256: durableLaunchBarrierDigest(readyBody),
 	};
-	await writeDurableExclusive(descriptor.readyPath, ready);
+	await writeDurableExclusive(descriptor, descriptor.readyPath, ready);
 	const release = assertRelease(
 		descriptor,
 		ready,
@@ -446,7 +608,7 @@ export async function awaitDurableLaunchBarrier(options: {
 		releaseSha256: release.releaseSha256,
 	};
 	const ack = { ...ackBody, ackSha256: durableLaunchBarrierDigest(ackBody) };
-	await writeDurableExclusive(descriptor.ackPath, ack);
+	await writeDurableExclusive(descriptor, descriptor.ackPath, ack);
 	return ack;
 }
 
@@ -455,9 +617,13 @@ export async function waitForDurableLaunchBarrierAck(
 	release: DurableLaunchBarrierRelease,
 ): Promise<DurableLaunchBarrierAck> {
 	assertDurableLaunchBarrierDescriptor(descriptor);
+	await assertOwnerOnlyDirectory(
+		descriptor.directory,
+		descriptor.directoryIdentity,
+	);
 	const value = await waitForFile(descriptor, descriptor.ackPath);
 	if (!value || typeof value !== "object")
-		throw new Error("durable launch barrier acknowledgement is invalid");
+		throw new DurableLaunchBarrierError("durable launch barrier acknowledgement is invalid");
 	const ack = value as DurableLaunchBarrierAck;
 	const { ackSha256, ...body } = ack;
 	if (
@@ -469,9 +635,13 @@ export async function waitForDurableLaunchBarrierAck(
 		ack.readySha256 !== release.readySha256 ||
 		ack.releaseSha256 !== release.releaseSha256
 	)
-		throw new Error("durable launch barrier acknowledgement mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier acknowledgement mismatch");
 	assertSha256("durable launch barrier acknowledgement digest", ackSha256);
 	if (durableLaunchBarrierDigest(body) !== ackSha256)
-		throw new Error("durable launch barrier acknowledgement digest mismatch");
+		throw new DurableLaunchBarrierError("durable launch barrier acknowledgement digest mismatch");
+	await assertOwnerOnlyDirectory(
+		descriptor.directory,
+		descriptor.directoryIdentity,
+	);
 	return ack;
 }
