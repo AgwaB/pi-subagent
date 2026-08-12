@@ -54,6 +54,80 @@ try {
 		/directory was replaced/,
 	);
 
+	const deletedBarrier = await createDurableLaunchBarrier({
+		directory: join(root, "deleted-barrier"),
+		subjectSha256: "8".repeat(64),
+		timeoutMs: 100,
+	});
+	await rm(deletedBarrier.directory, { recursive: true, force: true });
+	await assert.rejects(
+		waitForDurableLaunchBarrierReady(deletedBarrier),
+		(error) =>
+			error?.failureKind === "guard_failure" && /ENOENT/u.test(error.message),
+	);
+
+	for (const [index, prefix] of [
+		Buffer.alloc(0),
+		Buffer.from('{"schema":'),
+	].entries()) {
+		const crashBarrier = await createDurableLaunchBarrier({
+			directory: join(root, `crash-barrier-${index}`),
+			subjectSha256: "7".repeat(64),
+			timeoutMs: 100,
+		});
+		await writeFile(`${crashBarrier.releasePath}.pending`, "pending\n", {
+			mode: 0o600,
+		});
+		const crashedTempPath = `${crashBarrier.releasePath}.txn.crashed.tmp`;
+		await writeFile(crashedTempPath, prefix, { mode: 0o600 });
+		const fakeReadyBody = {
+			schema: "pi-subagent-durable-launch-barrier-ready-v1",
+			barrierIdentitySha256: crashBarrier.identitySha256,
+			challenge: crashBarrier.challenge,
+			subjectSha256: crashBarrier.subjectSha256,
+			runId: `run-crash-${index}`,
+			attemptId: `attempt-crash-${index}`,
+			workerPid: process.pid,
+			launchPayloadSha256: "6".repeat(64),
+			executionPlanSha256: "3".repeat(64),
+		};
+		const fakeReady = {
+			...fakeReadyBody,
+			readySha256: durableLaunchBarrierDigest(fakeReadyBody),
+		};
+		if (index === 1) {
+			await rm(crashedTempPath);
+			const expectedReleaseBody = {
+				schema: "pi-subagent-durable-launch-barrier-release-v1",
+				barrierIdentitySha256: crashBarrier.identitySha256,
+				challenge: crashBarrier.challenge,
+				subjectSha256: crashBarrier.subjectSha256,
+				runId: fakeReady.runId,
+				attemptId: fakeReady.attemptId,
+				readySha256: fakeReady.readySha256,
+				releasePayloadSha256: "4".repeat(64),
+			};
+			const expectedRelease = {
+				...expectedReleaseBody,
+				releaseSha256: durableLaunchBarrierDigest(expectedReleaseBody),
+			};
+			await writeFile(
+				crashedTempPath,
+				`${JSON.stringify(canonical(expectedRelease))}\n`,
+				{ mode: 0o600 },
+			);
+			await link(crashedTempPath, `${crashBarrier.releasePath}.txn`);
+		}
+		const recovered = await releaseDurableLaunchBarrier(
+			crashBarrier,
+			fakeReady,
+			"4".repeat(64),
+		);
+		assert.equal(recovered.readySha256, fakeReady.readySha256);
+		await assert.rejects(access(`${crashBarrier.releasePath}.pending`));
+		if (index === 1) await assert.rejects(access(crashedTempPath));
+	}
+
 	const descriptorPath = join(root, "descriptor.json");
 	const markerPath = join(root, "released.txt");
 	await writeFile(descriptorPath, `${JSON.stringify(descriptor)}\n`, "utf8");
@@ -109,6 +183,7 @@ try {
 	assert.equal(ready.runId, runId);
 	assert.equal(ready.attemptId, attemptId);
 	assert.equal(ready.launchPayloadSha256, launchPayloadSha256);
+	assert.equal(ready.executionPlanSha256, "e".repeat(64));
 	await assert.rejects(access(markerPath));
 
 	const releaseBody = {

@@ -71,6 +71,8 @@ export interface RunHeadlessModelOptions {
 	 */
 	toolResultBudget?: ToolResultBudgetInput;
 	onProcessStart?: (process: ProcessMetadata) => void | Promise<void>;
+	/** Explicit run-scoped environment additions/removals for the child process. */
+	childEnv?: NodeJS.ProcessEnv;
 }
 
 export interface ProcessOutcome {
@@ -906,6 +908,11 @@ export async function runHeadlessModel(
 	async function executeAttempt(
 		forceEvictFraction?: number,
 	): Promise<ProcessResult> {
+		const inheritedEnv = { ...process.env };
+		delete inheritedEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
+		const explicitEnv = { ...inheritedEnv, ...(options.childEnv ?? {}) };
+		const explicitBinding =
+			options.childEnv?.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
 		const attemptEnv =
 			budgetEnv === undefined
 				? undefined
@@ -936,9 +943,17 @@ export async function runHeadlessModel(
 								store,
 								options.captureToolCalls,
 								options.signal,
-								attemptEnv === undefined
-									? launch.env
-									: { ...(launch.env ?? process.env), ...attemptEnv },
+								(() => {
+									const env: NodeJS.ProcessEnv = {
+										...explicitEnv,
+										...(launch.env ?? {}),
+										...(attemptEnv ?? {}),
+									};
+									delete env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
+									if (explicitBinding !== undefined)
+										env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = explicitBinding;
+									return env;
+								})(),
 								options.onProcessStart,
 							),
 					)
@@ -949,9 +964,7 @@ export async function runHeadlessModel(
 						store,
 						options.captureToolCalls,
 						options.signal,
-						attemptEnv === undefined
-							? undefined
-							: { ...process.env, ...attemptEnv },
+						{ ...explicitEnv, ...(attemptEnv ?? {}) },
 						options.onProcessStart,
 					);
 		} catch (error) {

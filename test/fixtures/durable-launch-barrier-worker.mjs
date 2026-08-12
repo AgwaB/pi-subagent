@@ -19,5 +19,6 @@ await awaitDurableLaunchBarrier({
 	runId,
 	attemptId,
 	launchPayloadSha256,
+	executionPlanSha256: "e".repeat(64),
 });
 await writeFile(markerPath, "released\n", "utf8");

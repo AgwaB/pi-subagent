@@ -23,6 +23,7 @@ import { runHeadlessModel } from "../runners/headless-model.ts";
 import { runInlineModel } from "../runners/inline.ts";
 import { runTmuxModel } from "../runners/tmux.ts";
 import {
+	discardPreparedWorkspace,
 	finalizeWorktreeResult,
 	resolveWorkspace,
 	type ResolvedWorkspace,
@@ -40,6 +41,19 @@ export interface RunSubagentTaskOptions {
 	runId?: string;
 	attemptId?: string;
 	taskIndex?: number;
+}
+
+export interface PreparedSubagentExecution {
+	input: ResolveInput & { task: string };
+	backend: ResolvedBackend;
+	runId: string;
+	attemptId: string;
+	baseCwd: string;
+	workspace: ResolvedWorkspace;
+	workspaceResult: ReturnType<typeof workspaceMeta>;
+	requestedAgent: string;
+	agentDefinition: AgentDefinition | undefined;
+	effectiveTools: string[] | undefined;
 }
 
 export interface MultiRunOptions {
@@ -225,25 +239,72 @@ async function writeParallelErrorResult(options: {
 	return result;
 }
 
-export async function runSubagentTask(
+export async function prepareSubagentExecution(
 	options: RunSubagentTaskOptions,
-): Promise<ResultEnvelope> {
-	const input = options.input;
+): Promise<PreparedSubagentExecution> {
+	const input = Object.freeze({ ...options.input });
 	const resolved = resolveBackend(input);
 	if (resolved.status === "failed") throw new Error(resolved.error);
-
 	const backend = resolved.backend;
 	const runId = options.runId ?? createRunId();
 	const attemptId = options.attemptId ?? createAttemptId();
 	const baseCwd = resolve(input.cwd ?? options.cwd);
+	const requestedAgent = input.agent ?? `${backend}-worker`;
+	const agentDefinition =
+		input.agent === undefined
+			? undefined
+			: await loadAgentByName(input.agent, baseCwd, input.agentScope);
+	const effectiveTools = resolveEffectiveTools(input, agentDefinition);
+	if (input.task === undefined)
+		throw new Error(`${backend} execution requires agent/task input.`);
+	const preparedInput: ResolveInput & { task: string } = Object.freeze({
+		...input,
+		task: input.task,
+	});
+	const workspace = await resolveWorkspace({
+		cwd: baseCwd,
+		input,
+		taskIndex: options.taskIndex,
+		runId,
+	});
+	return Object.freeze({
+		input: preparedInput,
+		backend,
+		runId,
+		attemptId,
+		baseCwd,
+		workspace,
+		workspaceResult: workspaceMeta(workspace),
+		requestedAgent,
+		agentDefinition,
+		effectiveTools,
+	});
+}
+
+export async function discardSubagentExecution(
+	prepared: PreparedSubagentExecution,
+): Promise<void> {
+	await discardPreparedWorkspace(prepared.workspace);
+}
+
+export async function runPreparedSubagentExecution(
+	prepared: PreparedSubagentExecution,
+	options: Pick<RunSubagentTaskOptions, "signal"> = {},
+): Promise<ResultEnvelope> {
+	const {
+		input,
+		backend,
+		runId,
+		attemptId,
+		baseCwd,
+		workspace,
+		workspaceResult,
+		requestedAgent,
+		agentDefinition,
+		effectiveTools,
+	} = prepared;
 	const startedAt = new Date();
 	const runRef = { cwd: baseCwd, runId, runsDir: input.runsDir };
-	const requestedAgent = input.agent ?? `${backend}-worker`;
-	const shouldLoadAgent = input.agent !== undefined;
-	const agentDefinition = shouldLoadAgent
-		? await loadAgentByName(input.agent!, baseCwd, input.agentScope)
-		: undefined;
-	const effectiveTools = resolveEffectiveTools(input, agentDefinition);
 
 	await beginRunRecord({
 		...runRef,
@@ -270,14 +331,7 @@ export async function runSubagentTask(
 	}).catch(() => undefined);
 
 	try {
-		const workspace = await resolveWorkspace({
-			cwd: baseCwd,
-			input,
-			taskIndex: options.taskIndex,
-			runId,
-		});
 		const cwd = workspace.cwd;
-		const workspaceResult = workspaceMeta(workspace);
 
 		await upsertRunAttempt({
 			...runRef,
@@ -313,6 +367,11 @@ export async function runSubagentTask(
 			);
 		};
 
+		const childEnv = { ...process.env };
+		delete childEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
+		const durableBinding = process.env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
+		if (durableBinding !== undefined)
+			childEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = durableBinding;
 		const common = {
 			cwd,
 			artifactCwd: baseCwd,
@@ -326,10 +385,9 @@ export async function runSubagentTask(
 			parentSessionId: input.parentSessionId,
 			workspace: workspaceResult,
 			onProcessStart,
+			childEnv,
 		};
 
-		if (input.task === undefined)
-			throw new Error(`${backend} execution requires agent/task input.`);
 		const modelOptions = {
 			...common,
 			captureToolCalls: input.captureToolCalls,
@@ -412,6 +470,13 @@ export async function runSubagentTask(
 		).catch(() => undefined);
 		throw error;
 	}
+}
+
+export async function runSubagentTask(
+	options: RunSubagentTaskOptions,
+): Promise<ResultEnvelope> {
+	const prepared = await prepareSubagentExecution(options);
+	return await runPreparedSubagentExecution(prepared, { signal: options.signal });
 }
 
 export async function runParallelSubagentTasks(

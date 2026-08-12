@@ -127,6 +127,21 @@ async function captureWorktreeArtifacts(result: ResultEnvelope, worktreePath: st
   ];
 }
 
+export async function discardPreparedWorkspace(
+  workspace: ResolvedWorkspace,
+): Promise<void> {
+  if (workspace.mode !== "worktree" || workspace.worktreePath === null) return;
+  const root = await gitRoot(workspace.baseCwd);
+  await execFileAsync("git", [
+    "-C",
+    root,
+    "worktree",
+    "remove",
+    "--force",
+    workspace.worktreePath,
+  ]);
+}
+
 export async function finalizeWorktreeResult(workspace: ResolvedWorkspace, result: ResultEnvelope): Promise<ResultEnvelope> {
   if (workspace.mode !== "worktree" || workspace.worktreePath === null) return result;
 

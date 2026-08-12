@@ -73,6 +73,43 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 	);
 	await chmod(fakePi, 0o700);
 
+	const envPi = join(tempRoot, "env-pi.mjs");
+	await writeFile(
+		envPi,
+		`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: process.env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON ?? "unset" }], provider: "fake", model: "fake/model", usage: { inputTokens: 1, outputTokens: 1 }, stopReason: "end" } }) + "\\n");
+`,
+		"utf8",
+	);
+	await chmod(envPi, 0o700);
+	process.env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = "stale-parent-binding";
+	const unsetBinding = await runHeadlessModel({
+		cwd,
+		runId: "run_check_headless_env_unset",
+		attemptId: "attempt-env-unset",
+		piCommand: envPi,
+		agent: "env-worker",
+		task: "inspect env",
+	});
+	assert.equal(
+		await readFile(join(cwd, artifactByType(unsetBinding, "output").path), "utf8"),
+		"unset",
+	);
+	const explicitBinding = await runHeadlessModel({
+		cwd,
+		runId: "run_check_headless_env_explicit",
+		attemptId: "attempt-env-explicit",
+		piCommand: envPi,
+		agent: "env-worker",
+		task: "inspect env",
+		childEnv: { PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON: "current-binding" },
+	});
+	assert.equal(
+		await readFile(join(cwd, artifactByType(explicitBinding, "output").path), "utf8"),
+		"current-binding",
+	);
+	delete process.env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
+
 	const result = await runHeadlessModel({
 		cwd,
 		runId: "run_check_headless_streaming",

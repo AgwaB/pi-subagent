@@ -14,12 +14,14 @@ try {
 	prepareDurableWorkerBinding({
 		payload,
 		launchPayloadSha256: createHash("sha256").update(payloadBytes).digest("hex"),
+		executionPlanSha256: "9".repeat(64),
 	});
 	await awaitDurableLaunchBarrier({
 		descriptor: payload.input.durableLaunchBarrier,
 		runId: payload.runId,
 		attemptId: payload.attemptId,
 		launchPayloadSha256: createHash("sha256").update(payloadBytes).digest("hex"),
+		executionPlanSha256: "9".repeat(64),
 	});
 } catch (error) {
 	failureKind = error?.failureKind ?? "internal";

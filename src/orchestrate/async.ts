@@ -308,12 +308,15 @@ export async function startAsyncSubagentRun(
 	);
 
 	const workerLogFd = openSync(join(store.attemptDir, "worker.log"), "a");
+	const workerEnv = { ...process.env };
+	delete workerEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
 	let child;
 	try {
 		child = spawn(process.execPath, [workerPath(), payloadPath], {
 			cwd: options.cwd,
 			detached: process.platform !== "win32",
 			stdio: ["ignore", workerLogFd, workerLogFd],
+			env: workerEnv,
 		});
 	} finally {
 		closeSync(workerLogFd);

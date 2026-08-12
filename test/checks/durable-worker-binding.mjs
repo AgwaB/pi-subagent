@@ -43,19 +43,24 @@ assert.throws(
 		isDurableWorkerGuardError(error) &&
 		error.failureKind === "guard_failure",
 );
+const executionPlanSha256 = "8".repeat(64);
+const executionCwd = "/tmp/binding-worktree";
 const preflight = prepareDurableWorkerBinding({
 	payload,
 	launchPayloadSha256: "7".repeat(64),
+	executionPlanSha256,
+	executionCwd,
 	workerPid: 1234,
 });
 assert.deepEqual(preflight, {
 	schema: "pi-subagent-durable-worker-binding-preflight-v1",
 	runId: payload.runId,
 	attemptId: payload.attemptId,
-	cwdSha256: sha(payload.cwd),
+	cwdSha256: sha(executionCwd),
 	runsDirSha256: sha("/tmp/binding-cwd/.pi/agent/runs"),
 	workerPid: 1234,
 	launchPayloadSha256: "7".repeat(64),
+	executionPlanSha256,
 	barrierIdentitySha256: "1".repeat(64),
 	barrierSubjectSha256: "2".repeat(64),
 	authorityBindingSha256: "6".repeat(64),
@@ -65,16 +70,18 @@ const binding = buildDurableWorkerBinding({
 	launchPayloadSha256: "7".repeat(64),
 	ack,
 	workerPid: 1234,
+	executionPlanSha256,
 	preflight,
 });
 assert.deepEqual(binding, {
 	schema: "pi-subagent-durable-worker-binding-v1",
 	runId: payload.runId,
 	attemptId: payload.attemptId,
-	cwdSha256: sha(payload.cwd),
+	cwdSha256: sha(executionCwd),
 	runsDirSha256: sha("/tmp/binding-cwd/.pi/agent/runs"),
 	workerPid: 1234,
 	launchPayloadSha256: "7".repeat(64),
+	executionPlanSha256,
 	barrierIdentitySha256: "1".repeat(64),
 	barrierSubjectSha256: "2".repeat(64),
 	authorityBindingSha256: "6".repeat(64),
@@ -92,6 +99,7 @@ const correlated = prepareDurableWorkerBinding({
 		},
 	},
 	launchPayloadSha256: "7".repeat(64),
+	executionPlanSha256,
 	workerPid: 1234,
 });
 assert.equal(correlated.correlationId, "consumer:task-1");
@@ -100,6 +108,7 @@ const installed = installDurableWorkerBinding({
 	payload,
 	launchPayloadSha256: "7".repeat(64),
 	ack,
+	executionPlanSha256,
 	workerPid: 1234,
 });
 assert.deepEqual(JSON.parse(process.env[DURABLE_WORKER_BINDING_ENV]), installed);
@@ -117,6 +126,7 @@ assert.throws(
 				},
 			},
 			launchPayloadSha256: "7".repeat(64),
+			executionPlanSha256,
 		}),
 	(error) =>
 		isDurableWorkerGuardError(error) &&

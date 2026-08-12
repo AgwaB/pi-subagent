@@ -41,6 +41,7 @@ interface RunTmuxProcessOptions {
 	signal?: AbortSignal;
 	sandbox?: SandboxInput | false | null;
 	workspace?: Partial<ResultWorkspace>;
+	childEnv?: NodeJS.ProcessEnv;
 }
 
 export type RunTmuxModelOptions = RunHeadlessModelOptions;
@@ -155,7 +156,7 @@ function workerScript(
 	stderrPath: string,
 	metaPath: string,
 ): string {
-	return `import { spawn } from "node:child_process";\nimport { appendFileSync, closeSync, openSync, writeFileSync } from "node:fs";\nconst argv = ${JSON.stringify(argv)};\nconst cwd = ${JSON.stringify(cwd)};\nconst eventPath = ${JSON.stringify(eventPath)};\nconst stderrPath = ${JSON.stringify(stderrPath)};\nconst metaPath = ${JSON.stringify(metaPath)};\nconst messageUpdatePattern = /"type"\\s*:\\s*"message_update"/;\nconst maxStdoutLogLineChars = 64 * 1024 * 1024;\ncloseSync(openSync(eventPath, "w"));\ncloseSync(openSync(stderrPath, "w"));\nlet settled = false;\nlet stdoutBuffer = "";\nlet discardingOversizedLine = false;\nlet omittedMessageUpdates = 0;\nlet omittedMessageUpdateBytes = 0;\nlet omittedOversizedLines = 0;\nlet omittedOversizedBytes = 0;\nfunction writeStdoutLine(line) {\n  if (messageUpdatePattern.test(line)) {\n    omittedMessageUpdates += 1;\n    omittedMessageUpdateBytes += Buffer.byteLength(line, "utf8");\n    return;\n  }\n  appendFileSync(eventPath, line);\n  process.stdout.write(line);\n}\nfunction handleStdoutChunk(chunk) {\n  let text = chunk.toString("utf8");\n  while (text.length > 0) {\n    if (discardingOversizedLine) {\n      const newline = text.indexOf("\\n");\n      omittedOversizedBytes += Buffer.byteLength(newline < 0 ? text : text.slice(0, newline + 1), "utf8");\n      if (newline < 0) return;\n      discardingOversizedLine = false;\n      text = text.slice(newline + 1);\n      continue;\n    }\n    const newline = text.indexOf("\\n");\n    const segment = newline < 0 ? text : text.slice(0, newline + 1);\n    stdoutBuffer += segment;\n    text = newline < 0 ? "" : text.slice(newline + 1);\n    if (stdoutBuffer.length > maxStdoutLogLineChars) {\n      omittedOversizedLines += 1;\n      omittedOversizedBytes += Buffer.byteLength(stdoutBuffer, "utf8");\n      stdoutBuffer = "";\n      discardingOversizedLine = newline < 0;\n      continue;\n    }\n    if (newline >= 0) {\n      writeStdoutLine(stdoutBuffer);\n      stdoutBuffer = "";\n    }\n  }\n}\nfunction finishStdoutFilter() {\n  if (!discardingOversizedLine && stdoutBuffer.length > 0) writeStdoutLine(stdoutBuffer);\n  stdoutBuffer = "";\n  if (omittedMessageUpdates > 0 || omittedOversizedLines > 0) {\n    appendFileSync(eventPath, JSON.stringify({ type: "pi-subagent.stdout_filter", omitted: { messageUpdateEvents: omittedMessageUpdates, messageUpdateBytes: omittedMessageUpdateBytes, oversizedLines: omittedOversizedLines, oversizedBytes: omittedOversizedBytes }, reason: "cumulative message_update snapshots are omitted from durable stdout artifacts; final assistant text is stored in output.log" }) + "\\n");\n  }\n}\nfunction writeMeta(meta) {\n  if (settled) return;\n  settled = true;\n  finishStdoutFilter();\n  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\\n");\n}\nconst env = { ...process.env };\ndelete env.TMUX;\nconst child = spawn(argv[0], argv.slice(1), { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], env });\nchild.stdout?.on("data", handleStdoutChunk);\nchild.stderr?.on("data", (chunk) => { appendFileSync(stderrPath, chunk); process.stderr.write(chunk); });\nchild.on("error", () => { writeMeta({ status: "failed", failureKind: "spawn", exitCode: null, signal: null }); });\nchild.on("close", (exitCode, signal) => {\n  const failureKind = exitCode === 0 ? null : "exit";\n  writeMeta({ status: failureKind === null ? "completed" : "failed", failureKind, exitCode, signal });\n});\n`;
+	return `import { spawn } from "node:child_process";\nimport { appendFileSync, closeSync, openSync, writeFileSync } from "node:fs";\nconst argv = ${JSON.stringify(argv)};\nconst cwd = ${JSON.stringify(cwd)};\nconst eventPath = ${JSON.stringify(eventPath)};\nconst stderrPath = ${JSON.stringify(stderrPath)};\nconst metaPath = ${JSON.stringify(metaPath)};\nconst messageUpdatePattern = /"type"\\s*:\\s*"message_update"/;\nconst maxStdoutLogLineChars = 64 * 1024 * 1024;\ncloseSync(openSync(eventPath, "w"));\ncloseSync(openSync(stderrPath, "w"));\nlet settled = false;\nlet stdoutBuffer = "";\nlet discardingOversizedLine = false;\nlet omittedMessageUpdates = 0;\nlet omittedMessageUpdateBytes = 0;\nlet omittedOversizedLines = 0;\nlet omittedOversizedBytes = 0;\nfunction writeStdoutLine(line) {\n  if (messageUpdatePattern.test(line)) {\n    omittedMessageUpdates += 1;\n    omittedMessageUpdateBytes += Buffer.byteLength(line, "utf8");\n    return;\n  }\n  appendFileSync(eventPath, line);\n  process.stdout.write(line);\n}\nfunction handleStdoutChunk(chunk) {\n  let text = chunk.toString("utf8");\n  while (text.length > 0) {\n    if (discardingOversizedLine) {\n      const newline = text.indexOf("\\n");\n      omittedOversizedBytes += Buffer.byteLength(newline < 0 ? text : text.slice(0, newline + 1), "utf8");\n      if (newline < 0) return;\n      discardingOversizedLine = false;\n      text = text.slice(newline + 1);\n      continue;\n    }\n    const newline = text.indexOf("\\n");\n    const segment = newline < 0 ? text : text.slice(0, newline + 1);\n    stdoutBuffer += segment;\n    text = newline < 0 ? "" : text.slice(newline + 1);\n    if (stdoutBuffer.length > maxStdoutLogLineChars) {\n      omittedOversizedLines += 1;\n      omittedOversizedBytes += Buffer.byteLength(stdoutBuffer, "utf8");\n      stdoutBuffer = "";\n      discardingOversizedLine = newline < 0;\n      continue;\n    }\n    if (newline >= 0) {\n      writeStdoutLine(stdoutBuffer);\n      stdoutBuffer = "";\n    }\n  }\n}\nfunction finishStdoutFilter() {\n  if (!discardingOversizedLine && stdoutBuffer.length > 0) writeStdoutLine(stdoutBuffer);\n  stdoutBuffer = "";\n  if (omittedMessageUpdates > 0 || omittedOversizedLines > 0) {\n    appendFileSync(eventPath, JSON.stringify({ type: "pi-subagent.stdout_filter", omitted: { messageUpdateEvents: omittedMessageUpdates, messageUpdateBytes: omittedMessageUpdateBytes, oversizedLines: omittedOversizedLines, oversizedBytes: omittedOversizedBytes }, reason: "cumulative message_update snapshots are omitted from durable stdout artifacts; final assistant text is stored in output.log" }) + "\\n");\n  }\n}\nfunction writeMeta(meta) {\n  if (settled) return;\n  settled = true;\n  finishStdoutFilter();\n  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\\n");\n}\nconst binding = process.env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;\nconst env = { ...process.env };\ndelete env.TMUX;\ndelete env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;\nif (typeof binding === "string" && binding.length > 0) env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = binding;\nconst child = spawn(argv[0], argv.slice(1), { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], env });\nchild.stdout?.on("data", handleStdoutChunk);\nchild.stderr?.on("data", (chunk) => { appendFileSync(stderrPath, chunk); process.stderr.write(chunk); });\nchild.on("error", () => { writeMeta({ status: "failed", failureKind: "spawn", exitCode: null, signal: null }); });\nchild.on("close", (exitCode, signal) => {\n  const failureKind = exitCode === 0 ? null : "exit";\n  writeMeta({ status: failureKind === null ? "completed" : "failed", failureKind, exitCode, signal });\n});\n`;
 }
 
 async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
@@ -208,6 +209,12 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 	const scriptPath = join(store.taskDir, "tmux-worker.mjs");
 	const launchPath = join(store.taskDir, "tmux-launch.sh");
 
+	const childEnv = { ...process.env };
+	delete childEnv.TMUX;
+	delete childEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
+	Object.assign(childEnv, options.childEnv ?? {});
+	const durableBinding =
+		options.childEnv?.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON ?? "";
 	await writeFile(
 		scriptPath,
 		workerScript(argv, cwd, eventPath, stderrPath, metaPath),
@@ -245,6 +252,8 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 					"-P",
 					"-F",
 					"#{session_id}\t#{pane_id}",
+					"-e",
+					`PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON=${durableBinding}`,
 					tmuxCommand,
 					...tmuxArgs,
 				],
@@ -362,7 +371,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 				},
 			);
 		}
-		return await runSession("/bin/bash", [launchPath]);
+		return await runSession("/bin/bash", [launchPath], childEnv);
 	} catch (error) {
 		if (!(error instanceof SandboxUnavailableError)) throw error;
 		return {

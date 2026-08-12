@@ -1,6 +1,6 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, mkdir, open, readFile, rm } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, readdir, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -52,6 +52,7 @@ export interface DurableLaunchBarrierReady {
 	workerPid: number;
 	workerProcessGroupId?: number;
 	launchPayloadSha256: string;
+	executionPlanSha256: string;
 	readySha256: string;
 }
 
@@ -127,11 +128,25 @@ function assertPositiveInteger(
 		throw new DurableLaunchBarrierError(`${label} is outside the supported range`);
 }
 
+function normalizePathGuardError(error: unknown, operation: string): never {
+	const code = (error as NodeJS.ErrnoException)?.code;
+	if (["ENOENT", "ENOTDIR", "ELOOP", "EACCES", "EPERM"].includes(code ?? ""))
+		throw new DurableLaunchBarrierError(
+			`durable launch barrier ${operation} failed guard check (${code})`,
+		);
+	throw error;
+}
+
 async function assertOwnerOnlyDirectory(
 	path: string,
 	expected?: DurableLaunchBarrierDescriptor["directoryIdentity"],
 ): Promise<DurableLaunchBarrierDescriptor["directoryIdentity"]> {
-	const info = await lstat(path);
+	let info;
+	try {
+		info = await lstat(path);
+	} catch (error) {
+		normalizePathGuardError(error, "directory identity");
+	}
 	if (!info.isDirectory() || info.isSymbolicLink())
 		throw new DurableLaunchBarrierError("durable launch barrier directory is not a real directory");
 	if ((info.mode & 0o777) !== 0o700)
@@ -169,6 +184,32 @@ function transientCommitError(): NodeJS.ErrnoException {
 	return error;
 }
 
+async function removeTransactionTempAliases(
+	transactionPath: string,
+): Promise<void> {
+	const transactionInfo = await lstat(transactionPath);
+	const directory = resolve(transactionPath, "..");
+	const prefix = `${transactionPath.slice(directory.length + 1)}.`;
+	for (const name of await readdir(directory)) {
+		if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+		const candidate = join(directory, name);
+		let info;
+		try {
+			info = await lstat(candidate);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+			throw error;
+		}
+		if (
+			info.isFile() &&
+			!info.isSymbolicLink() &&
+			info.dev === transactionInfo.dev &&
+			info.ino === transactionInfo.ino
+		)
+			await rm(candidate);
+	}
+}
+
 async function assertTransactionLink(
 	path: string,
 	transactionPath: string,
@@ -202,6 +243,7 @@ async function writeDurableExclusive(
 ): Promise<void> {
 	const bytes = Buffer.from(`${canonicalJson(value)}\n`, "utf8");
 	const transactionPath = `${path}.txn`;
+	const temporaryPath = `${transactionPath}.${process.pid}.${randomUUID()}.tmp`;
 	const pendingPath = `${path}.pending`;
 	await assertOwnerOnlyDirectory(
 		descriptor.directory,
@@ -228,25 +270,42 @@ async function writeDurableExclusive(
 	}
 	let transaction;
 	try {
-		transaction = await open(
-			transactionPath,
-			constants.O_RDWR |
-				constants.O_CREAT |
-				constants.O_EXCL |
-				(constants.O_NOFOLLOW ?? 0),
-			0o600,
-		);
-		await transaction.writeFile(bytes);
-		await transaction.sync();
+		let temporary;
+		try {
+			temporary = await open(
+				temporaryPath,
+				constants.O_RDWR |
+					constants.O_CREAT |
+					constants.O_EXCL |
+					(constants.O_NOFOLLOW ?? 0),
+				0o600,
+			);
+			await temporary.writeFile(bytes);
+			await temporary.sync();
+			await temporary.close();
+			temporary = undefined;
+			try {
+				await link(temporaryPath, transactionPath);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+			}
+			await syncDirectory(descriptor.directory);
+		} finally {
+			await temporary?.close().catch(() => undefined);
+			await rm(temporaryPath, { force: true }).catch(() => undefined);
+		}
+		await removeTransactionTempAliases(transactionPath);
 		await syncDirectory(descriptor.directory);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
 		transaction = await open(
 			transactionPath,
-			constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
+			constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
 		);
-	}
-	try {
+		const transactionBytes = await transaction.readFile();
+		if (!transactionBytes.equals(bytes))
+			throw new DurableLaunchBarrierError(
+				"durable launch barrier duplicate payload mismatch",
+			);
+		await transaction.sync();
 		await assertOwnerOnlyDirectory(
 			descriptor.directory,
 			descriptor.directoryIdentity,
@@ -258,13 +317,8 @@ async function writeDurableExclusive(
 		}
 		await assertTransactionLink(path, transactionPath);
 		await syncDirectory(descriptor.directory);
-		const current = await readFile(transactionPath);
-		if (!current.equals(bytes))
-			throw new DurableLaunchBarrierError(
-				"durable launch barrier duplicate payload mismatch",
-			);
 	} finally {
-		await transaction.close();
+		await transaction?.close();
 	}
 	await assertOwnerOnlyDirectory(
 		descriptor.directory,
@@ -479,6 +533,10 @@ function assertReady(
 	assertNonEmpty("durable launch barrier run id", ready.runId);
 	assertNonEmpty("durable launch barrier attempt id", ready.attemptId);
 	assertSha256("durable launch barrier payload", ready.launchPayloadSha256);
+	assertSha256(
+		"durable launch barrier execution plan",
+		ready.executionPlanSha256,
+	);
 	assertSha256("durable launch barrier ready digest", readySha256);
 	if (durableLaunchBarrierDigest(body) !== readySha256)
 		throw new DurableLaunchBarrierError("durable launch barrier ready digest mismatch");
@@ -561,6 +619,7 @@ export async function awaitDurableLaunchBarrier(options: {
 	runId: string;
 	attemptId: string;
 	launchPayloadSha256: string;
+	executionPlanSha256: string;
 	workerProcessGroupId?: number;
 }): Promise<DurableLaunchBarrierAck> {
 	const { descriptor } = options;
@@ -568,6 +627,10 @@ export async function awaitDurableLaunchBarrier(options: {
 	assertNonEmpty("durable launch barrier run id", options.runId);
 	assertNonEmpty("durable launch barrier attempt id", options.attemptId);
 	assertSha256("durable launch barrier payload", options.launchPayloadSha256);
+	assertSha256(
+		"durable launch barrier execution plan",
+		options.executionPlanSha256,
+	);
 	await assertOwnerOnlyDirectory(
 		descriptor.directory,
 		descriptor.directoryIdentity,
@@ -587,6 +650,7 @@ export async function awaitDurableLaunchBarrier(options: {
 			? {}
 			: { workerProcessGroupId: options.workerProcessGroupId }),
 		launchPayloadSha256: options.launchPayloadSha256,
+		executionPlanSha256: options.executionPlanSha256,
 	};
 	const ready = {
 		...readyBody,

@@ -17,7 +17,7 @@ if (!payloadPath) {
 }
 
 const jiti = createJiti(import.meta.url, { interopDefault: false });
-const [{ runSubagentTask }, artifacts, launchBarrier] = await Promise.all([
+const [orchestration, artifacts, launchBarrier] = await Promise.all([
 	jiti.import("../orchestrate/run.ts"),
 	jiti.import("../artifacts/index.ts"),
 	jiti.import("../durable-launch-barrier.ts"),
@@ -184,37 +184,60 @@ heartbeat = setInterval(() => {
 		.catch(() => undefined);
 }, heartbeatMs);
 heartbeat.unref?.();
+let preparedExecution;
 try {
 	await maybeDelayStartForTests();
+	const executionInput = input?.durableLaunchBarrier
+		? executionInputAfterDurableLaunch(input)
+		: { ...input, async: false, onComplete: undefined };
+	preparedExecution = await orchestration.prepareSubagentExecution({
+		input: executionInput,
+		cwd,
+		runId,
+		attemptId,
+	});
 	if (input?.durableLaunchBarrier) {
+		const executionPlan = {
+			schema: "pi-subagent-durable-execution-plan-v1",
+			backend: preparedExecution.backend,
+			runId,
+			attemptId,
+			cwd: preparedExecution.workspace.cwd,
+			workspace: preparedExecution.workspaceResult,
+			agent: preparedExecution.requestedAgent,
+			tools: preparedExecution.effectiveTools,
+		};
+		const executionPlanSha256 = createHash("sha256")
+			.update(JSON.stringify(executionPlan))
+			.digest("hex");
 		const preflight = prepareDurableWorkerBinding({
 			payload,
 			launchPayloadSha256,
+			executionPlanSha256,
+			executionCwd: preparedExecution.workspace.cwd,
 		});
 		const ack = await launchBarrier.awaitDurableLaunchBarrier({
 			descriptor: input.durableLaunchBarrier,
 			runId,
 			attemptId,
 			launchPayloadSha256,
+			executionPlanSha256,
 			workerProcessGroupId,
 		});
 		installDurableWorkerBinding({
 			payload,
 			launchPayloadSha256,
+			executionPlanSha256,
 			ack,
 			preflight,
 		});
 	}
-	const executionInput = input?.durableLaunchBarrier
-		? executionInputAfterDurableLaunch(input)
-		: { ...input, async: false, onComplete: undefined };
-	await runSubagentTask({
-		input: executionInput,
-		cwd,
-		runId,
-		attemptId,
-	});
+	await orchestration.runPreparedSubagentExecution(preparedExecution);
 } catch (error) {
+	if (preparedExecution !== undefined)
+		await orchestration
+		.discardSubagentExecution(preparedExecution)
+		.catch(() => undefined);
 	const message = error instanceof Error ? error.message : String(error);
 	await writeTerminalResult({
 		status: "failed",

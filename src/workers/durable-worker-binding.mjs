@@ -43,6 +43,8 @@ export function isDurableWorkerGuardError(error) {
 export function prepareDurableWorkerBinding({
 	payload,
 	launchPayloadSha256,
+	executionPlanSha256,
+	executionCwd = payload?.cwd,
 	workerPid = process.pid,
 }) {
 	const descriptor = payload?.input?.durableLaunchBarrier;
@@ -50,6 +52,9 @@ export function prepareDurableWorkerBinding({
 	if (!Number.isInteger(workerPid) || workerPid <= 0)
 		throw new DurableWorkerGuardError("durable worker pid is invalid");
 	const cwd = requireText("worker cwd", payload.cwd);
+	const resolvedExecutionCwd = resolve(
+		requireText("execution cwd", executionCwd),
+	);
 	const runsDir = resolve(cwd, payload.input?.runsDir ?? DEFAULT_RUNS_DIR);
 	const correlationId = optionalText(
 		"subagent correlation id",
@@ -63,12 +68,16 @@ export function prepareDurableWorkerBinding({
 		runId: requireText("subagent run id", payload.runId),
 		attemptId: requireText("subagent attempt id", payload.attemptId),
 		...(correlationId === undefined ? {} : { correlationId }),
-		cwdSha256: sha256Text(resolve(cwd)),
+		cwdSha256: sha256Text(resolvedExecutionCwd),
 		runsDirSha256: sha256Text(runsDir),
 		workerPid,
 		launchPayloadSha256: requireSha256(
 			"launch payload digest",
 			launchPayloadSha256,
+		),
+		executionPlanSha256: requireSha256(
+			"execution plan digest",
+			executionPlanSha256,
 		),
 		barrierIdentitySha256: requireSha256(
 			"barrier identity",
@@ -84,17 +93,22 @@ export function prepareDurableWorkerBinding({
 	});
 }
 
-export function buildDurableWorkerBinding({
-	payload,
-	launchPayloadSha256,
-	ack,
-	workerPid = process.pid,
-	preflight = prepareDurableWorkerBinding({
+export function buildDurableWorkerBinding(options) {
+	const {
 		payload,
 		launchPayloadSha256,
-		workerPid,
-	}),
-}) {
+		executionPlanSha256,
+		ack,
+		workerPid = process.pid,
+	} = options;
+	const preflight =
+		options.preflight ??
+		prepareDurableWorkerBinding({
+			payload,
+			launchPayloadSha256,
+			executionPlanSha256,
+			workerPid,
+		});
 	const { schema: _schema, ...prepared } = preflight;
 	return Object.freeze({
 		schema: "pi-subagent-durable-worker-binding-v1",
