@@ -236,6 +236,14 @@ try {
 		"d".repeat(64),
 	);
 	assert.deepEqual(replayedRelease, release);
+	const concurrentReleases = await Promise.all(
+		Array.from({ length: 8 }, () =>
+			releaseDurableLaunchBarrier(descriptor, ready, "d".repeat(64)),
+		),
+	);
+	assert.equal(concurrentReleases.length, 8);
+	for (const concurrent of concurrentReleases)
+		assert.deepEqual(concurrent, release);
 
 	const ackReplacement = await createDurableLaunchBarrier({
 		directory: join(root, "ack-replacement"),

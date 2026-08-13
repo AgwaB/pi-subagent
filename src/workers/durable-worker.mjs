@@ -17,10 +17,11 @@ if (!payloadPath) {
 }
 
 const jiti = createJiti(import.meta.url, { interopDefault: false });
-const [orchestration, artifacts, launchBarrier] = await Promise.all([
+const [orchestration, artifacts, launchBarrier, constants] = await Promise.all([
 	jiti.import("../orchestrate/run.ts"),
 	jiti.import("../artifacts/index.ts"),
 	jiti.import("../durable-launch-barrier.ts"),
+	jiti.import("../core/constants.ts"),
 ]);
 
 const payloadBytes = await readFile(payloadPath);
@@ -36,6 +37,8 @@ const workerProcessGroupId =
 	process.platform === "win32" ? undefined : process.pid;
 let terminalWritePromise;
 let heartbeat;
+let preparedExecution;
+const executionAbort = new AbortController();
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
@@ -147,19 +150,25 @@ async function maybeDelayStartForTests() {
 		process.env.PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS ?? "0",
 		10,
 	);
-	if (Number.isFinite(delayMs) && delayMs > 0) await sleep(delayMs);
+	if (!Number.isFinite(delayMs) || delayMs <= 0) return;
+	await Promise.race([
+		sleep(delayMs),
+		new Promise((resolveAbort) =>
+			executionAbort.signal.addEventListener("abort", resolveAbort, {
+				once: true,
+			}),
+		),
+	]);
+}
+
+function failureKindFromError(error) {
+	const kind = error?.failureKind;
+	return constants.isFailureKind(kind) ? kind : "internal";
 }
 
 function requestCancel(signal) {
-	void writeTerminalResult({
-		status: "cancelled",
-		failureKind: "user_cancelled",
-		message: `durable worker received ${signal}`,
-		signal,
-	}).finally(() => {
-		process.exitCode = 130;
-		process.exit();
-	});
+	executionAbort.abort(new Error(`durable worker received ${signal}`));
+	process.exitCode = 130;
 }
 
 process.once("SIGINT", () => requestCancel("SIGINT"));
@@ -184,9 +193,13 @@ heartbeat = setInterval(() => {
 		.catch(() => undefined);
 }, heartbeatMs);
 heartbeat.unref?.();
-let preparedExecution;
 try {
 	await maybeDelayStartForTests();
+	if (executionAbort.signal.aborted) {
+		const cancelled = new Error("durable worker was cancelled before execution");
+		cancelled.failureKind = "user_cancelled";
+		throw cancelled;
+	}
 	const executionInput = input?.durableLaunchBarrier
 		? executionInputAfterDurableLaunch(input)
 		: { ...input, async: false, onComplete: undefined };
@@ -223,29 +236,33 @@ try {
 			launchPayloadSha256,
 			executionPlanSha256,
 			workerProcessGroupId,
+			signal: executionAbort.signal,
 		});
-		installDurableWorkerBinding({
+		const binding = installDurableWorkerBinding({
 			payload,
 			launchPayloadSha256,
 			executionPlanSha256,
 			ack,
 			preflight,
 		});
+		preparedExecution.durableWorkerBinding = JSON.stringify(binding);
 	}
-	await orchestration.runPreparedSubagentExecution(preparedExecution);
+	await orchestration.runPreparedSubagentExecution(preparedExecution, {
+		signal: executionAbort.signal,
+	});
 } catch (error) {
-	if (preparedExecution !== undefined)
-		await orchestration
-		.discardSubagentExecution(preparedExecution)
-		.catch(() => undefined);
+	if (preparedExecution?.ownership?.state === "prepared")
+		await orchestration.discardSubagentExecution(preparedExecution).catch(() => undefined);
 	const message = error instanceof Error ? error.message : String(error);
+	const cancelled = executionAbort.signal.aborted;
 	await writeTerminalResult({
-		status: "failed",
-		failureKind:
-			isDurableWorkerGuardError(error) ||
-			launchBarrier.isDurableLaunchBarrierError?.(error)
-				? "guard_failure"
-				: "internal",
+		status: cancelled ? "cancelled" : "failed",
+		failureKind: cancelled
+			? "user_cancelled"
+			: isDurableWorkerGuardError(error) ||
+				launchBarrier.isDurableLaunchBarrierError?.(error)
+					? "guard_failure"
+					: failureKindFromError(error),
 		message,
 		exitCode: null,
 	});

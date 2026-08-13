@@ -142,6 +142,17 @@ export async function discardPreparedWorkspace(
   ]);
 }
 
+export async function retainOwnedWorkspace(
+  workspace: ResolvedWorkspace,
+): Promise<void> {
+  if (workspace.mode !== "worktree" || workspace.worktreePath === null) return;
+  await gitOutput(workspace.baseCwd, [
+    "worktree",
+    "list",
+    "--porcelain",
+  ]);
+}
+
 export async function finalizeWorktreeResult(workspace: ResolvedWorkspace, result: ResultEnvelope): Promise<ResultEnvelope> {
   if (workspace.mode !== "worktree" || workspace.worktreePath === null) return result;
 

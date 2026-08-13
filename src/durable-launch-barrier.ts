@@ -324,7 +324,7 @@ async function writeDurableExclusive(
 		descriptor.directory,
 		descriptor.directoryIdentity,
 	);
-	await rm(pendingPath);
+	await rm(pendingPath, { force: true });
 	await syncDirectory(descriptor.directory);
 }
 
@@ -397,9 +397,14 @@ function sleep(ms: number): Promise<void> {
 async function waitForFile(
 	descriptor: DurableLaunchBarrierDescriptor,
 	path: string,
+	signal?: AbortSignal,
 ): Promise<unknown> {
 	const deadline = Date.now() + descriptor.timeoutMs;
 	while (Date.now() <= deadline) {
+		if (signal?.aborted)
+			throw new DurableLaunchBarrierError(
+				"durable launch barrier wait was aborted",
+			);
 		const value = await readStrictJson(descriptor, path).catch(
 			(error: NodeJS.ErrnoException) => {
 				if (error?.code === "ENOENT" || error?.code === "EAGAIN")
@@ -621,6 +626,7 @@ export async function awaitDurableLaunchBarrier(options: {
 	launchPayloadSha256: string;
 	executionPlanSha256: string;
 	workerProcessGroupId?: number;
+	signal?: AbortSignal;
 }): Promise<DurableLaunchBarrierAck> {
 	const { descriptor } = options;
 	assertDurableLaunchBarrierDescriptor(descriptor);
@@ -660,7 +666,7 @@ export async function awaitDurableLaunchBarrier(options: {
 	const release = assertRelease(
 		descriptor,
 		ready,
-		await waitForFile(descriptor, descriptor.releasePath),
+		await waitForFile(descriptor, descriptor.releasePath, options.signal),
 	);
 	const ackBody = {
 		schema: "pi-subagent-durable-launch-barrier-ack-v1" as const,

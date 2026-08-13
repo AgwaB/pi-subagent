@@ -52,6 +52,13 @@ export type Backend = (typeof BACKENDS)[number];
 export type ResolvedBackend = (typeof RESOLVED_BACKENDS)[number];
 export type Status = (typeof STATUSES)[number];
 export type FailureKind = (typeof FAILURE_KINDS)[number];
+
+export function isFailureKind(value: unknown): value is FailureKind {
+	return (
+		typeof value === "string" &&
+		(FAILURE_KINDS as readonly string[]).includes(value)
+	);
+}
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 export type AsyncDependency = (typeof ASYNC_DEPENDENCIES)[number];
 export type AgentScope = (typeof AGENT_SCOPES)[number];

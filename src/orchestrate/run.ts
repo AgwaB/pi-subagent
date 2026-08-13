@@ -12,11 +12,12 @@ import {
 	type ProcessMetadata,
 	type ResultEnvelope,
 } from "../artifacts/index.ts";
-import type {
-	FailureKind,
-	ResolveInput,
-	ResolvedBackend,
-	SubagentTaskInput,
+import {
+	isFailureKind,
+	type FailureKind,
+	type ResolveInput,
+	type ResolvedBackend,
+	type SubagentTaskInput,
 } from "../core/constants.ts";
 import { resolveBackend } from "../core/resolver.ts";
 import { runHeadlessModel } from "../runners/headless-model.ts";
@@ -25,6 +26,7 @@ import { runTmuxModel } from "../runners/tmux.ts";
 import {
 	discardPreparedWorkspace,
 	finalizeWorktreeResult,
+	retainOwnedWorkspace,
 	resolveWorkspace,
 	type ResolvedWorkspace,
 } from "../workspace/worktree.ts";
@@ -37,6 +39,8 @@ export const MAX_PARALLEL_CONCURRENCY = 10;
 export interface RunSubagentTaskOptions {
 	input: ResolveInput;
 	cwd: string;
+	/** Explicit binding for this execution only; absent means child env must unset it. */
+	durableWorkerBinding?: string;
 	signal?: AbortSignal;
 	runId?: string;
 	attemptId?: string;
@@ -45,6 +49,8 @@ export interface RunSubagentTaskOptions {
 
 export interface PreparedSubagentExecution {
 	input: ResolveInput & { task: string };
+	durableWorkerBinding?: string;
+	ownership: { state: "prepared" | "execution-owned" | "finalized" };
 	backend: ResolvedBackend;
 	runId: string;
 	attemptId: string;
@@ -144,7 +150,7 @@ function failureKindFromError(error: unknown): FailureKind {
 		typeof error === "object" && error !== null && "failureKind" in error
 			? (error as { failureKind?: unknown }).failureKind
 			: undefined;
-	return candidate === "validation" ? "validation" : "internal";
+	return isFailureKind(candidate) ? candidate : "internal";
 }
 
 async function writeParallelErrorResult(options: {
@@ -267,8 +273,10 @@ export async function prepareSubagentExecution(
 		taskIndex: options.taskIndex,
 		runId,
 	});
-	return Object.freeze({
+	return {
 		input: preparedInput,
+		durableWorkerBinding: options.durableWorkerBinding,
+		ownership: { state: "prepared" as const },
 		backend,
 		runId,
 		attemptId,
@@ -278,13 +286,15 @@ export async function prepareSubagentExecution(
 		requestedAgent,
 		agentDefinition,
 		effectiveTools,
-	});
+	};
 }
 
 export async function discardSubagentExecution(
 	prepared: PreparedSubagentExecution,
 ): Promise<void> {
+	if (prepared.ownership.state !== "prepared") return;
 	await discardPreparedWorkspace(prepared.workspace);
+	prepared.ownership.state = "finalized";
 }
 
 export async function runPreparedSubagentExecution(
@@ -302,6 +312,7 @@ export async function runPreparedSubagentExecution(
 		requestedAgent,
 		agentDefinition,
 		effectiveTools,
+		durableWorkerBinding,
 	} = prepared;
 	const startedAt = new Date();
 	const runRef = { cwd: baseCwd, runId, runsDir: input.runsDir };
@@ -324,6 +335,7 @@ export async function runPreparedSubagentExecution(
 			},
 		],
 	});
+	prepared.ownership.state = "execution-owned";
 	await writeRunLocator({
 		...runRef,
 		parentSessionId: input.parentSessionId,
@@ -369,9 +381,8 @@ export async function runPreparedSubagentExecution(
 
 		const childEnv = { ...process.env };
 		delete childEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
-		const durableBinding = process.env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
-		if (durableBinding !== undefined)
-			childEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = durableBinding;
+		if (durableWorkerBinding !== undefined)
+			childEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = durableWorkerBinding;
 		const common = {
 			cwd,
 			artifactCwd: baseCwd,
@@ -413,6 +424,7 @@ export async function runPreparedSubagentExecution(
 					? await runInlineModel(modelOptions)
 					: await runHeadlessModel(modelOptions);
 		result = await finalizeWorktreeResult(workspace, result);
+		prepared.ownership.state = "finalized";
 
 		await finishAttemptFromResult(runRef, result);
 		await appendRunEvent(
@@ -449,13 +461,14 @@ export async function runPreparedSubagentExecution(
 		);
 		return result;
 	} catch (error) {
+		await retainOwnedWorkspace(workspace).catch(() => undefined);
 		const message = error instanceof Error ? error.message : String(error);
 		await upsertRunAttempt({
 			...runRef,
 			attemptId,
 			status: "failed",
 			backend,
-			failureKind: "internal",
+			failureKind: failureKindFromError(error),
 			startedAt,
 			completedAt: new Date(),
 			activate: true,
@@ -476,7 +489,12 @@ export async function runSubagentTask(
 	options: RunSubagentTaskOptions,
 ): Promise<ResultEnvelope> {
 	const prepared = await prepareSubagentExecution(options);
-	return await runPreparedSubagentExecution(prepared, { signal: options.signal });
+	try {
+		return await runPreparedSubagentExecution(prepared, { signal: options.signal });
+	} catch (error) {
+		await discardSubagentExecution(prepared).catch(() => undefined);
+		throw error;
+	}
 }
 
 export async function runParallelSubagentTasks(
