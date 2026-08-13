@@ -111,7 +111,8 @@ const installed = installDurableWorkerBinding({
 	executionPlanSha256,
 	workerPid: 1234,
 });
-assert.deepEqual(JSON.parse(process.env[DURABLE_WORKER_BINDING_ENV]), installed);
+assert.equal(process.env[DURABLE_WORKER_BINDING_ENV], undefined);
+assert.equal(installed.schema, "pi-subagent-durable-worker-binding-v1");
 assert.throws(
 	() =>
 		prepareDurableWorkerBinding({

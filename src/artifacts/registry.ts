@@ -952,7 +952,7 @@ async function finishAttemptFromResultUnlocked(
 		stderrPath: artifactPath(result, "stderr"),
 		outputPath: artifactPath(result, "output"),
 		workspace: result.workspace,
-		tmux: result.tmux,
+		tmux: result.tmux ?? (index >= 0 ? attempts[index]?.tmux : undefined),
 	};
 	if (index >= 0) attempts[index] = attempt;
 	else attempts.push(attempt);

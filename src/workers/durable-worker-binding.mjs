@@ -133,7 +133,7 @@ export function executionInputAfterDurableLaunch(input) {
 }
 
 export function installDurableWorkerBinding(options) {
-	const binding = buildDurableWorkerBinding(options);
-	process.env[DURABLE_WORKER_BINDING_ENV] = JSON.stringify(binding);
-	return binding;
+	// Build a run-scoped value for explicit runner handoff. Never mutate the
+	// parent process environment: nested/barrierless inline runs share it.
+	return buildDurableWorkerBinding(options);
 }

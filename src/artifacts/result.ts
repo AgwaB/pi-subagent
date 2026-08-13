@@ -29,6 +29,8 @@ export interface ArtifactRef {
 
 export type WorktreeCleanupStatus =
 	| "not-needed"
+	| "prepared"
+	| "execution-owned"
 	| "removed"
 	| "kept"
 	| "failed";
@@ -50,6 +52,10 @@ export interface ResultSandbox {
 }
 
 export interface ResultTmuxMetadata {
+	/** Private per-run tmux socket/server name. */
+	serverName: string;
+	/** Absolute owner-only socket path used with `tmux -S`. */
+	socketPath: string;
 	sessionName: string;
 	sessionId: string | null;
 	paneId: string | null;

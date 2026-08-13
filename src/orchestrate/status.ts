@@ -9,6 +9,7 @@ import {
 	type CompletionMetadata,
 	type ResultEnvelope,
 	type ResultMetadata,
+	type ResultTmuxMetadata,
 	type RunAttemptRecord,
 	type RunEvent,
 	type RunRecord,
@@ -60,6 +61,7 @@ export interface RunAttemptStatusSnapshot {
 	processGroupId?: number;
 	workerPid?: number;
 	workerProcessGroupId?: number;
+	tmux?: ResultTmuxMetadata;
 }
 
 export type RunTaskStatusSnapshot = RunAttemptStatusSnapshot & {
@@ -219,6 +221,7 @@ function attemptSnapshot(attempt: RunAttemptRecord): RunAttemptStatusSnapshot {
 		...(attempt.process?.workerProcessGroupId === undefined
 			? {}
 			: { workerProcessGroupId: attempt.process.workerProcessGroupId }),
+		...(attempt.tmux === undefined ? {} : { tmux: attempt.tmux }),
 	};
 }
 
@@ -702,7 +705,11 @@ export async function waitForRun(
 	let snapshot = await getRunStatus(options);
 	while (Date.now() <= deadline) {
 		snapshot = await getRunStatus(options);
-		if (snapshot !== null && isTerminalStatus(snapshot.status))
+		if (
+			snapshot !== null &&
+			isTerminalStatus(snapshot.status) &&
+			snapshot.resultPath !== null
+		)
 			return { status: "completed", outcome: "terminal", snapshot };
 		await sleep(pollIntervalMs);
 	}

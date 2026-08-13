@@ -71,6 +71,13 @@ export interface RunHeadlessModelOptions {
 	 */
 	toolResultBudget?: ToolResultBudgetInput;
 	onProcessStart?: (process: ProcessMetadata) => void | Promise<void>;
+	onTmuxStart?: (tmux: {
+		serverName: string;
+		socketPath: string;
+		sessionName: string;
+		sessionId: string | null;
+		paneId: string | null;
+	}) => void | Promise<void>;
 	/** Explicit run-scoped environment additions/removals for the child process. */
 	childEnv?: NodeJS.ProcessEnv;
 }

@@ -260,7 +260,8 @@ export async function prepareSubagentExecution(
 	if (
 		backend === "inline" &&
 		(options.requiresDurableWorkerBinding === true ||
-			options.durableWorkerBinding !== undefined)
+			options.durableWorkerBinding !== undefined ||
+			process.env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON !== undefined)
 	)
 		throw new SubagentToolAuthorityError(
 			"durable worker binding does not support inline execution; choose headless or tmux.",
@@ -296,7 +297,11 @@ export async function prepareSubagentExecution(
 			status: "pending",
 			backend,
 			failureKind: null,
-			workspace: { ...workspaceResult, worktreeCleanupStatus: "kept" },
+			workspace: {
+				...workspaceResult,
+				worktreeCleanupStatus:
+					workspace.mode === "worktree" ? "prepared" : "not-needed",
+			},
 			activate: true,
 		});
 	} catch (error) {
@@ -379,10 +384,32 @@ export async function runPreparedSubagentExecution(
 				status: "running",
 				backend,
 				startedAt: startedAt.toISOString(),
+				workspace: {
+					...workspaceResult,
+					worktreeCleanupStatus:
+						workspace.mode === "worktree"
+							? "execution-owned"
+							: "not-needed",
+				},
 			},
 		],
 	});
 	prepared.ownership.state = "execution-owned";
+	await upsertRunAttempt({
+		...runRef,
+		attemptId,
+		status: "running",
+		backend,
+		failureKind: null,
+		startedAt,
+		completedAt: null,
+		workspace: {
+			...workspaceResult,
+			worktreeCleanupStatus:
+				workspace.mode === "worktree" ? "execution-owned" : "not-needed",
+		},
+		activate: true,
+	});
 	await writeRunLocator({
 		...runRef,
 		parentSessionId: input.parentSessionId,
@@ -400,7 +427,11 @@ export async function runPreparedSubagentExecution(
 			failureKind: null,
 			startedAt,
 			completedAt: null,
-			workspace: workspaceResult,
+			workspace: {
+				...workspaceResult,
+				worktreeCleanupStatus:
+					workspace.mode === "worktree" ? "execution-owned" : "not-needed",
+			},
 			activate: true,
 		});
 		await appendRunEvent(
@@ -425,6 +456,29 @@ export async function runPreparedSubagentExecution(
 				},
 			);
 		};
+		const onTmuxStart = async (tmux: {
+			serverName: string;
+			socketPath: string;
+			sessionName: string;
+			sessionId: string | null;
+			paneId: string | null;
+		}) => {
+			await upsertRunAttempt({
+				...runRef,
+				attemptId,
+				status: "running",
+				backend,
+				tmux,
+				workspace: {
+					...workspaceResult,
+					worktreeCleanupStatus:
+						workspace.mode === "worktree"
+							? "execution-owned"
+							: "not-needed",
+				},
+				onlyIfActive: true,
+			});
+		};
 
 		const childEnv = { ...process.env };
 		delete childEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
@@ -443,6 +497,7 @@ export async function runPreparedSubagentExecution(
 			parentSessionId: input.parentSessionId,
 			workspace: workspaceResult,
 			onProcessStart,
+			onTmuxStart,
 			childEnv,
 		};
 
@@ -472,9 +527,16 @@ export async function runPreparedSubagentExecution(
 					: await runHeadlessModel(modelOptions);
 		result = await finalizeWorktreeResult(workspace, result);
 		prepared.ownership.state = "finalized";
+		const terminalCleanupStatus = result.workspace.worktreeCleanupStatus;
 		prepared.ownership.cleanupStatus =
-			result.workspace.worktreeCleanupStatus ??
-			(workspace.mode === "worktree" ? "kept" : "not-needed");
+			terminalCleanupStatus === "removed" ||
+			terminalCleanupStatus === "kept" ||
+			terminalCleanupStatus === "failed" ||
+			terminalCleanupStatus === "not-needed"
+				? terminalCleanupStatus
+				: workspace.mode === "worktree"
+					? "kept"
+					: "not-needed";
 
 		await finishAttemptFromResult(runRef, result);
 		await appendRunEvent(
@@ -512,25 +574,8 @@ export async function runPreparedSubagentExecution(
 		return result;
 	} catch (error) {
 		await retainOwnedWorkspace(workspace).catch(() => undefined);
-		const message = error instanceof Error ? error.message : String(error);
-		await upsertRunAttempt({
-			...runRef,
-			attemptId,
-			status: "failed",
-			backend,
-			failureKind: failureKindFromError(error),
-			startedAt,
-			completedAt: new Date(),
-			activate: true,
-		}).catch(() => undefined);
-		await appendRunEvent(
-			{ ...runRef },
-			{ type: "attempt.failed", attemptId, status: "failed", message },
-		).catch(() => undefined);
-		await appendRunEvent(
-			{ ...runRef },
-			{ type: "run.failed", status: "failed", message },
-		).catch(() => undefined);
+		// Durable workers commit their fallback result before the terminal run
+		// transition. Synchronous callers receive the thrown error directly.
 		throw error;
 	}
 }

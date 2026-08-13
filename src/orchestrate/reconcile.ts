@@ -3,14 +3,15 @@ import { isAbsolute, resolve, sep } from "node:path";
 import {
 	appendRunEvent,
 	commitAttemptResultIfActive,
+	createAttemptArtifactStore,
 	readRunRecord,
-	upsertRunAttempt,
 	type ResultEnvelope,
 	type RunAttemptRecord,
 	type RunRef,
 	type RunRecord,
 } from "../artifacts/index.ts";
 import { resolveRunRef } from "./run-ref.ts";
+import { terminatePrivateTmuxServer } from "../runners/tmux-control.ts";
 import { isTerminalStatus } from "./status.ts";
 
 export interface ReconcileSubagentRunOptions extends RunRef {
@@ -75,6 +76,13 @@ function heartbeatFresh(
 	return Number.isFinite(time) && Date.now() - time <= staleAfterMs;
 }
 
+async function terminateTmuxServer(
+	tmux: RunAttemptRecord["tmux"],
+): Promise<boolean> {
+	if (tmux?.socketPath === undefined) return true;
+	return await terminatePrivateTmuxServer({ socketPath: tmux.socketPath });
+}
+
 function activeAttempt(record: RunRecord): RunAttemptRecord | undefined {
 	const activeId =
 		record.activeAttemptId ?? record.latestAttemptId ?? undefined;
@@ -92,8 +100,15 @@ export async function reconcileSubagentRun(
 	const record = await readRunRecord(ref);
 	if (record === null)
 		return { status: "not-found", runId: options.runId, record: null };
-	if (isTerminalStatus(record.status))
+	if (isTerminalStatus(record.status)) {
+		const terminalAttempt = activeAttempt(record);
+		if (
+			terminalAttempt?.tmux !== undefined &&
+			!(await terminateTmuxServer(terminalAttempt.tmux))
+		)
+			return { status: "running", runId: options.runId, record };
 		return { status: "already-terminal", runId: options.runId, record };
+	}
 
 	const attempt = activeAttempt(record);
 	if (attempt === undefined)
@@ -105,6 +120,8 @@ export async function reconcileSubagentRun(
 		result.attemptId === attempt.attemptId &&
 		isTerminalStatus(result.status)
 	) {
+		if (!(await terminateTmuxServer(attempt.tmux ?? result.tmux)))
+			return { status: "running", runId: options.runId, record };
 		const committed = await commitAttemptResultIfActive(ref, result);
 		await appendRunEvent(ref, {
 			type: "reconcile.completed",
@@ -125,17 +142,51 @@ export async function reconcileSubagentRun(
 		return { status: "running", runId: options.runId, record };
 	}
 
+	if (!(await terminateTmuxServer(attempt.tmux)))
+		return { status: "running", runId: options.runId, record };
+
 	const interrupted = record.interrupt !== undefined;
-	const updated = await upsertRunAttempt({
+	const cleanupStatus =
+		attempt.workspace?.mode === "worktree" ? "kept" : "not-needed";
+	const completedAt = new Date();
+	const artifactCwd = attempt.artifactCwd ?? record.cwd;
+	const store = await createAttemptArtifactStore({
 		...ref,
+		cwd: artifactCwd,
 		attemptId: attempt.attemptId,
-		status: interrupted ? "cancelled" : "failed",
-		backend: attempt.backend,
-		failureKind: interrupted ? "user_cancelled" : "stale",
-		startedAt: attempt.startedAt,
-		completedAt: new Date(),
-		activate: true,
 	});
+	const stderr = await store.writeTextArtifact(
+		"stderr",
+		interrupted
+			? "interrupted attempt exited without a result; marked cancelled\n"
+			: "active attempt is stale/orphaned\n",
+	);
+	const terminalResult = await store.writeResult({
+		backend: attempt.backend ?? record.backend ?? "headless",
+		status: interrupted ? "cancelled" : "failed",
+		failureKind: interrupted ? "user_cancelled" : "stale",
+		cwd: artifactCwd,
+		startedAt: attempt.startedAt,
+		completedAt,
+		workspace: {
+			...(attempt.workspace ?? {
+				mode: "shared",
+				cwd: artifactCwd,
+				worktreePath: null,
+			}),
+			worktreeCleanupStatus: cleanupStatus,
+		},
+		sandbox: result?.sandbox ?? { enabled: false },
+		exitCode: null,
+		signal: interrupted ? record.interrupt?.signal ?? null : null,
+		artifacts: [...(result?.artifacts ?? []), stderr],
+		...(attempt.tmux === undefined ? {} : { tmux: attempt.tmux }),
+		metadata: result?.metadata ?? { contextLengthExceeded: false },
+	});
+	const committed = await commitAttemptResultIfActive(ref, terminalResult);
+	if (!committed.committed)
+		return { status: "running", runId: options.runId, record: committed.record };
+	const updated = committed.record;
 	await appendRunEvent(ref, {
 		type: interrupted ? "reconcile.completed" : "reconcile.failed",
 		attemptId: attempt.attemptId,

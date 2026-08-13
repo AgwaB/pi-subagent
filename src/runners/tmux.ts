@@ -18,6 +18,13 @@ import {
 } from "../core/constants.ts";
 import { SandboxUnavailableError, withSandboxedArgv } from "../sandbox/srt.ts";
 import {
+	preparePrivateTmuxSocket,
+	privateTmuxServerAlive,
+	privateTmuxSocketPath,
+	terminatePrivateTmuxServer,
+	TmuxOwnershipError,
+} from "./tmux-control.ts";
+import {
 	buildPiArgv,
 	detectContextLengthExceeded,
 	parsePiJsonFile,
@@ -44,6 +51,7 @@ interface RunTmuxProcessOptions {
 	sandbox?: SandboxInput | false | null;
 	workspace?: Partial<ResultWorkspace>;
 	childEnv?: NodeJS.ProcessEnv;
+	onTmuxStart?: RunHeadlessModelOptions["onTmuxStart"];
 }
 
 export type RunTmuxModelOptions = RunHeadlessModelOptions;
@@ -60,6 +68,8 @@ interface TmuxRunResult {
 	stderrRef: ArtifactRef;
 	eventPath: string;
 	tmux: {
+		serverName: string;
+		socketPath: string;
 		sessionName: string;
 		sessionId: string | null;
 		paneId: string | null;
@@ -136,27 +146,15 @@ async function readWorkerMeta(path: string): Promise<WorkerMeta | undefined> {
 	}
 }
 
-async function tmuxSessionAlive(
-	serverName: string,
-	sessionName: string,
-): Promise<boolean> {
-	try {
-		await execFileAsync("tmux", ["-L", serverName, "has-session", "-t", sessionName]);
-		return true;
-	} catch {
-		return false;
-	}
+async function tmuxSessionAlive(socketPath: string): Promise<boolean> {
+	return await privateTmuxServerAlive({ socketPath });
 }
 
-async function killTmuxSession(
-	serverName: string,
-	_sessionName: string,
-): Promise<void> {
-	try {
-		await execFileAsync("tmux", ["-L", serverName, "kill-server"]);
-	} catch {
-		// Session may already have exited; cleanup remains best-effort.
-	}
+async function killTmuxSession(socketPath: string): Promise<void> {
+	if (!(await terminatePrivateTmuxServer({ socketPath })))
+		throw new TmuxOwnershipError(
+			"tmux private server remained alive after termination",
+		);
 }
 
 function workerScript(
@@ -209,10 +207,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 		};
 	}
 
-	const sessionName = `pi-subagent-${store.runId}-${store.attemptId}`.replace(
-		/[^A-Za-z0-9_-]/g,
-		"-",
-	);
+	const sessionName = "run";
 	const eventPath = join(store.taskDir, "pi-events.jsonl");
 	const stderrPath = store.pathFor("stderr");
 	const metaPath = join(store.taskDir, "tmux-worker-meta.json");
@@ -234,7 +229,10 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 	);
 	await chmod(launchPath, 0o700);
 
-	const serverName = `${sessionName}-${randomBytes(12).toString("hex")}`;
+	// Keep the socket name short under TMUX_TMPDIR and Unix socket path limits.
+	const serverName = `ps-${randomBytes(12).toString("hex")}`;
+	const socketPath = privateTmuxSocketPath(serverName, childEnv);
+	await preparePrivateTmuxSocket(socketPath);
 
 	async function runSession(
 		tmuxCommand: string,
@@ -251,12 +249,21 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 	}> {
 		let sessionId: string | null = null;
 		let paneId: string | null = null;
+		let serverStarted = false;
+		const tmuxIdentity = {
+			serverName,
+			socketPath,
+			sessionName,
+			sessionId,
+			paneId,
+		};
+		await options.onTmuxStart?.(tmuxIdentity);
 		try {
 			const { stdout } = await execFileAsync(
 				"tmux",
 				[
-					"-L",
-					serverName,
+					"-S",
+					socketPath,
 					"-f",
 					"/dev/null",
 					"new-session",
@@ -274,10 +281,25 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 					env: tmuxEnv ?? childEnv,
 				},
 			);
+			serverStarted = true;
 			const [rawSessionId, rawPaneId] = stdout.trim().split("\t");
 			sessionId = rawSessionId || null;
 			paneId = rawPaneId || null;
+			await options.onTmuxStart?.({
+				...tmuxIdentity,
+				sessionId,
+				paneId,
+			});
 		} catch (error) {
+			if (serverStarted || (await tmuxSessionAlive(socketPath))) {
+				try {
+					await killTmuxSession(socketPath);
+				} catch (cleanupError) {
+					throw new TmuxOwnershipError(
+						`tmux launch failed and the private server could not be terminated: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+					);
+				}
+			}
 			return {
 				result: null,
 				store,
@@ -302,13 +324,13 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 		while (true) {
 			const meta = await readWorkerMeta(metaPath);
 			if (meta !== undefined) {
-				await killTmuxSession(serverName, sessionName);
+				await killTmuxSession(socketPath);
 				return {
 					result: {
 						meta,
 						stderrRef: store.refFor("stderr", await pathBytes(stderrPath)),
 						eventPath,
-						tmux: { sessionName, sessionId, paneId },
+						tmux: { serverName, socketPath, sessionName, sessionId, paneId },
 					},
 					store,
 					cwd,
@@ -321,7 +343,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 			if (deadline !== undefined && Date.now() >= deadline)
 				stopKind = "timeout";
 			if (stopKind !== null) {
-				await killTmuxSession(serverName, sessionName);
+				await killTmuxSession(socketPath);
 				return {
 					result: {
 						meta: {
@@ -332,7 +354,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 						},
 						stderrRef: store.refFor("stderr", await pathBytes(stderrPath)),
 						eventPath,
-						tmux: { sessionName, sessionId, paneId },
+						tmux: { serverName, socketPath, sessionName, sessionId, paneId },
 					},
 					store,
 					cwd,
@@ -341,7 +363,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 				};
 			}
 
-			if (!(await tmuxSessionAlive(serverName, sessionName))) {
+			if (!(await tmuxSessionAlive(socketPath))) {
 				return {
 					result: {
 						meta: {
@@ -352,7 +374,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 						},
 						stderrRef: store.refFor("stderr", await pathBytes(stderrPath)),
 						eventPath,
-						tmux: { sessionName, sessionId, paneId },
+						tmux: { serverName, socketPath, sessionName, sessionId, paneId },
 					},
 					store,
 					cwd,
@@ -382,13 +404,33 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 						`#!/usr/bin/env bash\nset -euo pipefail\nunset TMUX\nexec ${launch.argv.map(shellQuote).join(" ")}\n`,
 					);
 					await chmod(launchPath, 0o700);
-					return await runSession("/bin/bash", [launchPath], launch.env);
+					const sandboxEnv = {
+						...childEnv,
+						...(launch.env ?? {}),
+					};
+					delete sandboxEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
+					const explicitBinding =
+						options.childEnv?.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
+					if (explicitBinding !== undefined)
+						sandboxEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = explicitBinding;
+					return await runSession("/bin/bash", [launchPath], sandboxEnv);
 				},
 			);
 		}
 		return await runSession("/bin/bash", [launchPath], childEnv);
 	} catch (error) {
-		if (!(error instanceof SandboxUnavailableError)) throw error;
+		if (!(error instanceof SandboxUnavailableError)) {
+			if (await tmuxSessionAlive(socketPath)) {
+				try {
+					await killTmuxSession(socketPath);
+				} catch (cleanupError) {
+					throw new TmuxOwnershipError(
+						`tmux execution failed and the private server could not be terminated: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+					);
+				}
+			}
+			throw error;
+		}
 		return {
 			result: null,
 			store,

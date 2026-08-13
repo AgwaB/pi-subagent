@@ -57,6 +57,8 @@ async function createRunningAttempt(cwd, runId, attemptId, options = {}) {
 				resultPath,
 				process: options.process,
 				heartbeatAt: options.heartbeatAt,
+				workspace: options.workspace,
+				tmux: options.tmux,
 			},
 		],
 	});
@@ -164,6 +166,41 @@ try {
 	assert.equal(stale.status, "marked-stale");
 	assert.equal(stale.record?.status, "failed");
 	assert.equal(stale.record?.failureKind, "stale");
+	assert.equal(
+		stale.record?.attempts[0]?.workspace?.worktreeCleanupStatus,
+		"not-needed",
+	);
+
+	const tmuxCwd = join(tempRoot, "stale-tmux");
+	await createRunningAttempt(tmuxCwd, "run_reconcile_tmux", "attempt_tmux", {
+		backend: "tmux",
+		process: { pid: 99999999 },
+		heartbeatAt: new Date(Date.now() - 60_000).toISOString(),
+		workspace: {
+			mode: "worktree",
+			cwd: tmuxCwd,
+			worktreePath: join(tempRoot, "retained-worktree"),
+			worktreeCleanupStatus: "execution-owned",
+		},
+		tmux: {
+			serverName: "ps-nonexistent-test",
+			socketPath: join(tempRoot, "missing-tmux.sock"),
+			sessionName: "run",
+			sessionId: "$1",
+			paneId: "%1",
+		},
+	});
+	const tmuxStale = await reconcileSubagentRun({
+		cwd: tmuxCwd,
+		runId: "run_reconcile_tmux",
+		staleAfterMs: 1,
+	});
+	assert.equal(tmuxStale.status, "marked-stale");
+	assert.equal(
+		tmuxStale.record?.attempts[0]?.workspace?.worktreeCleanupStatus,
+		"kept",
+	);
+	assert.equal(typeof tmuxStale.record?.attempts[0]?.resultPath, "string");
 
 	const interruptedCwd = join(tempRoot, "interrupted");
 	await createRunningAttempt(

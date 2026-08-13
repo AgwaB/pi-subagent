@@ -261,6 +261,10 @@ try {
 		signal: executionAbort.signal,
 	});
 } catch (error) {
+	if (error?.terminalBlocked === true) {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
+	} else {
 	if (preparedExecution?.ownership?.state === "prepared")
 		await orchestration.discardSubagentExecution(preparedExecution).catch(() => undefined);
 	const message = error instanceof Error ? error.message : String(error);
@@ -277,6 +281,7 @@ try {
 		exitCode: null,
 	});
 	process.exitCode = 1;
+	}
 } finally {
 	if (heartbeat !== undefined) clearInterval(heartbeat);
 }
