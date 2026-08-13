@@ -128,6 +128,30 @@ try {
 		if (index === 1) await assert.rejects(access(crashedTempPath));
 	}
 
+	const abortedBarrier = await createDurableLaunchBarrier({
+		directory: join(root, "aborted-barrier"),
+		subjectSha256: "2".repeat(64),
+		timeoutMs: 100,
+	});
+	const aborted = new AbortController();
+	aborted.abort();
+	await assert.rejects(
+		import("../../src/durable-launch-barrier.ts").then(
+			({ awaitDurableLaunchBarrier }) =>
+				awaitDurableLaunchBarrier({
+					descriptor: abortedBarrier,
+					runId: "run-aborted",
+					attemptId: "attempt-aborted",
+					launchPayloadSha256: "1".repeat(64),
+					executionPlanSha256: "0".repeat(64),
+					signal: aborted.signal,
+				}),
+		),
+		/aborted before ready/u,
+	);
+	await assert.rejects(access(abortedBarrier.readyPath));
+	await assert.rejects(access(abortedBarrier.ackPath));
+
 	const descriptorPath = join(root, "descriptor.json");
 	const markerPath = join(root, "released.txt");
 	await writeFile(descriptorPath, `${JSON.stringify(descriptor)}\n`, "utf8");

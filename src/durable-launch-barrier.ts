@@ -641,6 +641,10 @@ export async function awaitDurableLaunchBarrier(options: {
 		descriptor.directory,
 		descriptor.directoryIdentity,
 	);
+	if (options.signal?.aborted)
+		throw new DurableLaunchBarrierError(
+			"durable launch barrier was aborted before ready",
+		);
 	const readyBody = {
 		schema: "pi-subagent-durable-launch-barrier-ready-v1" as const,
 		barrierIdentitySha256: descriptor.identitySha256,
@@ -668,6 +672,10 @@ export async function awaitDurableLaunchBarrier(options: {
 		ready,
 		await waitForFile(descriptor, descriptor.releasePath, options.signal),
 	);
+	if (options.signal?.aborted)
+		throw new DurableLaunchBarrierError(
+			"durable launch barrier was aborted before acknowledgement",
+		);
 	const ackBody = {
 		schema: "pi-subagent-durable-launch-barrier-ack-v1" as const,
 		barrierIdentitySha256: descriptor.identitySha256,

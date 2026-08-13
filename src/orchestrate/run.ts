@@ -41,6 +41,8 @@ export interface RunSubagentTaskOptions {
 	cwd: string;
 	/** Explicit binding for this execution only; absent means child env must unset it. */
 	durableWorkerBinding?: string;
+	/** Preflight marker used to reject inline before a durable barrier emits READY. */
+	requiresDurableWorkerBinding?: boolean;
 	signal?: AbortSignal;
 	runId?: string;
 	attemptId?: string;
@@ -50,7 +52,10 @@ export interface RunSubagentTaskOptions {
 export interface PreparedSubagentExecution {
 	input: ResolveInput & { task: string };
 	durableWorkerBinding?: string;
-	ownership: { state: "prepared" | "execution-owned" | "finalized" };
+	ownership: {
+		state: "prepared" | "execution-owned" | "finalized";
+		cleanupStatus?: "not-needed" | "removed" | "kept" | "failed";
+	};
 	backend: ResolvedBackend;
 	runId: string;
 	attemptId: string;
@@ -252,6 +257,14 @@ export async function prepareSubagentExecution(
 	const resolved = resolveBackend(input);
 	if (resolved.status === "failed") throw new Error(resolved.error);
 	const backend = resolved.backend;
+	if (
+		backend === "inline" &&
+		(options.requiresDurableWorkerBinding === true ||
+			options.durableWorkerBinding !== undefined)
+	)
+		throw new SubagentToolAuthorityError(
+			"durable worker binding does not support inline execution; choose headless or tmux.",
+		);
 	const runId = options.runId ?? createRunId();
 	const attemptId = options.attemptId ?? createAttemptId();
 	const baseCwd = resolve(input.cwd ?? options.cwd);
@@ -273,6 +286,23 @@ export async function prepareSubagentExecution(
 		taskIndex: options.taskIndex,
 		runId,
 	});
+	const workspaceResult = workspaceMeta(workspace);
+	try {
+		await upsertRunAttempt({
+			cwd: baseCwd,
+			runId,
+			runsDir: input.runsDir,
+			attemptId,
+			status: "pending",
+			backend,
+			failureKind: null,
+			workspace: { ...workspaceResult, worktreeCleanupStatus: "kept" },
+			activate: true,
+		});
+	} catch (error) {
+		await discardPreparedWorkspace(workspace).catch(() => undefined);
+		throw error;
+	}
 	return {
 		input: preparedInput,
 		durableWorkerBinding: options.durableWorkerBinding,
@@ -282,7 +312,7 @@ export async function prepareSubagentExecution(
 		attemptId,
 		baseCwd,
 		workspace,
-		workspaceResult: workspaceMeta(workspace),
+		workspaceResult,
 		requestedAgent,
 		agentDefinition,
 		effectiveTools,
@@ -295,6 +325,23 @@ export async function discardSubagentExecution(
 	if (prepared.ownership.state !== "prepared") return;
 	await discardPreparedWorkspace(prepared.workspace);
 	prepared.ownership.state = "finalized";
+	prepared.ownership.cleanupStatus =
+		prepared.workspace.mode === "worktree" ? "removed" : "not-needed";
+	await upsertRunAttempt({
+		cwd: prepared.baseCwd,
+		runId: prepared.runId,
+		runsDir: prepared.input.runsDir,
+		attemptId: prepared.attemptId,
+		status: "pending",
+		backend: prepared.backend,
+		failureKind: null,
+		workspace: {
+			...prepared.workspaceResult,
+			worktreeCleanupStatus:
+				prepared.workspace.mode === "worktree" ? "removed" : "not-needed",
+		},
+		activate: true,
+	}).catch(() => undefined);
 }
 
 export async function runPreparedSubagentExecution(
@@ -425,6 +472,9 @@ export async function runPreparedSubagentExecution(
 					: await runHeadlessModel(modelOptions);
 		result = await finalizeWorktreeResult(workspace, result);
 		prepared.ownership.state = "finalized";
+		prepared.ownership.cleanupStatus =
+			result.workspace.worktreeCleanupStatus ??
+			(workspace.mode === "worktree" ? "kept" : "not-needed");
 
 		await finishAttemptFromResult(runRef, result);
 		await appendRunEvent(

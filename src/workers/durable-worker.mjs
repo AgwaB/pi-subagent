@@ -88,6 +88,15 @@ async function writeTerminalResultOnce({
 		});
 		const stderr = await store.writeTextArtifact("stderr", `${message}\n`);
 		const worker = store.refFor("worker");
+		const preparedWorkspace = preparedExecution?.workspaceResult;
+		const retainedWorkspace =
+			preparedWorkspace?.mode === "worktree"
+				? {
+						...preparedWorkspace,
+						worktreeCleanupStatus:
+							preparedExecution?.ownership?.cleanupStatus ?? "kept",
+					}
+				: (preparedWorkspace ?? { mode: "shared", cwd });
 		const result = await store.writeResult({
 			backend: payload.backend ?? "headless",
 			status,
@@ -95,7 +104,7 @@ async function writeTerminalResultOnce({
 			cwd,
 			startedAt: payload.startedAt ?? new Date().toISOString(),
 			completedAt: new Date().toISOString(),
-			workspace: { mode: "shared", cwd },
+			workspace: retainedWorkspace,
 			sandbox: { enabled: Boolean(input?.sandbox) },
 			exitCode,
 			signal,
@@ -208,6 +217,7 @@ try {
 		cwd,
 		runId,
 		attemptId,
+		requiresDurableWorkerBinding: Boolean(input?.durableLaunchBarrier),
 	});
 	if (input?.durableLaunchBarrier) {
 		const executionPlan = {
