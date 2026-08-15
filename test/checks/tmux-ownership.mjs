@@ -281,6 +281,7 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 			"sandbox execution callback ownership failure",
 			{ terminalBlocked: true },
 		);
+		let sandboxAvailable = true;
 		try {
 			await withSandboxedArgv(
 				["/bin/echo", "sandbox-wrapper-check"],
@@ -291,12 +292,15 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 			);
 			assert.fail("sandbox execution callback must reject");
 		} catch (error) {
-			if (!(error instanceof SandboxUnavailableError)) {
+			if (error instanceof SandboxUnavailableError) {
+				sandboxAvailable = false;
+			} else {
 				assert.equal(error, executionError);
 				assert.equal(error.terminalBlocked, true);
 			}
 		}
 
+		if (sandboxAvailable) {
 		const sandboxPaneSideEffect = join(
 			paneGateCwd,
 			"sandbox-side-effect",
@@ -372,6 +376,7 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 					sandboxPaneResult.status,
 				),
 			);
+		}
 		}
 
 		const rejectedPaneSideEffect = join(
