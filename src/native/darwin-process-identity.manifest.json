@@ -1,12 +1,12 @@
 {
   "schema": "pi-subagent-darwin-process-identity-helper-v1",
   "sourceSha256": "cf7b06a3e353cd74af33be0df4d945fc82893deddf81eb559fe892d31c5f660f",
-  "binarySha256": "cb94a969126d166a458a7523872be957ef42c493d665b14a81ef5e34dd7fc00b",
+  "binarySha256": "59dcaed4ea8a7ed9c7bef997ed5eaae413c97b318af36f592a285b9b093fed54",
   "architectures": [
     "arm64",
     "x86_64"
   ],
   "minimumMacOS": "11.0",
-  "compilerVersion": "Apple clang version 21.0.0 (clang-2100.0.123.102)",
-  "sdkVersion": "26.4"
+  "compilerVersion": "Apple clang version 17.0.0 (clang-1700.0.13.5)",
+  "sdkVersion": "15.5"
 }
