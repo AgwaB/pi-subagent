@@ -1194,3 +1194,87 @@ export async function readRunEvents(
 	});
 	return cloneRunEvents(events, limit);
 }
+
+export async function appendTerminalEventsIfCurrent(
+	ref: RunRef,
+	options: {
+		attemptId: string;
+		status: Status;
+		attemptMessage: string;
+		runMessage: string;
+	},
+): Promise<{ current: boolean; appendedTypes: RunEventType[] }> {
+	if (!isTerminalStatus(options.status))
+		throw new Error("terminal event publication requires terminal status");
+	const paths = runPaths(ref);
+	await mkdir(paths.runDir, { recursive: true });
+	return await withFileLock(paths.lockPath, async () => {
+		const record = await readRecordPath(paths);
+		if (
+			record === null ||
+			record.activeAttemptId !== null ||
+			record.latestAttemptId !== options.attemptId ||
+			record.status !== options.status
+		)
+			return { current: false, appendedTypes: [] };
+
+		let existingEvents: RunEvent[] = [];
+		try {
+			const text = await readFile(paths.eventsPath, "utf8");
+			existingEvents = text
+				.split(/\r?\n/u)
+				.filter(Boolean)
+				.flatMap((line) => {
+					try {
+						return [JSON.parse(line) as RunEvent];
+					} catch {
+						return [];
+					}
+				});
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+		}
+
+		const terminalType =
+			options.status === "completed"
+				? "completed"
+				: options.status === "cancelled"
+					? "cancelled"
+					: "failed";
+		const attemptType = `attempt.${terminalType}` as RunEventType;
+		const runType = `run.${terminalType}` as RunEventType;
+		const timestamp = new Date().toISOString();
+		const appendedTypes: RunEventType[] = [];
+		if (
+			!existingEvents.some(
+				(event) =>
+					event.type === attemptType &&
+					event.attemptId === options.attemptId,
+			)
+		) {
+			await appendJsonLine(paths.eventsPath, {
+				schemaVersion: RUN_EVENT_SCHEMA_VERSION,
+				timestamp,
+				type: attemptType,
+				runId: ref.runId,
+				attemptId: options.attemptId,
+				status: options.status,
+				message: options.attemptMessage,
+			});
+			appendedTypes.push(attemptType);
+		}
+		if (!existingEvents.some((event) => event.type === runType)) {
+			await appendJsonLine(paths.eventsPath, {
+				schemaVersion: RUN_EVENT_SCHEMA_VERSION,
+				timestamp,
+				type: runType,
+				runId: ref.runId,
+				status: options.status,
+				message: options.runMessage,
+			});
+			appendedTypes.push(runType);
+		}
+		eventReadCache.delete(paths.eventsPath);
+		return { current: true, appendedTypes };
+	});
+}

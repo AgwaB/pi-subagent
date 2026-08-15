@@ -4,20 +4,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
 import {
+	assertDurableLaunchBarrierV2ExecutionAuthorized,
 	createDurableLaunchBarrier,
+	createDurableLaunchBarrierV2,
 	durableLaunchBarrierDigest,
 	DurableLaunchBarrierError,
+	DurableLaunchBarrierRevokedError,
 	getSubagentLogs,
 	getSubagentStatus,
 	interruptSubagent,
 	isDurableLaunchBarrierError,
+	isDurableLaunchBarrierRevokedError,
+	readDurableLaunchBarrierV2State,
 	reconcileSubagentRun,
 	recordSubagentChildEvent,
 	releaseDurableLaunchBarrier,
+	resolveDurableLaunchBarrierV2Release,
+	revokeDurableLaunchBarrierV2,
 	runSubagent,
 	SubagentValidationError,
 	waitForDurableLaunchBarrierAck,
 	waitForDurableLaunchBarrierReady,
+	waitForDurableLaunchBarrierV2Ack,
+	waitForDurableLaunchBarrierV2Ready,
 	waitForSubagent,
 } from "../../api.mjs";
 import { createAttemptArtifactStore } from "../../src/artifacts/index.ts";
@@ -42,6 +51,15 @@ assert.equal(barrierError.failureKind, "guard_failure");
 assert.equal(typeof releaseDurableLaunchBarrier, "function");
 assert.equal(typeof waitForDurableLaunchBarrierAck, "function");
 assert.equal(typeof waitForDurableLaunchBarrierReady, "function");
+assert.equal(typeof createDurableLaunchBarrierV2, "function");
+assert.equal(typeof resolveDurableLaunchBarrierV2Release, "function");
+assert.equal(typeof revokeDurableLaunchBarrierV2, "function");
+assert.equal(typeof waitForDurableLaunchBarrierV2Ready, "function");
+assert.equal(typeof waitForDurableLaunchBarrierV2Ack, "function");
+assert.equal(typeof readDurableLaunchBarrierV2State, "function");
+assert.equal(typeof assertDurableLaunchBarrierV2ExecutionAuthorized, "function");
+assert.equal(typeof DurableLaunchBarrierRevokedError, "function");
+assert.equal(typeof isDurableLaunchBarrierRevokedError, "function");
 
 let cwd;
 try {

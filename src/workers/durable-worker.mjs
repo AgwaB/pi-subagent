@@ -237,15 +237,28 @@ try {
 			executionPlanSha256,
 			executionCwd: preparedExecution.workspace.cwd,
 		});
-		const ack = await launchBarrier.awaitDurableLaunchBarrier({
-			descriptor: input.durableLaunchBarrier,
-			runId,
-			attemptId,
-			launchPayloadSha256,
-			executionPlanSha256,
-			workerProcessGroupId,
-			signal: executionAbort.signal,
-		});
+		const barrierV2 =
+			input.durableLaunchBarrier.schema ===
+			"pi-subagent-durable-launch-barrier-v2";
+		const ack = barrierV2
+			? await launchBarrier.awaitDurableLaunchBarrierV2({
+					descriptor: input.durableLaunchBarrier,
+					runId,
+					attemptId,
+					launchPayloadSha256,
+					executionPlanSha256,
+					workerProcessGroupId,
+					signal: executionAbort.signal,
+				})
+			: await launchBarrier.awaitDurableLaunchBarrier({
+					descriptor: input.durableLaunchBarrier,
+					runId,
+					attemptId,
+					launchPayloadSha256,
+					executionPlanSha256,
+					workerProcessGroupId,
+					signal: executionAbort.signal,
+				});
 		const binding = installDurableWorkerBinding({
 			payload,
 			launchPayloadSha256,
@@ -254,6 +267,26 @@ try {
 			preflight,
 		});
 		preparedExecution.durableWorkerBinding = JSON.stringify(binding);
+		if (barrierV2) {
+			if (executionAbort.signal.aborted) {
+				const cancelled = new Error(
+					"durable worker was cancelled after release acknowledgement",
+				);
+				cancelled.failureKind = "user_cancelled";
+				throw cancelled;
+			}
+			await launchBarrier.assertDurableLaunchBarrierV2ExecutionAuthorized(
+				input.durableLaunchBarrier,
+				ack,
+			);
+			if (executionAbort.signal.aborted) {
+				const cancelled = new Error(
+					"durable worker was cancelled before prepared execution",
+				);
+				cancelled.failureKind = "user_cancelled";
+				throw cancelled;
+			}
+		}
 	}
 	terminalResult = await orchestration.runPreparedSubagentExecution(preparedExecution, {
 		signal: executionAbort.signal,
@@ -267,7 +300,9 @@ try {
 	if (preparedExecution?.ownership?.state === "prepared")
 		await orchestration.discardSubagentExecution(preparedExecution).catch(() => undefined);
 	const message = error instanceof Error ? error.message : String(error);
-	const cancelled = executionAbort.signal.aborted;
+	const cancelled =
+		executionAbort.signal.aborted ||
+		launchBarrier.isDurableLaunchBarrierRevokedError?.(error) === true;
 	terminalResult = await writeTerminalResult({
 		status: cancelled ? "cancelled" : "failed",
 		failureKind: cancelled

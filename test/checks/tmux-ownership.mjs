@@ -486,9 +486,13 @@ writeFileSync(${JSON.stringify(rejectedPaneSideEffect)}, "started");
 			});
 			assert.equal(
 				independentCleanup.status,
-				"running",
+				"cleanup-blocked",
 				"unsafe process metadata must block terminal state",
 			);
+			assert.deepEqual(independentCleanup.cleanupBlocked, {
+				reason: "stale-attempt-ownership",
+				attemptIds: ["attempt_independent_tmux_cleanup"],
+			});
 			assert.equal(
 				await privateTmuxServerAlive(runtimeProof),
 				false,
@@ -806,7 +810,7 @@ exit 99
 		});
 		assert.equal(
 			reconciled.status,
-			"running",
+			"cleanup-blocked",
 			"released launch without runtime identity must fail closed",
 		);
 		await sleep(2_500);
@@ -882,7 +886,7 @@ exec ${JSON.stringify(realTmux)} "$@"
 		});
 		assert.equal(
 			launchingLossReconciled.status,
-			"running",
+			"cleanup-blocked",
 			"post-release launching with a missing socket and unknown runtime identity must fail closed",
 		);
 		for (const pid of [launchingPanePid, launchingServerPid]) {

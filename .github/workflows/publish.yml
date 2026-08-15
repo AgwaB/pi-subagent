@@ -9,15 +9,76 @@ on:
         type: string
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  darwin-helper-build:
+    permissions:
+      contents: read
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Record Darwin toolchain
+        run: |
+          uname -a
+          /usr/bin/clang --version
+          /usr/bin/xcrun --sdk macosx --show-sdk-version
+
+      - name: Build and verify universal Darwin process helper
+        run: |
+          node scripts/build-darwin-process-identity.mjs
+          node test/checks/darwin-process-identity-helper.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-process-identity
+          if-no-files-found: error
+          path: |
+            src/native/darwin-process-identity
+            src/native/darwin-process-identity.manifest.json
+
+  darwin-helper-intel:
+    permissions:
+      contents: read
+    needs: darwin-helper-build
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: darwin-process-identity
+          path: src/native
+
+      - name: Verify published helper on Intel
+        run: |
+          chmod 755 src/native/darwin-process-identity
+          node test/checks/darwin-process-identity-helper.mjs
+
   npm:
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    needs:
+      - darwin-helper-build
+      - darwin-helper-intel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -29,6 +90,16 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
+
+      - name: Verify release source is current main
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+
+      - name: Validate release version
+        run: node scripts/validate-release-version.mjs "$RELEASE_VERSION"
 
       - name: Show Node/npm versions
         run: |
@@ -43,24 +114,42 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: darwin-process-identity
+          path: src/native
+
+      - name: Install verified Darwin helper artifact
+        run: |
+          chmod 755 src/native/darwin-process-identity
+          node test/checks/darwin-process-identity-helper.mjs
+
       - name: Prepare release version
         id: prepare
         run: |
           set -euo pipefail
-          target="${{ inputs.version }}"
+          target="$RELEASE_VERSION"
           current="$(node -p "require('./package.json').version")"
           needs_push=false
 
-          if [ "$current" = "$target" ]; then
-            echo "package.json is already at $target; skipping npm version."
-            if ! git rev-parse -q --verify "refs/tags/v$target" >/dev/null 2>&1; then
-              git tag "v$target"
-            fi
-            if ! git ls-remote --exit-code --tags origin "refs/tags/v$target" >/dev/null 2>&1; then
-              needs_push=true
-            fi
+          git add \
+            src/native/darwin-process-identity \
+            src/native/darwin-process-identity.manifest.json
+          if [ "$current" != "$target" ]; then
+            npm version "$target" --no-git-tag-version --force
+            git add package.json package-lock.json
+          fi
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): $target"
+            needs_push=true
+          fi
+
+          if git rev-parse -q --verify "refs/tags/v$target" >/dev/null 2>&1; then
+            test "$(git rev-parse "refs/tags/v$target^{}")" = "$(git rev-parse HEAD)"
           else
-            npm version "$target" -m "chore(release): %s"
+            git tag "v$target"
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/v$target" >/dev/null 2>&1; then
             needs_push=true
           fi
 
@@ -71,7 +160,7 @@ jobs:
         run: |
           set -euo pipefail
           name="$(node -p "require('./package.json').name")"
-          version="${{ inputs.version }}"
+          version="$RELEASE_VERSION"
           if npm view "$name@$version" version >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "$name@$version already exists on npm; publish will be skipped."
@@ -90,22 +179,38 @@ jobs:
           npm run check:static
           npm pack --dry-run --json
 
+      - name: Push release commit and tag
+        if: steps.prepare.outputs.needs_push == 'true'
+        run: |
+          git push --atomic origin \
+            HEAD:main \
+            "refs/tags/v$RELEASE_VERSION"
+
+      - name: Verify remote release identity
+        run: |
+          set -euo pipefail
+          expected="$(git rev-parse HEAD)"
+          remote_main="$(
+            git ls-remote --exit-code --heads origin refs/heads/main |
+              cut -f1
+          )"
+          remote_tag="$(
+            git ls-remote --exit-code --tags origin "refs/tags/v$RELEASE_VERSION" |
+              cut -f1
+          )"
+          test "$remote_main" = "$expected"
+          test "$remote_tag" = "$expected"
+
       - name: Publish to npm
         if: steps.npm_version.outputs.exists != 'true'
         run: npm publish --access public
 
-      - name: Push release commit and tag
-        if: steps.prepare.outputs.needs_push == 'true'
-        run: |
-          git push origin HEAD:main
-          git push origin "refs/tags/v${{ inputs.version }}"
-
       - name: Create GitHub release
         run: |
-          if gh release view "v${{ inputs.version }}" >/dev/null 2>&1; then
-            echo "GitHub release v${{ inputs.version }} already exists."
+          if gh release view "v$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo "GitHub release v$RELEASE_VERSION already exists."
           else
-            gh release create "v${{ inputs.version }}" --target "$GITHUB_SHA" --title "v${{ inputs.version }}" --generate-notes
+            gh release create "v$RELEASE_VERSION" --verify-tag --title "v$RELEASE_VERSION" --generate-notes
           fi
         env:
           GH_TOKEN: ${{ github.token }}

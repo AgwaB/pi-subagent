@@ -22,6 +22,8 @@ import { isTerminalStatus } from "./status.ts";
 
 export interface ReconcileSubagentRunOptions extends RunRef {
 	staleAfterMs?: number;
+	/** Refuse every mutation unless this is still the selected attempt. */
+	expectedAttemptId?: string;
 }
 
 export interface ReconcileSubagentRunResult {
@@ -29,11 +31,46 @@ export interface ReconcileSubagentRunResult {
 		| "not-found"
 		| "already-terminal"
 		| "running"
+		| "superseded"
+		| "cleanup-blocked"
 		| "committed-result"
 		| "marked-stale"
 		| "marked-cancelled";
 	runId: string;
 	record: RunRecord | null;
+	superseded?: {
+		expectedAttemptId: string;
+		currentAttemptId: string | null;
+	};
+	cleanupBlocked?: {
+		reason:
+			| "terminal-record-active-attempt"
+			| "terminal-attempt-ownership"
+			| "missing-active-attempt"
+			| "inactive-attempt-ownership"
+			| "terminal-result-ownership"
+			| "stale-attempt-ownership";
+		attemptIds: string[];
+	};
+}
+
+function cleanupBlockedResult(
+	runId: string,
+	record: RunRecord,
+	reason: NonNullable<
+		ReconcileSubagentRunResult["cleanupBlocked"]
+	>["reason"],
+	attemptIds: readonly string[],
+): ReconcileSubagentRunResult {
+	return {
+		status: "cleanup-blocked",
+		runId,
+		record,
+		cleanupBlocked: {
+			reason,
+			attemptIds: [...new Set(attemptIds)],
+		},
+	};
 }
 
 export async function cleanupInactiveAttemptOwnership(
@@ -304,12 +341,15 @@ async function terminateAttemptOwnership(
 }
 
 function activeAttempt(record: RunRecord): RunAttemptRecord | undefined {
-	const activeId =
-		record.activeAttemptId ?? record.latestAttemptId ?? undefined;
-	return activeId === undefined
-		? record.attempts.at(-1)
-		: (record.attempts.find((attempt) => attempt.attemptId === activeId) ??
-				record.attempts.at(-1));
+	if (record.activeAttemptId !== null)
+		return record.attempts.find(
+			(attempt) => attempt.attemptId === record.activeAttemptId,
+		);
+	if (record.latestAttemptId !== null)
+		return record.attempts.find(
+			(attempt) => attempt.attemptId === record.latestAttemptId,
+		);
+	return record.attempts.at(-1);
 }
 
 export async function reconcileSubagentRun(
@@ -320,29 +360,87 @@ export async function reconcileSubagentRun(
 	const record = await readRunRecord(ref);
 	if (record === null)
 		return { status: "not-found", runId: options.runId, record: null };
+	if (options.expectedAttemptId !== undefined) {
+		const currentAttemptId =
+			record.activeAttemptId ?? record.latestAttemptId;
+		if (currentAttemptId !== options.expectedAttemptId)
+			return {
+				status: "superseded",
+				runId: options.runId,
+				record,
+				superseded: {
+					expectedAttemptId: options.expectedAttemptId,
+					currentAttemptId,
+				},
+			};
+	}
 	if (isTerminalStatus(record.status)) {
-		if (record.activeAttemptId !== null)
-			return { status: "running", runId: options.runId, record };
+		if (record.activeAttemptId !== null) {
+			const inconsistentActiveAttempt = record.attempts.find(
+				(attempt) => attempt.attemptId === record.activeAttemptId,
+			);
+			const ownerPid =
+				inconsistentActiveAttempt?.process?.workerPid ??
+				inconsistentActiveAttempt?.process?.pid;
+			if (
+				inconsistentActiveAttempt !== undefined &&
+				((await ownerProcessAlive(inconsistentActiveAttempt)) ||
+					(ownerPid === undefined &&
+						heartbeatFresh(inconsistentActiveAttempt, staleAfterMs)))
+			)
+				return { status: "running", runId: options.runId, record };
+			return cleanupBlockedResult(
+				options.runId,
+				record,
+				"terminal-record-active-attempt",
+				[record.activeAttemptId],
+			);
+		}
 		let terminalSafe = true;
+		const blockedAttemptIds: string[] = [];
 		for (const terminalAttempt of record.attempts)
-			terminalSafe =
-				(await terminateAttemptOwnership(terminalAttempt)) && terminalSafe;
+			if (!(await terminateAttemptOwnership(terminalAttempt))) {
+				terminalSafe = false;
+				blockedAttemptIds.push(terminalAttempt.attemptId);
+			}
 		if (!terminalSafe)
-			return { status: "running", runId: options.runId, record };
+			return cleanupBlockedResult(
+				options.runId,
+				record,
+				"terminal-attempt-ownership",
+				blockedAttemptIds,
+			);
 		return { status: "already-terminal", runId: options.runId, record };
 	}
 
 	const attempt = activeAttempt(record);
 	if (attempt === undefined)
-		return { status: "running", runId: options.runId, record };
+		return cleanupBlockedResult(
+			options.runId,
+			record,
+			"missing-active-attempt",
+			record.activeAttemptId !== null
+				? [record.activeAttemptId]
+				: record.latestAttemptId !== null
+					? [record.latestAttemptId]
+					: [],
+		);
 	let inactiveSafe = true;
+	const blockedInactiveAttemptIds: string[] = [];
 	for (const inactiveAttempt of record.attempts) {
 		if (inactiveAttempt.attemptId === attempt.attemptId) continue;
-		inactiveSafe =
-			(await terminateAttemptOwnership(inactiveAttempt)) && inactiveSafe;
+		if (!(await terminateAttemptOwnership(inactiveAttempt))) {
+			inactiveSafe = false;
+			blockedInactiveAttemptIds.push(inactiveAttempt.attemptId);
+		}
 	}
 	if (!inactiveSafe)
-		return { status: "running", runId: options.runId, record };
+		return cleanupBlockedResult(
+			options.runId,
+			record,
+			"inactive-attempt-ownership",
+			blockedInactiveAttemptIds,
+		);
 
 	const result = await readAttemptResult(attempt, options.runId);
 	if (
@@ -353,7 +451,12 @@ export async function reconcileSubagentRun(
 		if (await ownerProcessAlive(attempt))
 			return { status: "running", runId: options.runId, record };
 		if (!(await terminateAttemptOwnership(attempt, result.tmux)))
-			return { status: "running", runId: options.runId, record };
+			return cleanupBlockedResult(
+				options.runId,
+				record,
+				"terminal-result-ownership",
+				[attempt.attemptId],
+			);
 		const committed = await commitAttemptResultIfActive(ref, result);
 		await appendRunEvent(ref, {
 			type: "reconcile.completed",
@@ -378,7 +481,12 @@ export async function reconcileSubagentRun(
 		return { status: "running", runId: options.runId, record };
 
 	if (!(await terminateAttemptOwnership(attempt)))
-		return { status: "running", runId: options.runId, record };
+		return cleanupBlockedResult(
+			options.runId,
+			record,
+			"stale-attempt-ownership",
+			[attempt.attemptId],
+		);
 
 	const interrupted = record.interrupt !== undefined;
 	const cleanupStatus =

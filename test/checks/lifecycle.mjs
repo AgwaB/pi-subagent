@@ -225,6 +225,7 @@ try {
 					status: "running",
 					backend: "headless",
 					startedAt: new Date().toISOString(),
+					artifactCwd: cwd,
 					resultPath: finalizerResult.artifacts.find(
 						(artifact) => artifact.type === "result",
 					)?.path,
@@ -272,6 +273,104 @@ try {
 			1,
 		);
 	}
+	const delayedFinalizerRunId = "run_delayed_finalizer_successor";
+	await beginRunRecord({
+		cwd,
+		runId: delayedFinalizerRunId,
+		mode: "single",
+		backend: "headless",
+		attempts: [
+			{
+				attemptId: "attempt_successor",
+				status: "completed",
+				backend: "headless",
+				startedAt: new Date().toISOString(),
+				completedAt: new Date().toISOString(),
+			},
+		],
+	});
+	const delayedFinalizerPayload = Buffer.from(
+		JSON.stringify({
+			ref: { cwd, runId: delayedFinalizerRunId },
+			attemptId: "attempt_stale_finalizer",
+			status: "failed",
+			worker: finalizerWorkerIdentity,
+		}),
+	).toString("base64url");
+	const delayedFinalizer = spawn(
+		process.execPath,
+		[finalizerPath, delayedFinalizerPayload],
+		{ cwd, stdio: "ignore" },
+	);
+	assert.equal(
+		await new Promise((resolveExit) =>
+			delayedFinalizer.once("exit", resolveExit),
+		),
+		0,
+	);
+	const delayedFinalizerEvents = await readRunEvents({
+		cwd,
+		runId: delayedFinalizerRunId,
+	});
+	assert.equal(
+		delayedFinalizerEvents.some(
+			(event) => event.attemptId === "attempt_stale_finalizer",
+		),
+		false,
+		"a delayed finalizer must not publish against a terminal successor",
+	);
+	assert.equal(
+		delayedFinalizerEvents.some((event) => event.type === "run.failed"),
+		false,
+	);
+	const readyStopRaceRunId = "run_stale_finalizer_active_successor";
+	await beginRunRecord({
+		cwd,
+		runId: readyStopRaceRunId,
+		mode: "single",
+		backend: "headless",
+		activeAttemptId: "attempt_active_successor",
+		attempts: [
+			{
+				attemptId: "attempt_active_successor",
+				status: "running",
+				backend: "headless",
+				startedAt: new Date().toISOString(),
+			},
+		],
+	});
+	const staleActivePayload = Buffer.from(
+		JSON.stringify({
+			ref: { cwd, runId: readyStopRaceRunId },
+			attemptId: "attempt_stale_finalizer",
+			status: "failed",
+			worker: finalizerWorkerIdentity,
+		}),
+	).toString("base64url");
+	const staleActiveFinalizer = spawn(
+		process.execPath,
+		[finalizerPath, staleActivePayload],
+		{ cwd, stdio: "ignore" },
+	);
+	assert.equal(
+		await new Promise((resolveExit) =>
+			staleActiveFinalizer.once("exit", resolveExit),
+		),
+		0,
+	);
+	const afterStaleActiveFinalizer = await readRunRecord({
+		cwd,
+		runId: readyStopRaceRunId,
+	});
+	assert.equal(afterStaleActiveFinalizer?.status, "running");
+	assert.equal(
+		afterStaleActiveFinalizer?.activeAttemptId,
+		"attempt_active_successor",
+	);
+	assert.equal(
+		afterStaleActiveFinalizer?.attempts[0]?.failureKind ?? null,
+		null,
+	);
 
 	const eventsRun = "run_lifecycle_events";
 	const eventsAttempt = "attempt_lifecycle_events";

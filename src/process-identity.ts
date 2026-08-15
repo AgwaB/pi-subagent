@@ -1,9 +1,13 @@
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
-const PS_TIMEOUT_MS = 2_000;
+const PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
+const DARWIN_PROCESS_IDENTITY_HELPER = fileURLToPath(
+	new URL("./native/darwin-process-identity", import.meta.url),
+);
 
 export interface ProcessIdentity {
 	pid: number;
@@ -48,12 +52,6 @@ export function inspectProcessGroup(
 	}
 }
 
-function psPath(): string | undefined {
-	if (process.platform === "darwin" || process.platform === "linux")
-		return "/bin/ps";
-	return undefined;
-}
-
 async function inspectLinuxProcessIdentity(
 	pid: number,
 ): Promise<ProcessIdentityStatus> {
@@ -94,73 +92,57 @@ async function inspectLinuxProcessIdentity(
 	}
 }
 
-async function inspectPsProcessIdentity(
+async function inspectDarwinProcessIdentity(
 	pid: number,
-	executable: string,
 ): Promise<ProcessIdentityStatus> {
 	try {
 		const { stdout } = await execFileAsync(
-			executable,
-			[
-				"-o",
-				"pid=",
-				"-o",
-				"pgid=",
-				"-o",
-				"state=",
-				"-o",
-				"lstart=",
-				"-p",
-				String(pid),
-			],
+			DARWIN_PROCESS_IDENTITY_HELPER,
+			[String(pid)],
 			{
-				timeout: PS_TIMEOUT_MS,
+				timeout: PROCESS_IDENTITY_TIMEOUT_MS,
 				maxBuffer: 64 * 1024,
 				env: {
-					...process.env,
+					PATH: "/usr/bin:/bin",
 					LC_ALL: "C",
-					LANG: "C",
-					TZ: "UTC",
 				},
 			},
 		);
-		const line = stdout.trim();
-		if (line.length === 0) return { state: "dead" };
-		const match =
-			/^(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})$/u.exec(
-				line,
-			);
-		if (match === null || Number(match[1]) !== pid)
-			return { state: "unknown", reason: "process identity output is invalid" };
-		const processGroupId = Number(match[2]);
-		if (match[3]!.includes("Z")) return { state: "dead" };
-		if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0)
+		const parsed = JSON.parse(stdout) as Partial<{
+			pid: unknown;
+			processGroupId: unknown;
+			startSeconds: unknown;
+			startMicroseconds: unknown;
+		}>;
+		const processGroupId = Number(parsed.processGroupId);
+		const startSeconds = String(parsed.startSeconds ?? "");
+		const startMicroseconds = String(parsed.startMicroseconds ?? "");
+		if (
+			parsed.pid !== pid ||
+			!Number.isSafeInteger(processGroupId) ||
+			processGroupId <= 0 ||
+			!/^\d+$/u.test(startSeconds) ||
+			!/^\d+$/u.test(startMicroseconds) ||
+			Number(startMicroseconds) >= 1_000_000
+		)
 			return {
 				state: "unknown",
-				reason: "process group identity output is invalid",
+				reason: "Darwin process identity output is invalid",
 			};
 		return {
 			state: "alive",
 			identity: {
 				pid,
 				processGroupId,
-				birthIdentity: `ps:${match[4]!.replace(/\s+/gu, " ").trim()}`,
+				birthIdentity: `darwin:${startSeconds}:${startMicroseconds.padStart(6, "0")}`,
 			},
 		};
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException)?.code;
-		const stdout =
-			typeof (error as { stdout?: unknown })?.stdout === "string"
-				? (error as { stdout: string }).stdout
-				: "";
-		if (
-			code === "ESRCH" ||
-			(String(code) === "1" && stdout.trim().length === 0)
-		)
-			return { state: "dead" };
+		if (String(code) === "3") return { state: "dead" };
 		return {
 			state: "unknown",
-			reason: `process identity inspection failed: ${error instanceof Error ? error.message : String(error)}`,
+			reason: `Darwin process identity inspection failed: ${error instanceof Error ? error.message : String(error)}`,
 		};
 	}
 }
@@ -172,13 +154,12 @@ export async function inspectProcessIdentity(
 		return { state: "unknown", reason: "process pid is invalid" };
 	if (process.platform === "linux")
 		return await inspectLinuxProcessIdentity(pid);
-	const executable = psPath();
-	if (executable === undefined)
-		return {
-			state: "unknown",
-			reason: `process identity is unsupported on ${process.platform}`,
-		};
-	return await inspectPsProcessIdentity(pid, executable);
+	if (process.platform === "darwin")
+		return await inspectDarwinProcessIdentity(pid);
+	return {
+		state: "unknown",
+		reason: `process identity is unsupported on ${process.platform}`,
+	};
 }
 
 export async function captureProcessIdentity(

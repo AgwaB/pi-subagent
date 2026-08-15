@@ -14,11 +14,18 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	assertDurableLaunchBarrierV2ExecutionAuthorized,
 	createDurableLaunchBarrier,
+	createDurableLaunchBarrierV2,
 	durableLaunchBarrierDigest,
+	readDurableLaunchBarrierV2State,
 	releaseDurableLaunchBarrier,
+	resolveDurableLaunchBarrierV2Release,
+	revokeDurableLaunchBarrierV2,
 	waitForDurableLaunchBarrierAck,
 	waitForDurableLaunchBarrierReady,
+	waitForDurableLaunchBarrierV2Ack,
+	waitForDurableLaunchBarrierV2Ready,
 } from "../../src/durable-launch-barrier.ts";
 import { validateResolveInput } from "../../src/core/validation.ts";
 
@@ -304,6 +311,219 @@ try {
 		waitForDurableLaunchBarrierAck(ackReplacement, copiedRelease),
 		/directory was replaced/u,
 	);
+
+	const descriptorV2 = await createDurableLaunchBarrierV2({
+		directory: join(root, "barrier-v2-release"),
+		subjectSha256: "1".repeat(64),
+		authorityBindingSha256: "2".repeat(64),
+		timeoutMs: 15_000,
+		pollIntervalMs: 5,
+	});
+	assert.equal(
+		validateResolveInput({
+			backend: "headless",
+			task: "fixture-v2",
+			async: true,
+			durableLaunchBarrier: descriptorV2,
+		}).ok,
+		true,
+	);
+	const descriptorV2Path = join(root, "descriptor-v2.json");
+	const markerV2Path = join(root, "released-v2.txt");
+	await writeFile(
+		descriptorV2Path,
+		`${JSON.stringify(descriptorV2)}\n`,
+		"utf8",
+	);
+	const childV2 = spawn(
+		process.execPath,
+		[
+			join(import.meta.dirname, "../fixtures/durable-launch-barrier-worker.mjs"),
+			descriptorV2Path,
+			markerV2Path,
+			"run-v2-release",
+			"attempt-v2-release",
+			"3".repeat(64),
+		],
+		{ stdio: ["ignore", "pipe", "pipe"] },
+	);
+	const childV2Output = [];
+	childV2.stdout.on("data", (chunk) => childV2Output.push(chunk));
+	childV2.stderr.on("data", (chunk) => childV2Output.push(chunk));
+	const childV2Exit = new Promise((resolveExit) => {
+		childV2.once("exit", (code, signal) => resolveExit({ code, signal }));
+	});
+	const readyV2 = await waitForDurableLaunchBarrierV2Ready(descriptorV2);
+	assert.equal(readyV2.runId, "run-v2-release");
+	assert.equal(readyV2.executionPlanSha256, "e".repeat(64));
+	const releasedV2 = await resolveDurableLaunchBarrierV2Release(
+		descriptorV2,
+		readyV2,
+		"4".repeat(64),
+	);
+	assert.equal(releasedV2.outcome, "released");
+	assert.equal(releasedV2.decision.kind, "released");
+	const ackV2 = await waitForDurableLaunchBarrierV2Ack(
+		descriptorV2,
+		releasedV2.decision,
+	);
+	assert.equal(ackV2.decisionSha256, releasedV2.decision.decisionSha256);
+	assert.equal(
+		(await assertDurableLaunchBarrierV2ExecutionAuthorized(
+			descriptorV2,
+			ackV2,
+		)).decisionSha256,
+		releasedV2.decision.decisionSha256,
+	);
+	assert.deepEqual(
+		await childV2Exit,
+		{ code: 0, signal: null },
+		Buffer.concat(childV2Output).toString(),
+	);
+	assert.equal(await readFile(markerV2Path, "utf8"), "released\n");
+	const revokeAfterRelease = await revokeDurableLaunchBarrierV2(descriptorV2, {
+		cancellationId: "cancel-after-release",
+		reasonSha256: "5".repeat(64),
+	});
+	assert.equal(revokeAfterRelease.outcome, "released");
+	assert.equal(
+		(await readDurableLaunchBarrierV2State(descriptorV2)).decision
+			?.decisionSha256,
+		releasedV2.decision.decisionSha256,
+	);
+
+	const revokedV2 = await createDurableLaunchBarrierV2({
+		directory: join(root, "barrier-v2-revoke"),
+		subjectSha256: "6".repeat(64),
+		timeoutMs: 15_000,
+		pollIntervalMs: 5,
+	});
+	const revokedV2Path = join(root, "descriptor-v2-revoke.json");
+	const revokedMarkerPath = join(root, "revoked-v2-marker.txt");
+	await writeFile(revokedV2Path, `${JSON.stringify(revokedV2)}\n`, "utf8");
+	const revokedChild = spawn(
+		process.execPath,
+		[
+			join(import.meta.dirname, "../fixtures/durable-launch-barrier-worker.mjs"),
+			revokedV2Path,
+			revokedMarkerPath,
+			"run-v2-revoke",
+			"attempt-v2-revoke",
+			"7".repeat(64),
+		],
+		{ stdio: ["ignore", "pipe", "pipe"] },
+	);
+	const revokedExit = new Promise((resolveExit) => {
+		revokedChild.once("exit", (code, signal) => resolveExit({ code, signal }));
+	});
+	const revokedReady = await waitForDurableLaunchBarrierV2Ready(revokedV2);
+	const revokeWinner = await revokeDurableLaunchBarrierV2(revokedV2, {
+		cancellationId: "cancel-before-release",
+		reasonSha256: "8".repeat(64),
+	});
+	assert.equal(revokeWinner.outcome, "revoked");
+	const releaseAfterRevoke = await resolveDurableLaunchBarrierV2Release(
+		revokedV2,
+		revokedReady,
+		"9".repeat(64),
+	);
+	assert.equal(releaseAfterRevoke.outcome, "revoked");
+	const revokedChildExit = await revokedExit;
+	assert.notEqual(revokedChildExit.code, 0);
+	await assert.rejects(access(revokedMarkerPath));
+	const revokedState = await readDurableLaunchBarrierV2State(revokedV2);
+	assert.equal(revokedState.decision?.kind, "revoked");
+	assert.equal(revokedState.ack, undefined);
+
+	for (const [winner, finalLinked] of [
+		["released", true],
+		["revoked", true],
+		["released", false],
+		["revoked", false],
+	]) {
+		const crashV2 = await createDurableLaunchBarrierV2({
+			directory: join(root, `barrier-v2-crash-${winner}-${finalLinked}`),
+			subjectSha256: "a".repeat(64),
+			timeoutMs: 500,
+			pollIntervalMs: 5,
+		});
+		const readyBody = {
+			schema: "pi-subagent-durable-launch-barrier-ready-v2",
+			barrierIdentitySha256: crashV2.identitySha256,
+			challenge: crashV2.challenge,
+			decisionNonce: crashV2.decisionNonce,
+			subjectSha256: crashV2.subjectSha256,
+			runId: `run-crash-${winner}-${finalLinked}`,
+			attemptId: `attempt-crash-${winner}-${finalLinked}`,
+			workerPid: process.pid,
+			launchPayloadSha256: "b".repeat(64),
+			executionPlanSha256: "c".repeat(64),
+		};
+		const crashReady = {
+			...readyBody,
+			readySha256: durableLaunchBarrierDigest(readyBody),
+		};
+		await writeFile(
+			crashV2.readyPath,
+			`${JSON.stringify(canonical(crashReady))}\n`,
+			{ mode: 0o600 },
+		);
+		const decisionBody =
+			winner === "released"
+				? {
+						schema: "pi-subagent-durable-launch-barrier-decision-v2",
+						kind: "released",
+						barrierIdentitySha256: crashV2.identitySha256,
+						challenge: crashV2.challenge,
+						decisionNonce: crashV2.decisionNonce,
+						subjectSha256: crashV2.subjectSha256,
+						runId: crashReady.runId,
+						attemptId: crashReady.attemptId,
+						readySha256: crashReady.readySha256,
+						releasePayloadSha256: "d".repeat(64),
+					}
+				: {
+						schema: "pi-subagent-durable-launch-barrier-decision-v2",
+						kind: "revoked",
+						barrierIdentitySha256: crashV2.identitySha256,
+						challenge: crashV2.challenge,
+						decisionNonce: crashV2.decisionNonce,
+						subjectSha256: crashV2.subjectSha256,
+						cancellationId: "crashed-revocation",
+						reasonSha256: "e".repeat(64),
+					};
+		const crashDecision = {
+			...decisionBody,
+			decisionSha256: durableLaunchBarrierDigest(decisionBody),
+		};
+		const transactionPath = `${crashV2.decisionPath}.txn`;
+		await writeFile(
+			transactionPath,
+			`${JSON.stringify(canonical(crashDecision))}\n`,
+			{ mode: 0o600 },
+		);
+		if (finalLinked) await link(transactionPath, crashV2.decisionPath);
+		await writeFile(`${crashV2.decisionPath}.pending`, "pending\n", {
+			mode: 0o600,
+		});
+		const recoveredWinner =
+			winner === "released"
+				? await revokeDurableLaunchBarrierV2(crashV2, {
+						cancellationId: "opposite-revocation",
+						reasonSha256: "f".repeat(64),
+					})
+				: await resolveDurableLaunchBarrierV2Release(
+						crashV2,
+						crashReady,
+						"0".repeat(64),
+					);
+		assert.equal(recoveredWinner.outcome, winner);
+		assert.equal(
+			recoveredWinner.decision.decisionSha256,
+			crashDecision.decisionSha256,
+		);
+		await assert.rejects(access(`${crashV2.decisionPath}.pending`));
+	}
 } finally {
 	await rm(root, { recursive: true, force: true });
 }

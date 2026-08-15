@@ -14,11 +14,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { createJiti } from "jiti";
 import {
 	beginRunRecord,
 	createAttemptArtifactStore,
 	readRunRecord,
 	recordInterruptRequest,
+	runPaths,
 	updateAttemptWorkerProcess,
 } from "../../src/artifacts/index.ts";
 import { reconcileSubagentRun } from "../../src/orchestrate/reconcile.ts";
@@ -74,23 +76,26 @@ async function createRunningAttempt(cwd, runId, attemptId, options = {}) {
 	const store = await createAttemptArtifactStore({ cwd, runId, attemptId });
 	const startedAt =
 		options.startedAt ?? new Date(Date.now() - 60_000).toISOString();
-	const result = await store.writeResult({
-		backend: options.backend ?? "inline",
-		status: "running",
-		failureKind: null,
-		cwd,
-		startedAt,
-		completedAt: null,
-		workspace: { mode: "shared", cwd, worktreePath: null },
-		sandbox: { enabled: false },
-		exitCode: null,
-		signal: null,
-		artifacts: [],
-		metadata: { contextLengthExceeded: false },
-	});
-	const resultPath = result.artifacts.find(
-		(artifact) => artifact.type === "result",
-	)?.path;
+	let resultPath = options.resultPath;
+	if (resultPath === undefined) {
+		const result = await store.writeResult({
+			backend: options.backend ?? "inline",
+			status: "running",
+			failureKind: null,
+			cwd,
+			startedAt,
+			completedAt: null,
+			workspace: { mode: "shared", cwd, worktreePath: null },
+			sandbox: { enabled: false },
+			exitCode: null,
+			signal: null,
+			artifacts: [],
+			metadata: { contextLengthExceeded: false },
+		});
+		resultPath = result.artifacts.find(
+			(artifact) => artifact.type === "result",
+		)?.path;
+	}
 	await beginRunRecord({
 		cwd,
 		runId,
@@ -113,7 +118,6 @@ async function createRunningAttempt(cwd, runId, attemptId, options = {}) {
 			},
 		],
 	});
-	return result;
 }
 
 try {
@@ -484,6 +488,188 @@ try {
 		"foreign result identity must not drive terminal reconciliation",
 	);
 
+	const danglingCwd = join(tempRoot, "dangling-active");
+	await beginRunRecord({
+		cwd: danglingCwd,
+		runId: "run_reconcile_dangling_active",
+		mode: "single",
+		backend: "headless",
+		activeAttemptId: "attempt_present",
+		attempts: [
+			{
+				attemptId: "attempt_present",
+				status: "running",
+				backend: "headless",
+				startedAt: new Date().toISOString(),
+			},
+		],
+	});
+	const danglingRef = {
+		cwd: danglingCwd,
+		runId: "run_reconcile_dangling_active",
+	};
+	const danglingRecord = await readRunRecord(danglingRef);
+	assert.ok(danglingRecord);
+	await writeFile(
+		runPaths(danglingRef).runJsonPath,
+		`${JSON.stringify({ ...danglingRecord, activeAttemptId: "attempt_missing" })}\n`,
+	);
+	const danglingReconcile = await reconcileSubagentRun({
+		...danglingRef,
+		staleAfterMs: 1,
+	});
+	assert.deepEqual(danglingReconcile.cleanupBlocked, {
+		reason: "missing-active-attempt",
+		attemptIds: ["attempt_missing"],
+	});
+
+	const terminalActiveCwd = join(tempRoot, "terminal-active-unsafe");
+	await beginRunRecord({
+		cwd: terminalActiveCwd,
+		runId: "run_terminal_active_unsafe",
+		mode: "single",
+		backend: "headless",
+		activeAttemptId: "attempt_terminal_active",
+		attempts: [
+			{
+				attemptId: "attempt_terminal_active",
+				status: "running",
+				backend: "headless",
+				startedAt: new Date().toISOString(),
+				heartbeatAt: new Date().toISOString(),
+				process: { pid: process.pid },
+			},
+		],
+	});
+	const terminalActiveRef = {
+		cwd: terminalActiveCwd,
+		runId: "run_terminal_active_unsafe",
+	};
+	const terminalActiveRecord = await readRunRecord(terminalActiveRef);
+	assert.ok(terminalActiveRecord);
+	await writeFile(
+		runPaths(terminalActiveRef).runJsonPath,
+		`${JSON.stringify({ ...terminalActiveRecord, status: "completed" })}\n`,
+	);
+	const terminalActiveReconcile = await reconcileSubagentRun({
+		...terminalActiveRef,
+		staleAfterMs: 30_000,
+	});
+	assert.deepEqual(terminalActiveReconcile.cleanupBlocked, {
+		reason: "terminal-record-active-attempt",
+		attemptIds: ["attempt_terminal_active"],
+	});
+
+	const terminalOwnershipCwd = join(tempRoot, "terminal-ownership-unsafe");
+	await beginRunRecord({
+		cwd: terminalOwnershipCwd,
+		runId: "run_terminal_ownership_unsafe",
+		mode: "single",
+		backend: "headless",
+		attempts: [
+			{
+				attemptId: "attempt_terminal_ownership",
+				status: "completed",
+				backend: "headless",
+				startedAt: new Date().toISOString(),
+				completedAt: new Date().toISOString(),
+				process: { pid: process.pid },
+			},
+		],
+	});
+	const terminalOwnershipReconcile = await reconcileSubagentRun({
+		cwd: terminalOwnershipCwd,
+		runId: "run_terminal_ownership_unsafe",
+		staleAfterMs: 1,
+	});
+	assert.deepEqual(terminalOwnershipReconcile.cleanupBlocked, {
+		reason: "terminal-attempt-ownership",
+		attemptIds: ["attempt_terminal_ownership"],
+	});
+
+	const inactiveOwnershipCwd = join(tempRoot, "inactive-ownership-unsafe");
+	await beginRunRecord({
+		cwd: inactiveOwnershipCwd,
+		runId: "run_inactive_ownership_unsafe",
+		mode: "single",
+		backend: "headless",
+		activeAttemptId: "attempt_active_safe",
+		attempts: [
+			{
+				attemptId: "attempt_inactive_unsafe",
+				status: "running",
+				backend: "headless",
+				startedAt: new Date(Date.now() - 1_000).toISOString(),
+				process: { pid: process.pid },
+			},
+			{
+				attemptId: "attempt_active_safe",
+				status: "running",
+				backend: "headless",
+				startedAt: new Date().toISOString(),
+				process: {
+					pid: liveIdentity.pid,
+					processGroupId: liveIdentity.processGroupId,
+					processBirthIdentity: liveIdentity.birthIdentity,
+				},
+			},
+		],
+	});
+	const inactiveOwnershipReconcile = await reconcileSubagentRun({
+		cwd: inactiveOwnershipCwd,
+		runId: "run_inactive_ownership_unsafe",
+		staleAfterMs: 1,
+	});
+	assert.deepEqual(inactiveOwnershipReconcile.cleanupBlocked, {
+		reason: "inactive-attempt-ownership",
+		attemptIds: ["attempt_inactive_unsafe"],
+	});
+
+	const terminalResultCwd = join(tempRoot, "terminal-result-unsafe");
+	const terminalResultStore = await createAttemptArtifactStore({
+		cwd: terminalResultCwd,
+		runId: "run_terminal_result_unsafe",
+		attemptId: "attempt_terminal_result_unsafe",
+	});
+	const terminalResultEnvelope = await terminalResultStore.writeResult({
+		backend: "headless",
+		status: "completed",
+		failureKind: null,
+		cwd: terminalResultCwd,
+		startedAt: new Date().toISOString(),
+		completedAt: new Date().toISOString(),
+		workspace: {
+			mode: "shared",
+			cwd: terminalResultCwd,
+			worktreePath: null,
+		},
+		sandbox: { enabled: false },
+		exitCode: 0,
+		signal: null,
+		artifacts: [],
+		metadata: { contextLengthExceeded: false },
+	});
+	await createRunningAttempt(
+		terminalResultCwd,
+		"run_terminal_result_unsafe",
+		"attempt_terminal_result_unsafe",
+		{
+			process: { pid: process.pid },
+			resultPath: terminalResultEnvelope.artifacts.find(
+				(artifact) => artifact.type === "result",
+			)?.path,
+		},
+	);
+	const terminalResultReconcile = await reconcileSubagentRun({
+		cwd: terminalResultCwd,
+		runId: "run_terminal_result_unsafe",
+		staleAfterMs: 1,
+	});
+	assert.deepEqual(terminalResultReconcile.cleanupBlocked, {
+		reason: "terminal-result-ownership",
+		attemptIds: ["attempt_terminal_result_unsafe"],
+	});
+
 	const heartbeatCwd = join(tempRoot, "fresh-heartbeat");
 	await createRunningAttempt(
 		heartbeatCwd,
@@ -537,11 +723,45 @@ try {
 	});
 	assert.equal(
 		unrelatedReconcile.status,
-		"running",
+		"cleanup-blocked",
 		"ownership mismatch must block terminal reconciliation",
 	);
+	assert.deepEqual(unrelatedReconcile.cleanupBlocked, {
+		reason: "stale-attempt-ownership",
+		attemptIds: ["attempt_unrelated"],
+	});
+	let registeredTool;
+	const jiti = createJiti(import.meta.url, {
+		interopDefault: true,
+		moduleCache: false,
+	});
+	const registerModule = await jiti.import(resolve("src/index.ts"));
+	const registerSubagentEngine =
+		registerModule.default ?? registerModule;
+	registerSubagentEngine({
+		registerCommand() {},
+		registerTool(tool) {
+			registeredTool = tool;
+		},
+	});
+	assert.ok(registeredTool);
+	const cleanupBlockedToolResult = await registeredTool.execute(
+		"reconcile-cleanup-blocked",
+		{ action: "reconcile", runId: "run_reconcile_unrelated" },
+		new AbortController().signal,
+		() => undefined,
+		{ cwd: unrelatedCwd },
+	);
+	assert.equal(cleanupBlockedToolResult.isError, true);
+	assert.deepEqual(
+		cleanupBlockedToolResult.details?.reconciled?.cleanupBlocked,
+		{
+		reason: "stale-attempt-ownership",
+		attemptIds: ["attempt_unrelated"],
+		},
+	);
 	assert.equal(
-		pidAlive(unrelatedIdentity.pid),
+		pidAlive(unrelatedProcess.pid),
 		true,
 		"ownership mismatch must not signal an unrelated process",
 	);
@@ -597,7 +817,7 @@ try {
 	});
 	assert.equal(
 		partialCleanupReconcile.status,
-		"running",
+		"cleanup-blocked",
 		"an unverified identity must continue to block terminal reconciliation",
 	);
 	assert.equal(
@@ -659,7 +879,7 @@ try {
 	});
 	assert.equal(
 		incompleteCleanupReconcile.status,
-		"running",
+		"cleanup-blocked",
 		"incomplete identity must block terminal reconciliation",
 	);
 	assert.equal(
@@ -772,7 +992,7 @@ try {
 	});
 	assert.equal(
 		deadLeaderReconcile.status,
-		"running",
+		"cleanup-blocked",
 		"a dead leader with a non-drained owned group must block terminal state",
 	);
 	assert.equal(pidAlive(deadLeaderChildPid), true);

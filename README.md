@@ -18,7 +18,7 @@ pi install npm:@agwab/pi-subagent
 
 Then reload Pi.
 
-Requires Node.js `>=22.19.0` on macOS or Linux. Native Windows is not supported (POSIX process groups, tmux, and `which`-based Pi discovery); use WSL2.
+Requires Node.js `>=22.19.0` on macOS or Linux. The package includes a source-auditable universal macOS helper for kernel process birth identity; users do not need a compiler. The published helper is rebuilt from the included C source and executed on both arm64 and Intel macOS runners before npm publish. Native Windows is not supported (POSIX process groups, tmux, and `which`-based Pi discovery); use WSL2.
 
 For local development, add this package as a Pi extension source and reload Pi.
 

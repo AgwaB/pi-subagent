@@ -23,37 +23,25 @@ for (let index = 0; index < 100; index += 1) {
 	const reconciled = await reconciliation.reconcileSubagentRun({
 		...payload.ref,
 		staleAfterMs: 0,
+		expectedAttemptId: payload.attemptId,
 	});
+	if (reconciled.status === "superseded") process.exit(0);
 	if (
 		reconciled.status === "committed-result" ||
 		reconciled.status === "already-terminal"
 	) {
-		const terminalType =
-			payload.status === "completed"
-				? "completed"
-				: payload.status === "cancelled"
-					? "cancelled"
-					: "failed";
-		const events = await artifacts.readRunEvents(payload.ref, Infinity);
 		if (
-			!events.some(
-				(event) =>
-					event.type === `attempt.${terminalType}` &&
-					event.attemptId === payload.attemptId,
-			)
+			reconciled.record?.activeAttemptId !== null ||
+			reconciled.record?.latestAttemptId !== payload.attemptId ||
+			reconciled.record?.status !== payload.status
 		)
-			await artifacts.appendRunEvent(payload.ref, {
-				type: `attempt.${terminalType}`,
-				attemptId: payload.attemptId,
-				status: payload.status,
-				message: "durable worker exited and ownership was drained",
-			}).catch(() => undefined);
-		if (!events.some((event) => event.type === `run.${terminalType}`))
-			await artifacts.appendRunEvent(payload.ref, {
-				type: `run.${terminalType}`,
-				status: payload.status,
-				message: `run ${payload.status}`,
-			}).catch(() => undefined);
+			process.exit(0);
+		await artifacts.appendTerminalEventsIfCurrent(payload.ref, {
+			attemptId: payload.attemptId,
+			status: payload.status,
+			attemptMessage: "durable worker exited and ownership was drained",
+			runMessage: `run ${payload.status}`,
+		});
 		process.exit(0);
 	}
 	await sleep(100);

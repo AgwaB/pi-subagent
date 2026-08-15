@@ -517,7 +517,8 @@ async function lifecycleAction(
 				reconciled,
 				snapshot,
 			},
-			reconciled.status === "not-found",
+			reconciled.status === "not-found" ||
+				reconciled.status === "cleanup-blocked",
 			{ reconciled, snapshot },
 		);
 	}

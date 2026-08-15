@@ -42,6 +42,10 @@ Every call has an `action`. The default is `run`, so omitting `action` starts a 
 
 State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
 
+`reconcileSubagentRun()` returns `status:"running"` only when current liveness evidence says the run may still be executing. If verified cleanup cannot complete safely, it returns `status:"cleanup-blocked"` with a stable `cleanupBlocked.reason` and the affected attempt IDs; callers should surface that state rather than treating it as ordinary execution. Process ownership uses Linux boot ID plus kernel start ticks, or a bundled macOS `proc_pidinfo` helper with microsecond process start time. Missing or unverifiable platform identity fails closed and is never signal authority.
+
+Attempt-scoped supervisors should pass `expectedAttemptId` to `reconcileSubagentRun()`. If another attempt has become active/latest, reconciliation returns `status:"superseded"` before cleanup or registry mutation. This prevents a delayed finalizer from stale-terminalizing its successor.
+
 Parent orchestrators may record descendant state with `recordSubagentChildEvent`, which appends `child.*` events to the parent run's `events.jsonl` (`child.started`, `child.failed`, `child.completed`, or `child.cancelled`). Event data may include `childRunId` (or legacy aliases `childId` / `descendantRunId`), `workflowRunId`, `taskId`, and `failureKind`. `status` and `/subagent panel` aggregate those into `childSummary`, including failure counts, active child run IDs, and the latest currently failed/cancelled child. This keeps parent status distinct from descendant failures and makes retry attempts distinguishable from newly-started child work.
 
 Model:
@@ -103,23 +107,26 @@ The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import in
 
 ### General durable launch barrier
 
-Code API orchestrators that must durably commit their own authority or accounting state before a child can execute a model/provider may opt into a general two-phase barrier:
+Code API orchestrators that need release-versus-cancellation ordering should use
+the v2 barrier. Release and revocation compete for one immutable, owner-only,
+fsynced decision file, so exactly one outcome can authorize the worker:
 
 ```ts
 import {
-  createDurableLaunchBarrier,
+  createDurableLaunchBarrierV2,
   durableLaunchBarrierDigest,
-  releaseDurableLaunchBarrier,
+  resolveDurableLaunchBarrierV2Release,
+  revokeDurableLaunchBarrierV2,
   runSubagent,
-  waitForDurableLaunchBarrierAck,
-  waitForDurableLaunchBarrierReady,
+  waitForDurableLaunchBarrierV2Ack,
+  waitForDurableLaunchBarrierV2Ready,
 } from "@agwab/pi-subagent/api";
 
-const barrier = await createDurableLaunchBarrier({
+const barrier = await createDurableLaunchBarrierV2({
   directory: "/absolute/private/path/attempt-barrier",
   subjectSha256: durableLaunchBarrierDigest({ operation: "my-operation" }),
-  // Optional: bind caller-verified per-run authority without giving
-  // pi-subagent responsibility for interpreting or validating that authority.
+  // Optional caller-verified authority binding. pi-subagent binds this digest
+  // but does not interpret or grant the underlying authority.
   authorityBindingSha256: durableLaunchBarrierDigest({ grantId: "grant-123" }),
 });
 const run = await runSubagent({
@@ -130,18 +137,45 @@ const run = await runSubagent({
   onComplete: "detach",
   durableLaunchBarrier: barrier,
 });
-const ready = await waitForDurableLaunchBarrierReady(barrier);
+const ready = await waitForDurableLaunchBarrierV2Ready(barrier);
 
-// Persist and crash-durably sync the caller's authorization/accounting state here.
-const release = await releaseDurableLaunchBarrier(
+// Persist and crash-durably sync caller authorization/accounting first.
+const decision = await resolveDurableLaunchBarrierV2Release(
   barrier,
   ready,
   durableLaunchBarrierDigest({ authorityState: "consumed" }),
 );
-await waitForDurableLaunchBarrierAck(barrier, release);
+if (decision.outcome === "released") {
+  await waitForDurableLaunchBarrierV2Ack(barrier, decision.decision);
+}
+
+// A cancellation path instead calls revokeDurableLaunchBarrierV2(). If release
+// already won, it returns outcome "released" rather than rewriting history.
+await revokeDurableLaunchBarrierV2(barrier, {
+  cancellationId: "stable-attempt-cancellation-id",
+  reasonSha256: durableLaunchBarrierDigest({ reason: "caller stopped" }),
+});
 ```
 
-Before writing the owner-only, fsynced ready record, the worker resolves the backend, agent/tool authority, workspace, and effective execution cwd into an immutable execution plan. The ready record binds that plan's digest; after acknowledgement the same prepared plan executes without re-resolving those prerequisites. A preflight failure produces no acknowledgement, and a barrier timeout discards any prepared worktree. Release and acknowledgement records are challenge-, subject-, optional authority-binding-, run-, attempt-, launch-payload-, and execution-plan-bound. Matching record writes are idempotently recoverable after a partial filesystem commit. Timeout, path/identity drift, conflicting duplicate release, or malformed records fail closed as `guard_failure`. The barrier is a general code-API primitive: pi-subagent does not interpret, authenticate, or grant the caller's authority, and the public `subagent` model tool does not expose this field. `correlationId` and `runsDir` remain optional; omitted `runsDir` resolves to `.pi/agent/runs` under `cwd`. Parallel children require distinct barriers. Durable binding is supported only by process-isolated `headless` and `tmux` backends; `inline` is rejected before READY because concurrent in-process environment authority cannot be isolated safely. Each tmux run starts a one-shot isolated server with the exact sanitized run environment, so no credential-bearing environment snapshot is persisted as an artifact. Barrier path protection assumes same-UID local processes are trusted; pathname identity checks do not defend against a malicious same-UID process that atomically renames a directory away and restores it between checks.
+Before READY, the worker resolves backend, agent/tool authority, workspace, and
+effective execution cwd into an immutable execution plan. READY binds that plan.
+A v2 worker waits for `decision-v2.json`: `revoked` terminates as
+`user_cancelled` without entering prepared model/provider execution; `released`
+binds the exact run, attempt, READY, authority, and release payload. The worker
+writes an ACK, revalidates the immutable decision, and checks its abort signal
+again immediately before executing the prepared plan. Matching writes and reads
+are idempotently recoverable after partial filesystem commits. Timeout,
+path/identity drift, conflicting replay, or malformed records fail closed.
+
+The original v1 exports remain available for compatibility, but v1 has no shared
+release-or-revoke linearization object and must not be used to claim that a
+concurrent cancellation can prevent release. The barrier is a code-API primitive;
+the public `subagent` model tool does not expose it. `correlationId` and `runsDir`
+remain optional, parallel children require distinct barriers, and durable binding
+requires process-isolated `headless` or `tmux` execution. Barrier path protection
+assumes same-UID local processes are trusted; pathname checks do not defend against
+a malicious same-UID process that swaps a directory away and restores it between
+checks.
 
 Project-local agents are repository-controlled. Project-local agent confirmation is disabled by default; use trusted repositories or constrain lookup with `agentScope:"global"`. The code API has no interactive prompt, so setting `confirmProjectAgents:true` rejects project-local agents instead of prompting.
 

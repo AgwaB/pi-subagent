@@ -46,17 +46,34 @@ import {
 } from "./orchestrate/status.ts";
 
 export {
+	assertDurableLaunchBarrierV2ExecutionAuthorized,
 	createDurableLaunchBarrier,
+	createDurableLaunchBarrierV2,
 	durableLaunchBarrierDigest,
 	isDurableLaunchBarrierError,
+	isDurableLaunchBarrierRevokedError,
+	readDurableLaunchBarrierV2State,
 	releaseDurableLaunchBarrier,
+	resolveDurableLaunchBarrierV2Release,
+	revokeDurableLaunchBarrierV2,
 	waitForDurableLaunchBarrierAck,
 	waitForDurableLaunchBarrierReady,
+	waitForDurableLaunchBarrierV2Ack,
+	waitForDurableLaunchBarrierV2Ready,
 	DurableLaunchBarrierError,
+	DurableLaunchBarrierRevokedError,
 	type DurableLaunchBarrierAck,
 	type DurableLaunchBarrierDescriptor,
 	type DurableLaunchBarrierReady,
 	type DurableLaunchBarrierRelease,
+	type DurableLaunchBarrierV2Ack,
+	type DurableLaunchBarrierV2Decision,
+	type DurableLaunchBarrierV2Descriptor,
+	type DurableLaunchBarrierV2Ready,
+	type DurableLaunchBarrierV2ReleaseDecision,
+	type DurableLaunchBarrierV2Resolution,
+	type DurableLaunchBarrierV2RevocationDecision,
+	type DurableLaunchBarrierV2State,
 } from "./durable-launch-barrier.ts";
 
 export interface RunSubagentOptions extends ResolveInput {

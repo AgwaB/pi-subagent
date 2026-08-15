@@ -96,6 +96,9 @@ const required = [
 	"api.mjs",
 	"src/api.ts",
 	"src/index.ts",
+	"src/native/darwin-process-identity",
+	"src/native/darwin-process-identity.c",
+	"src/native/darwin-process-identity.manifest.json",
 	"src/process-identity.ts",
 	"src/shell-environment.ts",
 	"src/workers/durable-worker.mjs",
@@ -106,6 +109,15 @@ const required = [
 const missing = required.filter((path) => !files.includes(path));
 if (missing.length > 0) {
 	console.error(`Package is missing required files: ${missing.join(", ")}`);
+	process.exit(1);
+}
+const darwinHelper = summary.files.find(
+	(file) => file.path === "src/native/darwin-process-identity",
+);
+if (darwinHelper === undefined || (darwinHelper.mode & 0o111) === 0) {
+	console.error(
+		"Package Darwin process identity helper is missing executable mode.",
+	);
 	process.exit(1);
 }
 const allowedPublicPaths = new Set([
