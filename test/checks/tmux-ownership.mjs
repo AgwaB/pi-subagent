@@ -282,19 +282,19 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 			{ terminalBlocked: true },
 		);
 		try {
-			await assert.rejects(
-				withSandboxedArgv(
-					["/bin/echo", "sandbox-wrapper-check"],
-					{ sandbox: true, cwd: paneGateCwd },
-					async () => {
-						throw executionError;
-					},
-				),
-				(error) => error === executionError && error.terminalBlocked === true,
-				"sandbox execution errors must retain their type and terminalBlocked marker",
+			await withSandboxedArgv(
+				["/bin/echo", "sandbox-wrapper-check"],
+				{ sandbox: true, cwd: paneGateCwd },
+				async () => {
+					throw executionError;
+				},
 			);
+			assert.fail("sandbox execution callback must reject");
 		} catch (error) {
-			if (!(error instanceof SandboxUnavailableError)) throw error;
+			if (!(error instanceof SandboxUnavailableError)) {
+				assert.equal(error, executionError);
+				assert.equal(error.terminalBlocked, true);
+			}
 		}
 
 		const sandboxPaneSideEffect = join(
