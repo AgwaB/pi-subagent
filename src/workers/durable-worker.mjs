@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 
 import {
@@ -17,12 +19,14 @@ if (!payloadPath) {
 }
 
 const jiti = createJiti(import.meta.url, { interopDefault: false });
-const [orchestration, artifacts, launchBarrier, constants] = await Promise.all([
+const [orchestration, artifacts, launchBarrier, constants, processIdentity] =
+	await Promise.all([
 	jiti.import("../orchestrate/run.ts"),
 	jiti.import("../artifacts/index.ts"),
 	jiti.import("../durable-launch-barrier.ts"),
 	jiti.import("../core/constants.ts"),
-]);
+	jiti.import("../process-identity.ts"),
+	]);
 
 const payloadBytes = await readFile(payloadPath);
 const launchPayloadSha256 = createHash("sha256").update(payloadBytes).digest("hex");
@@ -38,6 +42,7 @@ const workerProcessGroupId =
 let terminalWritePromise;
 let heartbeat;
 let preparedExecution;
+let terminalResult;
 const executionAbort = new AbortController();
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
@@ -114,38 +119,18 @@ async function writeTerminalResultOnce({
 		});
 		if (shouldBackfillDuplicateResult) {
 			await artifacts
-				.finishAttemptFromResult(runRef, result)
+				.refreshTerminalAttemptResultIfCurrent(runRef, result)
 				.catch(() => undefined);
-			return;
+			return undefined;
 		}
-		const committed = await artifacts
-			.commitAttemptResultIfActive(runRef, result)
-			.catch(() => ({ committed: false }));
-		if (!committed.committed) return;
-		const terminalType = status === "cancelled" ? "cancelled" : "failed";
-		await artifacts
-			.appendRunEvent(runRef, {
-				type: `attempt.${terminalType}`,
-				attemptId,
-				status,
-				message,
-				data: { failureKind, signal, exitCode },
-			})
-			.catch(() => undefined);
-		await artifacts
-			.appendRunEvent(runRef, {
-				type: `run.${terminalType}`,
-				status,
-				message,
-				data: { failureKind, signal, exitCode },
-			})
-			.catch(() => undefined);
+		return result;
 	} catch (writeError) {
 		console.error(
 			writeError instanceof Error
 				? (writeError.stack ?? writeError.message)
 				: String(writeError),
 		);
+		return undefined;
 	}
 }
 
@@ -183,19 +168,31 @@ function requestCancel(signal) {
 process.once("SIGINT", () => requestCancel("SIGINT"));
 process.once("SIGTERM", () => requestCancel("SIGTERM"));
 
-await artifacts
-	.updateAttemptProcess({
+const workerIdentity = await processIdentity.captureProcessIdentity(process.pid);
+const workerProcessMetadata = {
+	command: "pi-subagent durable-worker",
+	workerPid: workerIdentity.pid,
+	workerProcessGroupId: workerIdentity.processGroupId,
+	workerProcessBirthIdentity: workerIdentity.birthIdentity,
+};
+const workerRecord = await artifacts.updateAttemptWorkerProcess({
 		...runRef,
 		attemptId,
-		process: {
-			pid: process.pid,
-			processGroupId: workerProcessGroupId,
-			command: "pi-subagent durable-worker",
-			workerPid: process.pid,
-			workerProcessGroupId,
-		},
-	})
-	.catch(() => undefined);
+		process: workerProcessMetadata,
+	});
+const persistedWorker = workerRecord.attempts.find(
+	(candidate) => candidate.attemptId === attemptId,
+);
+if (
+	workerRecord.activeAttemptId !== attemptId ||
+	persistedWorker?.process?.workerPid !== workerIdentity.pid ||
+	persistedWorker.process.workerProcessGroupId !== workerIdentity.processGroupId ||
+	persistedWorker.process.workerProcessBirthIdentity !==
+		workerIdentity.birthIdentity
+)
+	throw new Error(
+		"durable worker ownership metadata was not committed to the active attempt",
+	);
 heartbeat = setInterval(() => {
 	void artifacts
 		.recordAttemptHeartbeat({ ...runRef, attemptId })
@@ -217,6 +214,7 @@ try {
 		cwd,
 		runId,
 		attemptId,
+		resumeExistingAttempt: true,
 		requiresDurableWorkerBinding: Boolean(input?.durableLaunchBarrier),
 	});
 	if (input?.durableLaunchBarrier) {
@@ -257,8 +255,9 @@ try {
 		});
 		preparedExecution.durableWorkerBinding = JSON.stringify(binding);
 	}
-	await orchestration.runPreparedSubagentExecution(preparedExecution, {
+	terminalResult = await orchestration.runPreparedSubagentExecution(preparedExecution, {
 		signal: executionAbort.signal,
+		deferTerminalCommit: true,
 	});
 } catch (error) {
 	if (error?.terminalBlocked === true) {
@@ -269,7 +268,7 @@ try {
 		await orchestration.discardSubagentExecution(preparedExecution).catch(() => undefined);
 	const message = error instanceof Error ? error.message : String(error);
 	const cancelled = executionAbort.signal.aborted;
-	await writeTerminalResult({
+	terminalResult = await writeTerminalResult({
 		status: cancelled ? "cancelled" : "failed",
 		failureKind: cancelled
 			? "user_cancelled"
@@ -284,4 +283,28 @@ try {
 	}
 } finally {
 	if (heartbeat !== undefined) clearInterval(heartbeat);
+}
+if (terminalResult !== undefined) {
+	const finalizerPath = fileURLToPath(
+		new URL("./terminal-finalizer.mjs", import.meta.url),
+	);
+	const finalizerPayload = Buffer.from(
+		JSON.stringify({
+			ref: runRef,
+			attemptId,
+			status: terminalResult.status,
+			worker: workerIdentity,
+		}),
+	).toString("base64url");
+	const finalizer = spawn(process.execPath, [finalizerPath, finalizerPayload], {
+		cwd,
+		detached: true,
+		stdio: "ignore",
+		env: {
+			PATH: "/usr/bin:/bin",
+			LC_ALL: "C",
+			LANG: "C",
+		},
+	});
+	finalizer.unref();
 }

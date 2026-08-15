@@ -1,10 +1,21 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import {
+	access,
+	appendFile,
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	appendRunEvent,
+	beginRunRecord,
 	commitAttemptResultIfActive,
 	createAttemptArtifactStore,
 	finishAttemptFromResult,
@@ -12,15 +23,47 @@ import {
 	readRunRecord,
 	recordAttemptHeartbeat,
 	updateAttemptProcess,
+	upsertRunAttempt,
 } from "../../src/artifacts/index.ts";
+import {
+	captureProcessIdentity,
+	verifyProcessIdentity,
+} from "../../src/process-identity.ts";
 import { startAsyncSubagentRun } from "../../src/orchestrate/async.ts";
+import {
+	discardSubagentExecution,
+	prepareSubagentExecution,
+} from "../../src/orchestrate/run.ts";
 import {
 	getSubagentStatus,
 	interruptSubagent,
+	runSubagent,
 	waitForSubagent,
 } from "../../api.mjs";
 
 const cwd = await mkdtemp(join(tmpdir(), "pi-subagent-lifecycle-"));
+const originalPath = process.env.PATH;
+let stubbornChildPid;
+
+function pidAlive(pid) {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function pathExists(path) {
+	try {
+		await access(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 try {
 	const runId = "run_lifecycle_terminal";
 	const attemptId = "attempt_lifecycle_terminal";
@@ -80,6 +123,155 @@ try {
 		"completed",
 		"late signal result must not overwrite an already-terminal attempt",
 	);
+
+	const stalePreparedRunId = "run_stale_prepared";
+	const stalePreparedA = await prepareSubagentExecution({
+		cwd,
+		runId: stalePreparedRunId,
+		attemptId: "attempt_prepared_a",
+		input: { backend: "headless", task: "must not execute" },
+	});
+	await assert.rejects(
+		prepareSubagentExecution({
+			cwd,
+			runId: stalePreparedRunId,
+			attemptId: "attempt_prepared_b",
+			input: { backend: "headless", task: "successor" },
+		}),
+		/already has active attempt/u,
+		"a successor must not reserve authority while another attempt is active",
+	);
+	await upsertRunAttempt({
+		cwd,
+		runId: stalePreparedRunId,
+		attemptId: stalePreparedA.attemptId,
+		status: "cancelled",
+		backend: "headless",
+		failureKind: "user_cancelled",
+		completedAt: new Date(),
+		activate: true,
+		onlyIfActive: true,
+	});
+	const stalePreparedB = await prepareSubagentExecution({
+		cwd,
+		runId: stalePreparedRunId,
+		attemptId: "attempt_prepared_b",
+		input: { backend: "headless", task: "successor" },
+	});
+	await discardSubagentExecution(stalePreparedA);
+	const afterStaleDiscard = await readRunRecord({
+		cwd,
+		runId: stalePreparedRunId,
+	});
+	assert.equal(
+		afterStaleDiscard?.activeAttemptId,
+		stalePreparedB.attemptId,
+		"a stale discard must not terminalize its active successor",
+	);
+	await discardSubagentExecution(stalePreparedB);
+
+	const finalizerWorker = spawn("/bin/sleep", ["30"], {
+		detached: true,
+		stdio: "ignore",
+	});
+	assert.equal(typeof finalizerWorker.pid, "number");
+	const finalizerWorkerIdentity = await captureProcessIdentity(
+		finalizerWorker.pid,
+	);
+	process.kill(-finalizerWorkerIdentity.processGroupId, "SIGKILL");
+	await new Promise((resolveExit) => finalizerWorker.once("exit", resolveExit));
+	const finalizerPath = fileURLToPath(
+		new URL("../../src/workers/terminal-finalizer.mjs", import.meta.url),
+	);
+	for (const terminalCase of [
+		{ status: "completed", failureKind: null, event: "completed" },
+		{ status: "failed", failureKind: "model", event: "failed" },
+		{
+			status: "cancelled",
+			failureKind: "user_cancelled",
+			event: "cancelled",
+		},
+	]) {
+		const finalizerRunId = `run_finalizer_${terminalCase.status}`;
+		const finalizerAttemptId = `attempt_finalizer_${terminalCase.status}`;
+		const finalizerStore = await createAttemptArtifactStore({
+			cwd,
+			runId: finalizerRunId,
+			attemptId: finalizerAttemptId,
+		});
+		const finalizerResult = await finalizerStore.writeResult({
+			backend: "headless",
+			status: terminalCase.status,
+			failureKind: terminalCase.failureKind,
+			cwd,
+			startedAt: new Date().toISOString(),
+			completedAt: new Date().toISOString(),
+			workspace: { mode: "shared", cwd, worktreePath: null },
+			sandbox: { enabled: false },
+			exitCode: terminalCase.status === "completed" ? 0 : null,
+			signal: terminalCase.status === "cancelled" ? "SIGTERM" : null,
+			artifacts: [],
+			metadata: { contextLengthExceeded: false },
+		});
+		await beginRunRecord({
+			cwd,
+			runId: finalizerRunId,
+			mode: "single",
+			backend: "headless",
+			activeAttemptId: finalizerAttemptId,
+			attempts: [
+				{
+					attemptId: finalizerAttemptId,
+					status: "running",
+					backend: "headless",
+					startedAt: new Date().toISOString(),
+					resultPath: finalizerResult.artifacts.find(
+						(artifact) => artifact.type === "result",
+					)?.path,
+					process: {
+						workerPid: finalizerWorkerIdentity.pid,
+						workerProcessGroupId:
+							finalizerWorkerIdentity.processGroupId,
+						workerProcessBirthIdentity:
+							finalizerWorkerIdentity.birthIdentity,
+					},
+				},
+			],
+		});
+		const finalizerPayload = Buffer.from(
+			JSON.stringify({
+				ref: { cwd, runId: finalizerRunId },
+				attemptId: finalizerAttemptId,
+				status: terminalCase.status,
+				worker: finalizerWorkerIdentity,
+			}),
+		).toString("base64url");
+		const finalizerProcess = spawn(
+			process.execPath,
+			[finalizerPath, finalizerPayload],
+			{ cwd, stdio: "ignore" },
+		);
+		const finalizerExit = await new Promise((resolveExit) =>
+			finalizerProcess.once("exit", resolveExit),
+		);
+		assert.equal(finalizerExit, 0);
+		const finalizerEvents = await readRunEvents({
+			cwd,
+			runId: finalizerRunId,
+		});
+		assert.equal(
+			finalizerEvents.filter(
+				(event) => event.type === `attempt.${terminalCase.event}`,
+			).length,
+			1,
+		);
+		assert.equal(
+			finalizerEvents.filter(
+				(event) => event.type === `run.${terminalCase.event}`,
+			).length,
+			1,
+		);
+	}
 
 	const eventsRun = "run_lifecycle_events";
 	const eventsAttempt = "attempt_lifecycle_events";
@@ -243,6 +435,26 @@ try {
 		timeoutMs: 3000,
 		pollIntervalMs: 50,
 	});
+	const asyncFalseTerminalRecord = await readRunRecord({
+		cwd,
+		runId: asyncFalse.runId,
+	});
+	const asyncFalseWorker =
+		asyncFalseTerminalRecord?.attempts[0]?.process;
+	if (
+		asyncFalseWorker?.workerPid !== undefined &&
+		asyncFalseWorker.workerProcessGroupId !== undefined &&
+		asyncFalseWorker.workerProcessBirthIdentity !== undefined
+	)
+		assert.equal(
+			await verifyProcessIdentity({
+				pid: asyncFalseWorker.workerPid,
+				processGroupId: asyncFalseWorker.workerProcessGroupId,
+				birthIdentity: asyncFalseWorker.workerProcessBirthIdentity,
+			}),
+			"dead",
+			"terminal publication must wait for the durable worker to exit",
+		);
 
 	const previousDelay = process.env.PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS;
 	const previousTerminalDelay =
@@ -300,9 +512,137 @@ try {
 				previousTerminalDelay;
 	}
 
+	const shortTarget = spawn("/bin/sleep", ["30"], {
+		detached: true,
+		stdio: "ignore",
+	});
+	assert.equal(typeof shortTarget.pid, "number");
+	const shortIdentity = await captureProcessIdentity(shortTarget.pid);
+	const shortRunId = "run_interrupt_short_target";
+	const shortAttemptId = "attempt_interrupt_short_target";
+	await beginRunRecord({
+		cwd,
+		runId: shortRunId,
+		mode: "single",
+		backend: "headless",
+		activeAttemptId: shortAttemptId,
+		attempts: [
+			{
+				attemptId: shortAttemptId,
+				status: "running",
+				backend: "headless",
+				startedAt: new Date().toISOString(),
+				process: {
+					pid: shortIdentity.pid,
+					processGroupId: shortIdentity.processGroupId,
+					processBirthIdentity: shortIdentity.birthIdentity,
+				},
+			},
+		],
+	});
+	const realProcessKill = process.kill;
+	const postExitSignals = [];
+	process.kill = function trackedProcessKill(pid, signal) {
+		if (
+			pid === -shortIdentity.processGroupId &&
+			(signal === "SIGTERM" || signal === "SIGKILL")
+		)
+			postExitSignals.push(signal);
+		return realProcessKill.call(process, pid, signal);
+	};
+	try {
+		const shortInterrupted = await interruptSubagent({
+			cwd,
+			runId: shortRunId,
+			attemptId: shortAttemptId,
+			reason: "short target escalation revalidation",
+		});
+		assert.equal(shortInterrupted.status, "interrupt-requested");
+		for (let index = 0; index < 100 && pidAlive(shortTarget.pid); index += 1)
+			await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+		assert.equal(pidAlive(shortTarget.pid), false);
+		await new Promise((resolveSleep) => setTimeout(resolveSleep, 3_200));
+		assert.deepEqual(
+			postExitSignals,
+			[],
+			"escalation must not signal a cached target after its identity is dead",
+		);
+	} finally {
+		process.kill = realProcessKill;
+		if (pidAlive(shortTarget.pid)) {
+			try {
+				realProcessKill(-shortTarget.pid, "SIGKILL");
+			} catch {
+				// The owned fixture process already exited.
+			}
+		}
+	}
+
+	const interruptBin = join(cwd, "interrupt-bin");
+	const stubbornChildPidPath = join(cwd, "interrupt-child.pid");
+	const stubbornLateSideEffect = join(cwd, "interrupt-late-side-effect");
+	await mkdir(interruptBin);
+	await writeFile(
+		join(interruptBin, "pi"),
+		`#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const child = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(`import { writeFileSync } from "node:fs"; for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => {}); await new Promise((resolve) => setTimeout(resolve, 4000)); writeFileSync(${JSON.stringify(stubbornLateSideEffect)}, "late"); await new Promise((resolve) => setTimeout(resolve, 10000));`)}], { stdio: ["ignore", "inherit", "inherit"] });
+child.unref();
+writeFileSync(${JSON.stringify(stubbornChildPidPath)}, String(child.pid));
+await new Promise((resolve) => setTimeout(resolve, 10000));
+`,
+		{ mode: 0o700 },
+	);
+	process.env.PATH = `${interruptBin}:${originalPath}`;
+	const stubbornInterruptRun = await runSubagent({
+		cwd,
+		backend: "headless",
+		task: "provider-free stubborn interrupt group",
+		async: true,
+	});
+	for (
+		let index = 0;
+		index < 300 && !(await pathExists(stubbornChildPidPath));
+		index += 1
+	)
+		await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+	stubbornChildPid = Number(
+		(await readFile(stubbornChildPidPath, "utf8")).trim(),
+	);
+	assert.equal(pidAlive(stubbornChildPid), true);
+	const stubbornInterrupted = await interruptSubagent({
+		cwd,
+		runId: stubbornInterruptRun.runId,
+		attemptId: stubbornInterruptRun.attemptId,
+		reason: "stubborn headless interrupt regression",
+	});
+	assert.equal(stubbornInterrupted.status, "interrupt-requested");
+	const stubbornWait = await waitForSubagent({
+		cwd,
+		runId: stubbornInterruptRun.runId,
+		attemptId: stubbornInterruptRun.attemptId,
+		timeoutMs: 10_000,
+		pollIntervalMs: 50,
+	});
+	assert.equal(stubbornWait.status, "completed");
+	assert.equal(stubbornWait.snapshot?.status, "cancelled");
+	assert.equal(pidAlive(stubbornChildPid), false);
+	await new Promise((resolveSleep) => setTimeout(resolveSleep, 4_100));
+	assert.equal(await pathExists(stubbornLateSideEffect), false);
+	process.env.PATH = originalPath;
+
 	console.log(
 		JSON.stringify({ name: "check-lifecycle", status: "completed" }, null, 2),
 	);
 } finally {
+	process.env.PATH = originalPath;
+	if (pidAlive(stubbornChildPid)) {
+		try {
+			process.kill(stubbornChildPid, "SIGKILL");
+		} catch {
+			// The owned fixture process already exited.
+		}
+	}
 	await rm(cwd, { recursive: true, force: true });
 }

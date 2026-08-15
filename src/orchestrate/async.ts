@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -9,8 +10,8 @@ import {
 	createAttemptArtifactStore,
 	createAttemptId,
 	createRunId,
-	finishAttemptFromResult,
-	updateAttemptProcess,
+	upsertRunAttempt,
+	updateAttemptWorkerProcess,
 	type ResultEnvelope,
 } from "../artifacts/index.ts";
 import type {
@@ -29,6 +30,7 @@ import {
 } from "./run.ts";
 import { writeRunLocator } from "./run-ref.ts";
 import { readRunResult, waitForRun } from "./status.ts";
+import { captureProcessIdentity } from "../process-identity.ts";
 
 export interface StartAsyncSubagentRunOptions {
 	input: ResolveInput;
@@ -108,7 +110,7 @@ function armCompletionMonitor(
 		});
 		if (result === null) return;
 		const updatesSent = await options.onComplete!(result, options.mode);
-		const completed = await options.store.writeResult({
+		await options.store.writeResult({
 			...result,
 			completion: {
 				onComplete: options.input.onComplete ?? null,
@@ -116,14 +118,6 @@ function armCompletionMonitor(
 				updatesSent,
 			},
 		});
-		await finishAttemptFromResult(
-			{
-				cwd: options.cwd,
-				runsDir: options.input.runsDir,
-				runId: options.runId,
-			},
-			completed,
-		);
 	})().catch(() => undefined);
 }
 
@@ -266,6 +260,22 @@ export async function startAsyncSubagentRun(
 		metadata: { contextLengthExceeded: false },
 	});
 
+	await upsertRunAttempt({
+		cwd: options.cwd,
+		runsDir: input.runsDir,
+		runId,
+		attemptId,
+		status: "running",
+		backend: options.backend,
+		startedAt,
+		artifactCwd: options.cwd,
+		resultPath: running.artifacts.find(
+			(artifact) => artifact.type === "result",
+		)?.path,
+		createOnly: true,
+		requireNoActive: true,
+		activate: true,
+	});
 	await beginRunRecord({
 		cwd: options.cwd,
 		runsDir: input.runsDir,
@@ -277,18 +287,7 @@ export async function startAsyncSubagentRun(
 		correlationId: input.correlationId,
 		parentSessionId: input.parentSessionId,
 		activeAttemptId: attemptId,
-		attempts: [
-			{
-				attemptId,
-				status: "running",
-				backend: options.backend,
-				startedAt: startedAt.toISOString(),
-				artifactCwd: options.cwd,
-				resultPath: running.artifacts.find(
-					(artifact) => artifact.type === "result",
-				)?.path,
-			},
-		],
+		attempts: [],
 	});
 	await writeRunLocator({
 		cwd: options.cwd,
@@ -312,33 +311,69 @@ export async function startAsyncSubagentRun(
 	delete workerEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
 	let child;
 	try {
-		child = spawn(process.execPath, [workerPath(), payloadPath], {
+		child = spawn(
+			process.execPath,
+			[
+				workerPath(),
+				payloadPath,
+				`ownership-${randomBytes(16).toString("hex")}`,
+			],
+			{
 			cwd: options.cwd,
 			detached: process.platform !== "win32",
 			stdio: ["ignore", workerLogFd, workerLogFd],
 			env: workerEnv,
-		});
+			},
+		);
 	} finally {
 		closeSync(workerLogFd);
 	}
-	child.unref();
-
 	if (child.pid !== undefined) {
-		await updateAttemptProcess({
-			cwd: options.cwd,
-			runsDir: input.runsDir,
-			runId,
-			attemptId,
-			process: {
-				pid: child.pid,
-				processGroupId: process.platform === "win32" ? undefined : child.pid,
+		try {
+			const identity = await captureProcessIdentity(child.pid);
+			const processMetadata = {
 				command: process.execPath,
-				workerPid: child.pid,
-				workerProcessGroupId:
-					process.platform === "win32" ? undefined : child.pid,
-			},
-		}).catch(() => undefined);
+				workerPid: identity.pid,
+				workerProcessGroupId: identity.processGroupId,
+				workerProcessBirthIdentity: identity.birthIdentity,
+			};
+			const updated = await updateAttemptWorkerProcess({
+				cwd: options.cwd,
+				runsDir: input.runsDir,
+				runId,
+				attemptId,
+				process: processMetadata,
+			});
+			const persisted = updated.attempts.find(
+				(attempt) => attempt.attemptId === attemptId,
+			);
+			if (
+				updated.activeAttemptId !== attemptId ||
+				persisted?.process?.workerPid !== identity.pid ||
+				persisted.process.workerProcessGroupId !== identity.processGroupId ||
+				persisted.process.workerProcessBirthIdentity !== identity.birthIdentity
+			)
+				throw new Error(
+					"durable worker ownership metadata was not committed to the active attempt",
+				);
+		} catch (error) {
+			try {
+				if (process.platform === "win32") child.kill("SIGKILL");
+				else process.kill(-child.pid, "SIGKILL");
+			} catch {
+				/* already exited */
+			}
+			await new Promise<void>((resolveClose) => {
+				if (child.exitCode !== null || child.signalCode !== null) {
+					resolveClose();
+					return;
+				}
+				child.once("close", () => resolveClose());
+			});
+			throw error;
+		}
 	}
+	child.unref();
 
 	armCompletionMonitor({ ...options, runId, attemptId, mode, store });
 	return running;

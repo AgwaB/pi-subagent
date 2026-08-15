@@ -1,14 +1,17 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, stat, unlink, writeFile } from "node:fs/promises";
+import { stat, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import {
 	createAttemptArtifactStore,
 	type ArtifactRef,
 	type ResultEnvelope,
 } from "../artifacts/index.ts";
-import type { ResultWorkspace } from "../artifacts/result.ts";
+import type {
+	ResultTmuxMetadata,
+	ResultWorkspace,
+} from "../artifacts/result.ts";
 import {
 	isFailureKind,
 	sandboxAllowedDomains,
@@ -21,9 +24,21 @@ import {
 	preparePrivateTmuxSocket,
 	privateTmuxServerAlive,
 	privateTmuxSocketPath,
+	readPrivateTmuxRuntimeIdentity,
 	terminatePrivateTmuxServer,
+	TMUX_OWNERSHIP_ENV,
+	tmuxOwnershipTokenDigest,
 	TmuxOwnershipError,
 } from "./tmux-control.ts";
+import {
+	captureProcessIdentity,
+	inspectProcessGroup,
+	type ProcessIdentity,
+} from "../process-identity.ts";
+import {
+	processGateEnvironment,
+	withoutShellStartupAuthority,
+} from "../shell-environment.ts";
 import {
 	buildPiArgv,
 	detectContextLengthExceeded,
@@ -36,8 +51,9 @@ import {
 	type RunHeadlessModelOptions,
 } from "./headless-model.ts";
 
-const execFileAsync = promisify(execFile);
 const POLL_INTERVAL_MS = 100;
+const TMUX_LAUNCH_TIMEOUT_MS = 10_000;
+const TMUX_LAUNCH_KILL_GRACE_MS = 500;
 
 interface RunTmuxProcessOptions {
 	argv: readonly string[];
@@ -67,13 +83,7 @@ interface TmuxRunResult {
 	meta: WorkerMeta;
 	stderrRef: ArtifactRef;
 	eventPath: string;
-	tmux: {
-		serverName: string;
-		socketPath: string;
-		sessionName: string;
-		sessionId: string | null;
-		paneId: string | null;
-	};
+	tmux: ResultTmuxMetadata;
 }
 
 function assertRunnableArgv(
@@ -100,14 +110,6 @@ function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
 	return timeoutMs;
 }
 
-async function tmuxAvailable(): Promise<boolean> {
-	try {
-		await execFileAsync("tmux", ["-V"]);
-		return true;
-	} catch {
-		return false;
-	}
-}
 
 async function pathBytes(path: string): Promise<number> {
 	try {
@@ -121,8 +123,221 @@ async function sleep(ms: number): Promise<void> {
 	await new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
-function shellQuote(value: string): string {
-	return `'${value.replaceAll("'", `'\\''`)}'`;
+async function runGatedTmuxLaunch(options: {
+	args: readonly string[];
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+	signal?: AbortSignal;
+	onSpawn: (identity: ProcessIdentity) => void | Promise<void>;
+	onRelease: (identity: ProcessIdentity) => void | Promise<void>;
+}): Promise<{ stdout: string; stderr: string }> {
+	return await new Promise((resolveLaunch, rejectLaunch) => {
+		const gatePath = fileURLToPath(
+			new URL("../workers/process-gate.mjs", import.meta.url),
+		);
+		const child = spawn(
+			process.execPath,
+			[gatePath],
+			{
+				cwd: options.cwd,
+				env: processGateEnvironment(process.env),
+				detached: process.platform !== "win32",
+				stdio: ["pipe", "pipe", "pipe"],
+			},
+		);
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		let released = false;
+		let pendingError: Error | undefined;
+		let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+		let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+		let authorizedProcessGroupId: number | undefined;
+		let groupDrain: Promise<boolean> | undefined;
+
+		async function drainLauncherGroup(): Promise<boolean> {
+			const processGroupId = authorizedProcessGroupId;
+			if (processGroupId === undefined) return pendingError === undefined;
+			for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+				if (inspectProcessGroup(processGroupId) === "dead") return true;
+				try {
+					process.kill(-processGroupId, signal);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException)?.code !== "ESRCH")
+						return false;
+				}
+				for (let index = 0; index < 10; index += 1) {
+					const status = inspectProcessGroup(processGroupId);
+					if (status === "dead") return true;
+					if (status === "unknown") return false;
+					await sleep(25);
+				}
+			}
+			return inspectProcessGroup(processGroupId) === "dead";
+		}
+
+		function startGroupDrain(): Promise<boolean> {
+			groupDrain ??= drainLauncherGroup();
+			return groupDrain;
+		}
+
+		function appendLimited(current: string, chunk: unknown): string {
+			return `${current}${String(chunk)}`.slice(-64 * 1024);
+		}
+
+		function finish(result: { ok: true } | { ok: false; error: Error }): void {
+			if (settled) return;
+			settled = true;
+			if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+			if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+			options.signal?.removeEventListener("abort", onAbort);
+			if (result.ok) resolveLaunch({ stdout, stderr });
+			else rejectLaunch(result.error);
+		}
+
+		function signalLauncher(signal: NodeJS.Signals): void {
+			try {
+				if (
+					authorizedProcessGroupId !== undefined &&
+					process.platform !== "win32"
+				)
+					process.kill(-authorizedProcessGroupId, signal);
+				else child.kill(signal);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
+			}
+		}
+
+		function onAbort(): void {
+			stopWithError(
+				Object.assign(new Error("tmux gated launch was aborted"), {
+					failureKind: "abort" as const,
+				}),
+			);
+		}
+
+		function stopWithError(error: Error): void {
+			if (pendingError !== undefined || settled) return;
+			pendingError = error;
+			child.stdin?.destroy();
+			signalLauncher("SIGTERM");
+			forceKillTimer = setTimeout(() => {
+				signalLauncher("SIGKILL");
+			}, TMUX_LAUNCH_KILL_GRACE_MS);
+		}
+
+		child.stdout?.on("data", (chunk) => {
+			stdout = appendLimited(stdout, chunk);
+		});
+		child.stderr?.on("data", (chunk) => {
+			stderr = appendLimited(stderr, chunk);
+		});
+		child.stdin?.on("error", (error) => {
+			if ((error as NodeJS.ErrnoException).code !== "EPIPE")
+				stopWithError(error);
+		});
+		child.once("error", (error) => finish({ ok: false, error }));
+		child.once("exit", () => void startGroupDrain());
+		child.once("close", (code, signal) => {
+			void (async () => {
+				if (!(await startGroupDrain())) {
+					finish({
+						ok: false,
+						error: new TmuxOwnershipError(
+							"tmux gated launcher process group did not drain",
+							{ terminalBlocked: true },
+						),
+					});
+					return;
+				}
+			if (pendingError !== undefined) {
+				finish({ ok: false, error: pendingError });
+				return;
+			}
+			if (signal !== null) {
+				finish({
+					ok: false,
+					error: new TmuxOwnershipError(
+						`tmux gated launcher terminated by ${signal}`,
+					),
+				});
+				return;
+			}
+			if (code === 0) {
+				finish({ ok: true });
+				return;
+			}
+			finish({
+				ok: false,
+				error: new TmuxOwnershipError(
+					released
+						? `tmux launch failed with exit code ${String(code)}: ${stderr.trim() || "no diagnostic"}`
+						: "tmux launch gate closed before ownership was recorded",
+				),
+			});
+			})().catch((error) =>
+				finish({
+					ok: false,
+					error: new TmuxOwnershipError(
+						`tmux gated launcher cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+						{ terminalBlocked: true },
+					),
+				}),
+			);
+		});
+		child.once("spawn", () => {
+			const pid = child.pid;
+			if (pid === undefined) {
+				child.stdin?.destroy();
+				child.kill("SIGKILL");
+				finish({
+					ok: false,
+					error: new TmuxOwnershipError(
+						"tmux gated launcher did not expose a pid",
+					),
+				});
+				return;
+			}
+			timeoutTimer = setTimeout(() => {
+				stopWithError(
+					new TmuxOwnershipError(
+						"tmux gated launch timed out before ownership was verified",
+						{ terminalBlocked: true },
+					),
+				);
+			}, TMUX_LAUNCH_TIMEOUT_MS);
+			void captureProcessIdentity(pid)
+				.then(async (identity) => {
+					if (
+						process.platform !== "win32" &&
+						identity.pid === identity.processGroupId
+					)
+						authorizedProcessGroupId = identity.processGroupId;
+					await options.onSpawn(identity);
+					return identity;
+				})
+				.then(async (identity) => {
+					if (settled || pendingError !== undefined) return;
+					await options.onRelease(identity);
+					if (settled || pendingError !== undefined) return;
+					released = true;
+					child.stdin?.end(
+						`${JSON.stringify({
+							argv: ["tmux", ...options.args],
+							cwd: options.cwd,
+							env: options.env,
+						})}\n`,
+					);
+				})
+				.catch((error) => {
+					stopWithError(
+						error instanceof Error ? error : new Error(String(error)),
+					);
+				});
+		});
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		if (options.signal?.aborted) onAbort();
+	});
 }
 
 async function readWorkerMeta(path: string): Promise<WorkerMeta | undefined> {
@@ -133,7 +348,11 @@ async function readWorkerMeta(path: string): Promise<WorkerMeta | undefined> {
 		) as Partial<WorkerMeta>;
 		if (parsed.status !== "completed" && parsed.status !== "failed")
 			return undefined;
-		if (parsed.failureKind !== null && parsed.failureKind !== undefined && !isFailureKind(parsed.failureKind))
+		if (
+			parsed.failureKind !== null &&
+			parsed.failureKind !== undefined &&
+			!isFailureKind(parsed.failureKind)
+		)
 			return undefined;
 		return {
 			status: parsed.status,
@@ -146,14 +365,15 @@ async function readWorkerMeta(path: string): Promise<WorkerMeta | undefined> {
 	}
 }
 
-async function tmuxSessionAlive(socketPath: string): Promise<boolean> {
-	return await privateTmuxServerAlive({ socketPath });
+async function tmuxSessionAlive(tmux: ResultTmuxMetadata): Promise<boolean> {
+	return await privateTmuxServerAlive(tmux);
 }
 
-async function killTmuxSession(socketPath: string): Promise<void> {
-	if (!(await terminatePrivateTmuxServer({ socketPath })))
+async function killTmuxSession(tmux: ResultTmuxMetadata): Promise<void> {
+	if (!(await terminatePrivateTmuxServer(tmux)))
 		throw new TmuxOwnershipError(
 			"tmux private server remained alive after termination",
+			{ terminalBlocked: true },
 		);
 }
 
@@ -164,7 +384,7 @@ function workerScript(
 	stderrPath: string,
 	metaPath: string,
 ): string {
-	return `import { spawn } from "node:child_process";\nimport { appendFileSync, closeSync, openSync, writeFileSync } from "node:fs";\nconst argv = ${JSON.stringify(argv)};\nconst cwd = ${JSON.stringify(cwd)};\nconst eventPath = ${JSON.stringify(eventPath)};\nconst stderrPath = ${JSON.stringify(stderrPath)};\nconst metaPath = ${JSON.stringify(metaPath)};\nconst messageUpdatePattern = /"type"\\s*:\\s*"message_update"/;\nconst maxStdoutLogLineChars = 64 * 1024 * 1024;\ncloseSync(openSync(eventPath, "w"));\ncloseSync(openSync(stderrPath, "w"));\nlet settled = false;\nlet stdoutBuffer = "";\nlet discardingOversizedLine = false;\nlet omittedMessageUpdates = 0;\nlet omittedMessageUpdateBytes = 0;\nlet omittedOversizedLines = 0;\nlet omittedOversizedBytes = 0;\nfunction writeStdoutLine(line) {\n  if (messageUpdatePattern.test(line)) {\n    omittedMessageUpdates += 1;\n    omittedMessageUpdateBytes += Buffer.byteLength(line, "utf8");\n    return;\n  }\n  appendFileSync(eventPath, line);\n  process.stdout.write(line);\n}\nfunction handleStdoutChunk(chunk) {\n  let text = chunk.toString("utf8");\n  while (text.length > 0) {\n    if (discardingOversizedLine) {\n      const newline = text.indexOf("\\n");\n      omittedOversizedBytes += Buffer.byteLength(newline < 0 ? text : text.slice(0, newline + 1), "utf8");\n      if (newline < 0) return;\n      discardingOversizedLine = false;\n      text = text.slice(newline + 1);\n      continue;\n    }\n    const newline = text.indexOf("\\n");\n    const segment = newline < 0 ? text : text.slice(0, newline + 1);\n    stdoutBuffer += segment;\n    text = newline < 0 ? "" : text.slice(newline + 1);\n    if (stdoutBuffer.length > maxStdoutLogLineChars) {\n      omittedOversizedLines += 1;\n      omittedOversizedBytes += Buffer.byteLength(stdoutBuffer, "utf8");\n      stdoutBuffer = "";\n      discardingOversizedLine = newline < 0;\n      continue;\n    }\n    if (newline >= 0) {\n      writeStdoutLine(stdoutBuffer);\n      stdoutBuffer = "";\n    }\n  }\n}\nfunction finishStdoutFilter() {\n  if (!discardingOversizedLine && stdoutBuffer.length > 0) writeStdoutLine(stdoutBuffer);\n  stdoutBuffer = "";\n  if (omittedMessageUpdates > 0 || omittedOversizedLines > 0) {\n    appendFileSync(eventPath, JSON.stringify({ type: "pi-subagent.stdout_filter", omitted: { messageUpdateEvents: omittedMessageUpdates, messageUpdateBytes: omittedMessageUpdateBytes, oversizedLines: omittedOversizedLines, oversizedBytes: omittedOversizedBytes }, reason: "cumulative message_update snapshots are omitted from durable stdout artifacts; final assistant text is stored in output.log" }) + "\\n");\n  }\n}\nfunction writeMeta(meta) {\n  if (settled) return;\n  settled = true;\n  finishStdoutFilter();\n  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\\n");\n}\nconst env = { ...process.env };\ndelete env.TMUX;\nconst child = spawn(argv[0], argv.slice(1), { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], env });\nchild.stdout?.on("data", handleStdoutChunk);\nchild.stderr?.on("data", (chunk) => { appendFileSync(stderrPath, chunk); process.stderr.write(chunk); });\nchild.on("error", () => { writeMeta({ status: "failed", failureKind: "spawn", exitCode: null, signal: null }); });\nchild.on("close", (exitCode, signal) => {\n  const failureKind = exitCode === 0 ? null : "exit";\n  writeMeta({ status: failureKind === null ? "completed" : "failed", failureKind, exitCode, signal });\n});\n`;
+	return `import { spawn } from "node:child_process";\nimport { appendFileSync, closeSync, openSync, writeFileSync } from "node:fs";\nconst argv = ${JSON.stringify(argv)};\nconst cwd = ${JSON.stringify(cwd)};\nconst eventPath = ${JSON.stringify(eventPath)};\nconst stderrPath = ${JSON.stringify(stderrPath)};\nconst metaPath = ${JSON.stringify(metaPath)};\nconst messageUpdatePattern = /"type"\\s*:\\s*"message_update"/;\nconst maxStdoutLogLineChars = 64 * 1024 * 1024;\ncloseSync(openSync(eventPath, "w"));\ncloseSync(openSync(stderrPath, "w"));\nlet settled = false;\nlet stdoutBuffer = "";\nlet discardingOversizedLine = false;\nlet omittedMessageUpdates = 0;\nlet omittedMessageUpdateBytes = 0;\nlet omittedOversizedLines = 0;\nlet omittedOversizedBytes = 0;\nfunction writeStdoutLine(line) {\n  if (messageUpdatePattern.test(line)) {\n    omittedMessageUpdates += 1;\n    omittedMessageUpdateBytes += Buffer.byteLength(line, "utf8");\n    return;\n  }\n  appendFileSync(eventPath, line);\n  process.stdout.write(line);\n}\nfunction handleStdoutChunk(chunk) {\n  let text = chunk.toString("utf8");\n  while (text.length > 0) {\n    if (discardingOversizedLine) {\n      const newline = text.indexOf("\\n");\n      omittedOversizedBytes += Buffer.byteLength(newline < 0 ? text : text.slice(0, newline + 1), "utf8");\n      if (newline < 0) return;\n      discardingOversizedLine = false;\n      text = text.slice(newline + 1);\n      continue;\n    }\n    const newline = text.indexOf("\\n");\n    const segment = newline < 0 ? text : text.slice(0, newline + 1);\n    stdoutBuffer += segment;\n    text = newline < 0 ? "" : text.slice(newline + 1);\n    if (stdoutBuffer.length > maxStdoutLogLineChars) {\n      omittedOversizedLines += 1;\n      omittedOversizedBytes += Buffer.byteLength(stdoutBuffer, "utf8");\n      stdoutBuffer = "";\n      discardingOversizedLine = newline < 0;\n      continue;\n    }\n    if (newline >= 0) {\n      writeStdoutLine(stdoutBuffer);\n      stdoutBuffer = "";\n    }\n  }\n}\nfunction finishStdoutFilter() {\n  if (!discardingOversizedLine && stdoutBuffer.length > 0) writeStdoutLine(stdoutBuffer);\n  stdoutBuffer = "";\n  if (omittedMessageUpdates > 0 || omittedOversizedLines > 0) {\n    appendFileSync(eventPath, JSON.stringify({ type: "pi-subagent.stdout_filter", omitted: { messageUpdateEvents: omittedMessageUpdates, messageUpdateBytes: omittedMessageUpdateBytes, oversizedLines: omittedOversizedLines, oversizedBytes: omittedOversizedBytes }, reason: "cumulative message_update snapshots are omitted from durable stdout artifacts; final assistant text is stored in output.log" }) + "\\n");\n  }\n}\nfunction writeMeta(meta) {\n  if (settled) return;\n  settled = true;\n  finishStdoutFilter();\n  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\\n");\n}\nconst env = { ...process.env };\ndelete env.TMUX;\ndelete env[${JSON.stringify(TMUX_OWNERSHIP_ENV)}];\nconst child = spawn(argv[0], argv.slice(1), { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], env });\nchild.stdout?.on("data", handleStdoutChunk);\nchild.stderr?.on("data", (chunk) => { appendFileSync(stderrPath, chunk); process.stderr.write(chunk); });\nchild.on("error", () => { writeMeta({ status: "failed", failureKind: "spawn", exitCode: null, signal: null }); });\nchild.on("close", (exitCode, signal) => {\n  const failureKind = exitCode === 0 ? null : "exit";\n  writeMeta({ status: failureKind === null ? "completed" : "failed", failureKind, exitCode, signal });\n});\n`;
 }
 
 async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
@@ -189,54 +409,65 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 		runsDir: options.runsDir,
 	});
 
-	if (!(await tmuxAvailable())) {
-		return {
-			result: null,
-			store,
-			cwd,
-			artifactCwd,
-			startedAt,
-			failure: {
-				status: "failed",
-				failureKind: "spawn",
-				exitCode: null,
-				signal: null,
-			},
-			stderr:
-				'tmux is not available on PATH; install tmux or choose backend "headless".\n',
-		};
-	}
 
 	const sessionName = "run";
 	const eventPath = join(store.taskDir, "pi-events.jsonl");
 	const stderrPath = store.pathFor("stderr");
 	const metaPath = join(store.taskDir, "tmux-worker-meta.json");
 	const scriptPath = join(store.taskDir, "tmux-worker.mjs");
-	const launchPath = join(store.taskDir, "tmux-launch.sh");
+	const paneGatePath = join(store.taskDir, "tmux-pane.gate");
+	const processGatePath = fileURLToPath(
+		new URL("../workers/process-gate.mjs", import.meta.url),
+	);
 
-	const childEnv = { ...process.env };
+	let childEnv = { ...process.env };
 	delete childEnv.TMUX;
 	delete childEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
 	Object.assign(childEnv, options.childEnv ?? {});
+	childEnv = withoutShellStartupAuthority(childEnv);
+	const ownershipToken = randomBytes(32).toString("hex");
+	const ownershipTokenSha256 = tmuxOwnershipTokenDigest(ownershipToken);
 	await writeFile(
 		scriptPath,
 		workerScript(argv, cwd, eventPath, stderrPath, metaPath),
 	);
 
-	await writeFile(
-		launchPath,
-		`#!/usr/bin/env bash\nset -euo pipefail\nunset TMUX\nexec ${shellQuote(process.execPath)} ${shellQuote(scriptPath)}\n`,
-	);
-	await chmod(launchPath, 0o700);
-
 	// Keep the socket name short under TMUX_TMPDIR and Unix socket path limits.
 	const serverName = `ps-${randomBytes(12).toString("hex")}`;
 	const socketPath = privateTmuxSocketPath(serverName, childEnv);
 	await preparePrivateTmuxSocket(socketPath);
+	const tmuxServerEnv: NodeJS.ProcessEnv = {
+		...processGateEnvironment(childEnv),
+		PATH: childEnv.PATH ?? process.env.PATH ?? "/usr/bin:/bin",
+		...(childEnv.TMUX_TMPDIR === undefined
+			? {}
+			: { TMUX_TMPDIR: childEnv.TMUX_TMPDIR }),
+		[TMUX_OWNERSHIP_ENV]: ownershipToken,
+	};
+	const plannedTmuxIdentity: ResultTmuxMetadata = {
+		serverName,
+		socketPath,
+		ownershipTokenSha256,
+		launchState: "planned",
+		launchPid: null,
+		launchProcessGroupId: null,
+		launchProcessBirthIdentity: null,
+		serverPid: null,
+		serverProcessGroupId: null,
+		serverProcessBirthIdentity: null,
+		panePid: null,
+		paneProcessGroupId: null,
+		paneProcessBirthIdentity: null,
+		sessionName,
+		sessionId: null,
+		paneId: null,
+	};
 
 	async function runSession(
-		tmuxCommand: string,
-		tmuxArgs: readonly string[],
+		panePayload: {
+			argv: readonly [string, ...string[]];
+			env: NodeJS.ProcessEnv;
+		},
 		tmuxEnv?: NodeJS.ProcessEnv,
 	): Promise<{
 		result: TmuxRunResult | null;
@@ -247,21 +478,11 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 		failure?: WorkerMeta;
 		stderr?: string;
 	}> {
-		let sessionId: string | null = null;
-		let paneId: string | null = null;
-		let serverStarted = false;
-		const tmuxIdentity = {
-			serverName,
-			socketPath,
-			sessionName,
-			sessionId,
-			paneId,
-		};
+		let tmuxIdentity = plannedTmuxIdentity;
 		await options.onTmuxStart?.(tmuxIdentity);
 		try {
-			const { stdout } = await execFileAsync(
-				"tmux",
-				[
+			const launch = await runGatedTmuxLaunch({
+				args: [
 					"-S",
 					socketPath,
 					"-f",
@@ -272,31 +493,71 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 					sessionName,
 					"-P",
 					"-F",
-					"#{session_id}\t#{pane_id}",
-					tmuxCommand,
-					...tmuxArgs,
+					"#{session_id}|#{pane_id}",
+					process.execPath,
+					processGatePath,
+					"--file",
+					paneGatePath,
 				],
-				{
+				cwd,
+				env: tmuxEnv ?? tmuxServerEnv,
+				signal: options.signal,
+				onSpawn: async (launchIdentity) => {
+					tmuxIdentity = {
+						...plannedTmuxIdentity,
+						launchState: "gated",
+						launchPid: launchIdentity.pid,
+						launchProcessGroupId: launchIdentity.processGroupId,
+						launchProcessBirthIdentity: launchIdentity.birthIdentity,
+					};
+					await options.onTmuxStart?.(tmuxIdentity);
+				},
+				onRelease: async (launchIdentity) => {
+					tmuxIdentity = {
+						...plannedTmuxIdentity,
+						launchState: "launching",
+						launchPid: launchIdentity.pid,
+						launchProcessGroupId: launchIdentity.processGroupId,
+						launchProcessBirthIdentity: launchIdentity.birthIdentity,
+					};
+					await options.onTmuxStart?.(tmuxIdentity);
+				},
+			});
+			const [rawSessionId, rawPaneId] = launch.stdout.trim().split("|");
+			tmuxIdentity = {
+				...plannedTmuxIdentity,
+				launchState: "running",
+				launchPid: null,
+				launchProcessGroupId: null,
+				launchProcessBirthIdentity: null,
+				sessionId: rawSessionId || null,
+				paneId: rawPaneId || null,
+			};
+			tmuxIdentity = {
+				...tmuxIdentity,
+				...(await readPrivateTmuxRuntimeIdentity(tmuxIdentity)),
+			};
+			await options.onTmuxStart?.(tmuxIdentity);
+			await writeFile(
+				paneGatePath,
+				`${JSON.stringify({
+					argv: panePayload.argv,
 					cwd,
-					env: tmuxEnv ?? childEnv,
+					env: panePayload.env,
+				})}\n`,
+				{
+				mode: 0o600,
+				flag: "wx",
 				},
 			);
-			serverStarted = true;
-			const [rawSessionId, rawPaneId] = stdout.trim().split("\t");
-			sessionId = rawSessionId || null;
-			paneId = rawPaneId || null;
-			await options.onTmuxStart?.({
-				...tmuxIdentity,
-				sessionId,
-				paneId,
-			});
 		} catch (error) {
-			if (serverStarted || (await tmuxSessionAlive(socketPath))) {
+			if (await tmuxSessionAlive(tmuxIdentity)) {
 				try {
-					await killTmuxSession(socketPath);
+					await killTmuxSession(tmuxIdentity);
 				} catch (cleanupError) {
 					throw new TmuxOwnershipError(
 						`tmux launch failed and the private server could not be terminated: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+						{ terminalBlocked: true },
 					);
 				}
 			}
@@ -307,8 +568,14 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 				artifactCwd,
 				startedAt,
 				failure: {
-					status: "failed",
-					failureKind: "spawn",
+					status:
+						(error as { failureKind?: unknown })?.failureKind === "abort"
+							? "cancelled"
+							: "failed",
+					failureKind:
+						(error as { failureKind?: unknown })?.failureKind === "abort"
+							? "abort"
+							: "spawn",
 					exitCode: null,
 					signal: null,
 				},
@@ -324,13 +591,13 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 		while (true) {
 			const meta = await readWorkerMeta(metaPath);
 			if (meta !== undefined) {
-				await killTmuxSession(socketPath);
+				await killTmuxSession(tmuxIdentity);
 				return {
 					result: {
 						meta,
 						stderrRef: store.refFor("stderr", await pathBytes(stderrPath)),
 						eventPath,
-						tmux: { serverName, socketPath, sessionName, sessionId, paneId },
+						tmux: tmuxIdentity,
 					},
 					store,
 					cwd,
@@ -343,7 +610,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 			if (deadline !== undefined && Date.now() >= deadline)
 				stopKind = "timeout";
 			if (stopKind !== null) {
-				await killTmuxSession(socketPath);
+				await killTmuxSession(tmuxIdentity);
 				return {
 					result: {
 						meta: {
@@ -354,7 +621,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 						},
 						stderrRef: store.refFor("stderr", await pathBytes(stderrPath)),
 						eventPath,
-						tmux: { serverName, socketPath, sessionName, sessionId, paneId },
+						tmux: tmuxIdentity,
 					},
 					store,
 					cwd,
@@ -363,7 +630,29 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 				};
 			}
 
-			if (!(await tmuxSessionAlive(socketPath))) {
+			if (!(await tmuxSessionAlive(tmuxIdentity))) {
+				for (let index = 0; index < 20; index += 1) {
+					const exitedMeta = await readWorkerMeta(metaPath);
+					if (exitedMeta !== undefined) {
+						await killTmuxSession(tmuxIdentity);
+						return {
+							result: {
+								meta: exitedMeta,
+								stderrRef: store.refFor(
+									"stderr",
+									await pathBytes(stderrPath),
+								),
+								eventPath,
+								tmux: tmuxIdentity,
+							},
+							store,
+							cwd,
+							artifactCwd,
+							startedAt,
+						};
+					}
+					await sleep(10);
+				}
 				return {
 					result: {
 						meta: {
@@ -374,7 +663,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 						},
 						stderrRef: store.refFor("stderr", await pathBytes(stderrPath)),
 						eventPath,
-						tmux: { serverName, socketPath, sessionName, sessionId, paneId },
+						tmux: tmuxIdentity,
 					},
 					store,
 					cwd,
@@ -399,33 +688,45 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 					signal: options.signal,
 				},
 				async (launch) => {
-					await writeFile(
-						launchPath,
-						`#!/usr/bin/env bash\nset -euo pipefail\nunset TMUX\nexec ${launch.argv.map(shellQuote).join(" ")}\n`,
-					);
-					await chmod(launchPath, 0o700);
-					const sandboxEnv = {
+					let sandboxEnv = {
 						...childEnv,
 						...(launch.env ?? {}),
 					};
+					sandboxEnv = withoutShellStartupAuthority(sandboxEnv);
 					delete sandboxEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
 					const explicitBinding =
 						options.childEnv?.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
 					if (explicitBinding !== undefined)
-						sandboxEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = explicitBinding;
-					return await runSession("/bin/bash", [launchPath], sandboxEnv);
+						sandboxEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON =
+							explicitBinding;
+					return await runSession(
+						{
+							argv: launch.argv,
+							env: sandboxEnv,
+						},
+						tmuxServerEnv,
+					);
 				},
 			);
 		}
-		return await runSession("/bin/bash", [launchPath], childEnv);
+		return await runSession(
+			{
+				argv: [process.execPath, scriptPath],
+				env: childEnv,
+			},
+			tmuxServerEnv,
+		);
 	} catch (error) {
 		if (!(error instanceof SandboxUnavailableError)) {
-			if (await tmuxSessionAlive(socketPath)) {
+			if (error instanceof TmuxOwnershipError && error.terminalBlocked === true)
+				throw error;
+			if (await tmuxSessionAlive(plannedTmuxIdentity)) {
 				try {
-					await killTmuxSession(socketPath);
+					await killTmuxSession(plannedTmuxIdentity);
 				} catch (cleanupError) {
 					throw new TmuxOwnershipError(
 						`tmux execution failed and the private server could not be terminated: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+						{ terminalBlocked: true },
 					);
 				}
 			}

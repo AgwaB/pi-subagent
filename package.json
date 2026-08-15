@@ -37,7 +37,7 @@
     "image": "https://raw.githubusercontent.com/AgwaB/pi-subagent/main/assets/subagent-panel.png"
   },
   "scripts": {
-    "check:scripts": "for d in scripts test; do [ -d \"$d\" ] && find \"$d\" -name '*.mjs' -print; done | xargs -n1 node --check",
+    "check:scripts": "for d in scripts test src/workers; do [ -d \"$d\" ] && find \"$d\" -name '*.mjs' -print; done | xargs -n1 node --check",
     "check:resolver": "node ./test/checks/resolver.mjs",
     "check:api": "node ./test/checks/api.mjs",
     "check:artifacts": "node ./test/checks/artifacts.mjs",
@@ -54,6 +54,8 @@
     "check:schema-sync": "node ./test/checks/schema-sync.mjs",
     "check:run-lock": "node ./test/checks/run-lock.mjs",
     "check:reconcile": "node ./test/checks/reconcile.mjs",
+    "check:tmux-ownership": "node ./test/checks/tmux-ownership.mjs",
+    "check:inline-sdk-compat": "node ./test/checks/inline-sdk-compat.mjs",
     "check:headless-streaming": "node ./test/checks/headless-streaming.mjs",
     "check:usage-accumulation": "node ./test/checks/usage-accumulation.mjs",
     "check:tool-result-budget": "node ./test/checks/tool-result-budget.mjs",
@@ -68,16 +70,19 @@
     "release:check": "node ./scripts/release-check.mjs",
     "check": "npm run check:static",
     "check:types": "tsc -p tsconfig.json",
-    "check:static": "npm run check:types && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:parent-session && npm run check:panel-session-scope && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:lifecycle && npm run check:fail-fast && npm run check:schema-sync && npm run check:run-lock && npm run check:reconcile && npm run check:headless-streaming && npm run check:usage-accumulation && npm run check:tool-result-budget && npm run check:durable-launch-barrier && npm run check:durable-worker-binding && npm run check:durable-worker-preflight",
+    "check:static": "npm run check:types && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:parent-session && npm run check:panel-session-scope && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:lifecycle && npm run check:fail-fast && npm run check:schema-sync && npm run check:run-lock && npm run check:reconcile && npm run check:tmux-ownership && npm run check:inline-sdk-compat && npm run check:headless-streaming && npm run check:usage-accumulation && npm run check:tool-result-budget && npm run check:durable-launch-barrier && npm run check:durable-worker-binding && npm run check:durable-worker-preflight",
     "check:integration": "npm run check:model:inline && npm run check:model:headless && npm run check:model:tmux"
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.54",
     "jiti": "^2.7.0",
+    "proper-lockfile": "^4.1.2",
     "typebox": "^1.2.3"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "0.79.1",
+    "@earendil-works/pi-coding-agent": "0.79.1",
+    "@earendil-works/pi-tui": "0.79.1",
     "@types/node": "^24.0.0",
     "typescript": "^5.7.0"
   },

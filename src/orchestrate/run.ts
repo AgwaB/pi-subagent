@@ -3,14 +3,17 @@ import { loadAgentByName, type AgentDefinition } from "../agents.ts";
 import {
 	appendRunEvent,
 	beginRunRecord,
+	commitAttemptResultIfActive,
 	createAttemptArtifactStore,
 	createAttemptId,
 	createRunId,
-	finishAttemptFromResult,
+	readRunRecord,
 	updateAttemptProcess,
 	upsertRunAttempt,
 	type ProcessMetadata,
 	type ResultEnvelope,
+	type ResultTmuxMetadata,
+	type RunRef,
 } from "../artifacts/index.ts";
 import {
 	isFailureKind,
@@ -31,6 +34,7 @@ import {
 	type ResolvedWorkspace,
 } from "../workspace/worktree.ts";
 import { writeRunLocator } from "./run-ref.ts";
+import { cleanupInactiveAttemptOwnership } from "./reconcile.ts";
 
 export const DEFAULT_PARALLEL_CONCURRENCY = 4;
 export const MAX_PARALLEL_TASKS = 12;
@@ -43,6 +47,8 @@ export interface RunSubagentTaskOptions {
 	durableWorkerBinding?: string;
 	/** Preflight marker used to reject inline before a durable barrier emits READY. */
 	requiresDurableWorkerBinding?: boolean;
+	/** Internal durable-worker continuation of the already-created active attempt. */
+	resumeExistingAttempt?: boolean;
 	signal?: AbortSignal;
 	runId?: string;
 	attemptId?: string;
@@ -69,6 +75,18 @@ export interface PreparedSubagentExecution {
 
 export interface MultiRunOptions {
 	correlationId?: string;
+}
+
+export async function commitOwnedTerminalResult(
+	ref: RunRef,
+	result: ResultEnvelope,
+): Promise<Awaited<ReturnType<typeof commitAttemptResultIfActive>>> {
+	if (!(await cleanupInactiveAttemptOwnership(ref, result.attemptId)))
+		throw Object.assign(
+			new Error("inactive attempt ownership could not be drained"),
+			{ failureKind: "internal" as const, terminalBlocked: true as const },
+		);
+	return await commitAttemptResultIfActive(ref, result);
 }
 
 export interface ParallelRunResult {
@@ -158,6 +176,56 @@ function failureKindFromError(error: unknown): FailureKind {
 	return isFailureKind(candidate) ? candidate : "internal";
 }
 
+function terminalCommitBlocked(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"terminalBlocked" in error &&
+		(error as { terminalBlocked?: unknown }).terminalBlocked === true
+	);
+}
+
+function tmuxMetadataMatches(
+	persisted: ResultTmuxMetadata | undefined,
+	expected: ResultTmuxMetadata,
+): boolean {
+	return (
+		persisted?.serverName === expected.serverName &&
+		persisted.socketPath === expected.socketPath &&
+		persisted.ownershipTokenSha256 === expected.ownershipTokenSha256 &&
+		persisted.launchState === expected.launchState &&
+		persisted.launchPid === expected.launchPid &&
+		persisted.launchProcessGroupId === expected.launchProcessGroupId &&
+		persisted.launchProcessBirthIdentity ===
+			expected.launchProcessBirthIdentity &&
+		persisted.serverPid === expected.serverPid &&
+		persisted.serverProcessGroupId === expected.serverProcessGroupId &&
+		persisted.serverProcessBirthIdentity === expected.serverProcessBirthIdentity &&
+		persisted.panePid === expected.panePid &&
+		persisted.paneProcessGroupId === expected.paneProcessGroupId &&
+		persisted.paneProcessBirthIdentity === expected.paneProcessBirthIdentity &&
+		persisted.sessionName === expected.sessionName &&
+		persisted.sessionId === expected.sessionId &&
+		persisted.paneId === expected.paneId
+	);
+}
+
+function processMetadataMatches(
+	persisted: ProcessMetadata | undefined,
+	expected: ProcessMetadata,
+): boolean {
+	return (
+		persisted !== undefined &&
+		persisted.pid === expected.pid &&
+		persisted.processGroupId === expected.processGroupId &&
+		persisted.processBirthIdentity === expected.processBirthIdentity &&
+		persisted.command === expected.command &&
+		persisted.workerPid === expected.workerPid &&
+		persisted.workerProcessGroupId === expected.workerProcessGroupId &&
+		persisted.workerProcessBirthIdentity === expected.workerProcessBirthIdentity
+	);
+}
+
 async function writeParallelErrorResult(options: {
 	taskInput: ResolveInput;
 	cwd: string;
@@ -165,6 +233,7 @@ async function writeParallelErrorResult(options: {
 	attemptId: string;
 	error: unknown;
 	cancelled: boolean;
+	cancelFailureKind?: "abort" | "cancelled";
 }): Promise<ResultEnvelope> {
 	const message =
 		options.error instanceof Error
@@ -221,7 +290,7 @@ async function writeParallelErrorResult(options: {
 		backend,
 		status: options.cancelled ? "cancelled" : "failed",
 		failureKind: options.cancelled
-			? "cancelled"
+			? (options.cancelFailureKind ?? "cancelled")
 			: failureKindFromError(options.error),
 		cwd: options.cwd,
 		startedAt,
@@ -234,7 +303,10 @@ async function writeParallelErrorResult(options: {
 		correlationId: options.taskInput.correlationId,
 		metadata: { contextLengthExceeded: false },
 	});
-	await finishAttemptFromResult(runRef, result).catch(() => undefined);
+	const committed = await commitOwnedTerminalResult(runRef, result).catch(
+		() => ({ committed: false as const, record: null }),
+	);
+	if (!committed.committed) return result;
 	await appendRunEvent(runRef, {
 		type: options.cancelled ? "attempt.cancelled" : "attempt.failed",
 		attemptId: options.attemptId,
@@ -289,7 +361,33 @@ export async function prepareSubagentExecution(
 	});
 	const workspaceResult = workspaceMeta(workspace);
 	try {
-		await upsertRunAttempt({
+		const existingRecord = await readRunRecord({
+			cwd: baseCwd,
+			runId,
+			runsDir: input.runsDir,
+		});
+		const existingAttempt = existingRecord?.attempts.find(
+			(attempt) => attempt.attemptId === attemptId,
+		);
+		if (
+			options.resumeExistingAttempt === true &&
+			(existingAttempt === undefined ||
+				existingRecord?.activeAttemptId !== attemptId ||
+				existingAttempt.process?.workerPid !== process.pid ||
+				(existingAttempt.status !== "pending" &&
+					existingAttempt.status !== "running"))
+		)
+			throw new Error(
+				`attempt id ${attemptId} cannot be resumed by this worker`,
+			);
+		if (
+			options.resumeExistingAttempt !== true &&
+			existingAttempt !== undefined
+		)
+				throw new Error(
+					`attempt id ${attemptId} is already present in run ${runId}`,
+				);
+		const reservation = await upsertRunAttempt({
 			cwd: baseCwd,
 			runId,
 			runsDir: input.runsDir,
@@ -303,7 +401,23 @@ export async function prepareSubagentExecution(
 					workspace.mode === "worktree" ? "prepared" : "not-needed",
 			},
 			activate: true,
+			createOnly: options.resumeExistingAttempt !== true,
+			mustExist: options.resumeExistingAttempt === true,
+			requireNoActive: options.resumeExistingAttempt !== true,
+			onlyIfActive: options.resumeExistingAttempt === true,
 		});
+		const reservedAttempt = reservation.attempts.find(
+			(attempt) => attempt.attemptId === attemptId,
+		);
+		if (
+			reservation.activeAttemptId !== attemptId ||
+			reservedAttempt === undefined ||
+			(reservedAttempt.status !== "pending" &&
+				reservedAttempt.status !== "running")
+		)
+			throw new Error(
+				`attempt id ${attemptId} lost active ownership before preparation completed`,
+			);
 	} catch (error) {
 		await discardPreparedWorkspace(workspace).catch(() => undefined);
 		throw error;
@@ -337,21 +451,95 @@ export async function discardSubagentExecution(
 		runId: prepared.runId,
 		runsDir: prepared.input.runsDir,
 		attemptId: prepared.attemptId,
-		status: "pending",
+		status: "cancelled",
 		backend: prepared.backend,
-		failureKind: null,
+		failureKind: "user_cancelled",
+		completedAt: new Date(),
 		workspace: {
 			...prepared.workspaceResult,
 			worktreeCleanupStatus:
 				prepared.workspace.mode === "worktree" ? "removed" : "not-needed",
 		},
-		activate: true,
+		activate: false,
+		mustExist: true,
+		onlyIfActive: true,
 	}).catch(() => undefined);
+}
+
+async function writeOwnedExecutionFailure(
+	prepared: PreparedSubagentExecution,
+	error: unknown,
+): Promise<ResultEnvelope> {
+	const { input, backend, runId, attemptId, baseCwd, workspace } = prepared;
+	const runRef = { cwd: baseCwd, runId, runsDir: input.runsDir };
+	const existing = await readRunRecord(runRef);
+	const existingAttempt = existing?.attempts.find(
+		(attempt) => attempt.attemptId === attemptId,
+	);
+	const startedAt = existingAttempt?.startedAt ?? new Date().toISOString();
+	const completedAt = new Date();
+	const message = error instanceof Error ? error.message : String(error);
+	const failureKind = failureKindFromError(error);
+	const status =
+		failureKind === "abort" ||
+		failureKind === "cancelled" ||
+		failureKind === "user_cancelled"
+			? "cancelled"
+			: "failed";
+
+	await retainOwnedWorkspace(workspace);
+	const store = await createAttemptArtifactStore({
+		...runRef,
+		attemptId,
+	});
+	const stderr = await store.writeTextArtifact("stderr", `${message}\n`);
+	const output = await store.writeTextArtifact("output", "");
+	const cleanupStatus = workspace.mode === "worktree" ? "kept" : "not-needed";
+	const result = await store.writeResult({
+		backend,
+		status,
+		failureKind,
+		cwd: baseCwd,
+		startedAt,
+		completedAt,
+		workspace: {
+			...prepared.workspaceResult,
+			worktreeCleanupStatus: cleanupStatus,
+		},
+		sandbox: { enabled: Boolean(input.sandbox) },
+		exitCode: null,
+		signal: status === "cancelled" ? "SIGTERM" : null,
+		artifacts: [stderr, output],
+		...(existingAttempt?.tmux === undefined
+			? {}
+			: { tmux: existingAttempt.tmux }),
+		correlationId: input.correlationId,
+		metadata: { contextLengthExceeded: false },
+	});
+	prepared.ownership.state = "finalized";
+	prepared.ownership.cleanupStatus = cleanupStatus;
+	const committed = await commitOwnedTerminalResult(runRef, result);
+	if (!committed.committed) return result;
+	await appendRunEvent(runRef, {
+		type: status === "cancelled" ? "attempt.cancelled" : "attempt.failed",
+		attemptId,
+		status,
+		message,
+		data: { failureKind },
+	}).catch(() => undefined);
+	await appendRunEvent(runRef, {
+		type: status === "cancelled" ? "run.cancelled" : "run.failed",
+		status,
+		message: `run ${status}`,
+	}).catch(() => undefined);
+	return result;
 }
 
 export async function runPreparedSubagentExecution(
 	prepared: PreparedSubagentExecution,
-	options: Pick<RunSubagentTaskOptions, "signal"> = {},
+	options: Pick<RunSubagentTaskOptions, "signal"> & {
+		deferTerminalCommit?: boolean;
+	} = {},
 ): Promise<ResultEnvelope> {
 	const {
 		input,
@@ -377,25 +565,9 @@ export async function runPreparedSubagentExecution(
 		dependency: input.asyncDependency ?? null,
 		correlationId: input.correlationId,
 		parentSessionId: input.parentSessionId,
-		activeAttemptId: attemptId,
-		attempts: [
-			{
-				attemptId,
-				status: "running",
-				backend,
-				startedAt: startedAt.toISOString(),
-				workspace: {
-					...workspaceResult,
-					worktreeCleanupStatus:
-						workspace.mode === "worktree"
-							? "execution-owned"
-							: "not-needed",
-				},
-			},
-		],
+		attempts: [],
 	});
-	prepared.ownership.state = "execution-owned";
-	await upsertRunAttempt({
+	const runningRecord = await upsertRunAttempt({
 		...runRef,
 		attemptId,
 		status: "running",
@@ -408,8 +580,20 @@ export async function runPreparedSubagentExecution(
 			worktreeCleanupStatus:
 				workspace.mode === "worktree" ? "execution-owned" : "not-needed",
 		},
-		activate: true,
+		activate: false,
+		onlyIfActive: true,
 	});
+	const runningAttempt = runningRecord.attempts.find(
+		(attempt) => attempt.attemptId === attemptId,
+	);
+	if (
+		runningRecord.activeAttemptId !== attemptId ||
+		runningAttempt?.status !== "running"
+	)
+		throw new Error(
+			`attempt id ${attemptId} lost active ownership before execution`,
+		);
+	prepared.ownership.state = "execution-owned";
 	await writeRunLocator({
 		...runRef,
 		parentSessionId: input.parentSessionId,
@@ -419,21 +603,6 @@ export async function runPreparedSubagentExecution(
 	try {
 		const cwd = workspace.cwd;
 
-		await upsertRunAttempt({
-			...runRef,
-			attemptId,
-			status: "running",
-			backend,
-			failureKind: null,
-			startedAt,
-			completedAt: null,
-			workspace: {
-				...workspaceResult,
-				worktreeCleanupStatus:
-					workspace.mode === "worktree" ? "execution-owned" : "not-needed",
-			},
-			activate: true,
-		});
 		await appendRunEvent(
 			{ ...runRef },
 			{
@@ -445,25 +614,50 @@ export async function runPreparedSubagentExecution(
 		);
 
 		const onProcessStart = async (process: ProcessMetadata) => {
-			await updateAttemptProcess({ ...runRef, attemptId, process });
+			const beforeUpdate = await readRunRecord(runRef);
+			const existingProcess = beforeUpdate?.attempts.find(
+				(attempt) => attempt.attemptId === attemptId,
+			)?.process;
+			const ownedProcess: ProcessMetadata = {
+				...process,
+				...(existingProcess?.workerPid === undefined
+					? {}
+					: {
+							workerPid: existingProcess.workerPid,
+							workerProcessGroupId: existingProcess.workerProcessGroupId,
+							workerProcessBirthIdentity:
+								existingProcess.workerProcessBirthIdentity,
+						}),
+			};
+			await updateAttemptProcess({
+				...runRef,
+				attemptId,
+				process: ownedProcess,
+			});
+			const updated = await readRunRecord(runRef);
+			const persisted = updated?.attempts.find(
+				(attempt) => attempt.attemptId === attemptId,
+			);
+			if (
+				updated?.activeAttemptId !== attemptId ||
+				persisted?.status !== "running" ||
+				!processMetadataMatches(persisted.process, ownedProcess)
+			)
+				throw new Error(
+					"process ownership metadata was not committed to the active attempt",
+				);
 			await appendRunEvent(
 				{ ...runRef },
 				{
 					type: "attempt.process_started",
 					attemptId,
 					status: "running",
-					data: { ...process },
+					data: { ...ownedProcess },
 				},
 			);
 		};
-		const onTmuxStart = async (tmux: {
-			serverName: string;
-			socketPath: string;
-			sessionName: string;
-			sessionId: string | null;
-			paneId: string | null;
-		}) => {
-			await upsertRunAttempt({
+		const onTmuxStart = async (tmux: ResultTmuxMetadata) => {
+			const updated = await upsertRunAttempt({
 				...runRef,
 				attemptId,
 				status: "running",
@@ -472,12 +666,21 @@ export async function runPreparedSubagentExecution(
 				workspace: {
 					...workspaceResult,
 					worktreeCleanupStatus:
-						workspace.mode === "worktree"
-							? "execution-owned"
-							: "not-needed",
+						workspace.mode === "worktree" ? "execution-owned" : "not-needed",
 				},
 				onlyIfActive: true,
 			});
+			const persisted = updated.attempts.find(
+				(attempt) => attempt.attemptId === attemptId,
+			);
+			if (
+				updated.activeAttemptId !== attemptId ||
+				persisted?.status !== "running" ||
+				!tmuxMetadataMatches(persisted.tmux, tmux)
+			)
+				throw new Error(
+					"tmux ownership metadata was not committed to the active attempt",
+				);
 		};
 
 		const childEnv = { ...process.env };
@@ -538,7 +741,9 @@ export async function runPreparedSubagentExecution(
 					? "kept"
 					: "not-needed";
 
-		await finishAttemptFromResult(runRef, result);
+		if (options.deferTerminalCommit === true) return result;
+		const committed = await commitOwnedTerminalResult(runRef, result);
+		if (!committed.committed) return result;
 		await appendRunEvent(
 			{ ...runRef },
 			{
@@ -574,8 +779,8 @@ export async function runPreparedSubagentExecution(
 		return result;
 	} catch (error) {
 		await retainOwnedWorkspace(workspace).catch(() => undefined);
-		// Durable workers commit their fallback result before the terminal run
-		// transition. Synchronous callers receive the thrown error directly.
+		// The owning entry point commits the fallback result after this method
+		// releases model/workspace control.
 		throw error;
 	}
 }
@@ -585,8 +790,13 @@ export async function runSubagentTask(
 ): Promise<ResultEnvelope> {
 	const prepared = await prepareSubagentExecution(options);
 	try {
-		return await runPreparedSubagentExecution(prepared, { signal: options.signal });
+		return await runPreparedSubagentExecution(prepared, {
+			signal: options.signal,
+		});
 	} catch (error) {
+		if (terminalCommitBlocked(error)) throw error;
+		if (prepared.ownership.state === "execution-owned")
+			return await writeOwnedExecutionFailure(prepared, error);
 		await discardSubagentExecution(prepared).catch(() => undefined);
 		throw error;
 	}
@@ -645,6 +855,9 @@ export async function runParallelSubagentTasks(
 		parentAbortTriggered = true;
 		controller?.abort();
 	}
+	function parentIsAborted(): boolean {
+		return parentAbortTriggered || signal?.aborted === true;
+	}
 	if (signal !== undefined) {
 		if (signal.aborted) onParentAbort();
 		else signal.addEventListener("abort", onParentAbort, { once: true });
@@ -660,6 +873,23 @@ export async function runParallelSubagentTasks(
 			const taskInput = mergeTaskInput(input, tasks[index]!);
 			const runId = createRunId();
 			const attemptId = createAttemptId();
+			if (parentIsAborted()) {
+				stopScheduling = true;
+				const abortError = Object.assign(
+					new Error("parallel execution was aborted before task start"),
+					{ failureKind: "abort" as const },
+				);
+				resultSlots[index] = await writeParallelErrorResult({
+					taskInput,
+					cwd: runCwd,
+					runId,
+					attemptId,
+					error: abortError,
+					cancelled: true,
+					cancelFailureKind: "abort",
+				});
+				return;
+			}
 			try {
 				const result = await runSubagentTask({
 					input: taskInput,
@@ -671,12 +901,12 @@ export async function runParallelSubagentTasks(
 				});
 				resultSlots[index] = result;
 				const parentCancelled =
-					(parentAbortTriggered || signal?.aborted === true) &&
+					parentIsAborted() &&
 					(result.status === "cancelled" || result.failureKind === "abort");
 				if (result.status !== "completed" && !parentCancelled)
 					triggerFailFast();
 			} catch (error) {
-				if (parentAbortTriggered || signal?.aborted === true) throw error;
+				if (parentIsAborted()) throw error;
 				const siblingAbort =
 					controller?.signal.aborted === true &&
 					siblingCancelTriggered &&

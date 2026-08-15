@@ -49,6 +49,8 @@ export class SandboxUnavailableError extends Error {
 }
 
 let sandboxQueue: Promise<void> = Promise.resolve();
+let sandboxPoisonedError: Error | undefined;
+const SANDBOX_RESET_TIMEOUT_MS = 5_000;
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
@@ -106,6 +108,7 @@ export async function withSandboxedArgv<T>(
   run: (launch: SandboxLaunch) => Promise<T>,
 ): Promise<T> {
   return await acquireSandboxLock(async () => {
+    if (sandboxPoisonedError !== undefined) throw sandboxPoisonedError;
     const srt = await importSandboxRuntime();
 
     if (!srt.SandboxManager.isSupportedPlatform()) {
@@ -120,24 +123,87 @@ export async function withSandboxedArgv<T>(
     const config = defaultConfig(options.sandbox, options.cwd, options.writablePaths ?? [], options.allowPty ?? false);
     validateConfig(srt, config);
 
+    let result!: T;
+    let primaryFailed = false;
+    let primaryError: unknown;
+    let cleanupError: unknown;
     try {
-      await srt.SandboxManager.initialize(config);
-      const wrapped = await srt.SandboxManager.wrapWithSandboxArgv(commandFromArgv(argv), undefined, undefined, options.signal);
-      if (!Array.isArray(wrapped.argv) || wrapped.argv.length === 0 || wrapped.argv.some((entry) => typeof entry !== "string" || entry.length === 0)) {
-        throw new SandboxUnavailableError("sandbox runtime returned an invalid argv wrapper");
+      let launch: SandboxLaunch;
+      try {
+        await srt.SandboxManager.initialize(config);
+        const wrapped = await srt.SandboxManager.wrapWithSandboxArgv(commandFromArgv(argv), undefined, undefined, options.signal);
+        if (!Array.isArray(wrapped.argv) || wrapped.argv.length === 0 || wrapped.argv.some((entry) => typeof entry !== "string" || entry.length === 0)) {
+          throw new SandboxUnavailableError("sandbox runtime returned an invalid argv wrapper");
+        }
+        launch = { argv: wrapped.argv as [string, ...string[]], env: wrapped.env };
+      } catch (error) {
+        primaryFailed = true;
+        if (options.signal?.aborted) {
+          primaryError = Object.assign(
+            error instanceof Error ? error : new Error(String(error)),
+            { failureKind: "abort" as const },
+          );
+        } else if (error instanceof SandboxUnavailableError) {
+          primaryError = error;
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          primaryError = new SandboxUnavailableError(`sandbox setup failed: ${message}`);
+        }
       }
-      return await run({ argv: wrapped.argv as [string, ...string[]], env: wrapped.env });
-    } catch (error) {
-      if (error instanceof SandboxUnavailableError) throw error;
-      const message = error instanceof Error ? error.message : String(error);
-      throw new SandboxUnavailableError(`sandbox setup or execution failed: ${message}`);
+
+      if (!primaryFailed) {
+        try {
+          result = await run(launch!);
+        } catch (error) {
+          primaryFailed = true;
+          primaryError = error;
+        }
+      }
     } finally {
       try {
         srt.SandboxManager.cleanupAfterCommand();
       } catch {
         // Best-effort cleanup; reset below is the fail-closed cleanup path.
       }
-      await srt.SandboxManager.reset();
+      try {
+        await Promise.race([
+          srt.SandboxManager.reset(),
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error("sandbox reset timed out")),
+              SANDBOX_RESET_TIMEOUT_MS,
+            ),
+          ),
+        ]);
+      } catch (error) {
+        cleanupError = error;
+        sandboxPoisonedError = Object.assign(
+          new Error(
+            `sandbox cleanup is unresolved: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+          { failureKind: "internal" as const, terminalBlocked: true as const },
+        );
+      }
     }
+    if (cleanupError !== undefined) {
+      const cleanupMessage =
+        cleanupError instanceof Error
+          ? cleanupError.message
+          : String(cleanupError);
+      if (primaryFailed) {
+        throw Object.assign(
+          new AggregateError(
+            [primaryError, cleanupError],
+            `sandbox execution and cleanup failed: ${cleanupMessage}`,
+          ),
+          { failureKind: "internal" as const, terminalBlocked: true as const },
+        );
+      }
+      throw sandboxPoisonedError;
+    }
+    if (primaryFailed) throw primaryError;
+    return result;
   });
 }

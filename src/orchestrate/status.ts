@@ -558,8 +558,8 @@ function selectedAttempt(
 	const requested =
 		ref.attemptId ??
 		ref.taskId ??
-		record.latestAttemptId ??
 		record.activeAttemptId ??
+		record.latestAttemptId ??
 		undefined;
 	return requested === undefined
 		? record.attempts.at(-1)

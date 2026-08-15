@@ -7,6 +7,10 @@ import {
 } from "../artifacts/index.ts";
 import { resolveRunRef } from "./run-ref.ts";
 import { isTerminalStatus } from "./status.ts";
+import {
+	type ProcessIdentity,
+	verifyProcessIdentity,
+} from "../process-identity.ts";
 
 export interface InterruptRunOptions {
 	cwd?: string;
@@ -38,27 +42,67 @@ export interface InterruptRunResult {
 	record: RunRecord | null;
 }
 
-function sendProcessSignal(
+interface VerifiedInterruptTarget {
+	identity: ProcessIdentity;
+	target: number;
+}
+
+function interruptIdentities(attempt: RunAttemptRecord): ProcessIdentity[] {
+	const identities: ProcessIdentity[] = [];
+	if (
+		attempt.process?.pid !== undefined &&
+		attempt.process.processGroupId !== undefined &&
+		attempt.process.processBirthIdentity !== undefined
+	)
+		identities.push({
+			pid: attempt.process.pid,
+			processGroupId: attempt.process.processGroupId,
+			birthIdentity: attempt.process.processBirthIdentity,
+		});
+	if (
+		attempt.process?.workerPid !== undefined &&
+		attempt.process.workerProcessGroupId !== undefined &&
+		attempt.process.workerProcessBirthIdentity !== undefined
+	)
+		identities.push({
+			pid: attempt.process.workerPid,
+			processGroupId: attempt.process.workerProcessGroupId,
+			birthIdentity: attempt.process.workerProcessBirthIdentity,
+		});
+	return identities;
+}
+
+async function verifyInterruptTargets(
 	attempt: RunAttemptRecord,
-	signal: NodeJS.Signals,
-): boolean {
-	const pid = attempt.process?.pid;
-	if (pid === undefined) return false;
-	try {
+): Promise<VerifiedInterruptTarget[]> {
+	const targets = new Map<number, VerifiedInterruptTarget>();
+	for (const identity of interruptIdentities(attempt)) {
+		if ((await verifyProcessIdentity(identity)) !== "alive") continue;
 		const target =
-			process.platform === "win32"
-				? pid
-				: -(attempt.process?.processGroupId ?? pid);
-		process.kill(target, signal);
-		return true;
-	} catch {
+			process.platform === "win32" ||
+			identity.processGroupId !== identity.pid
+				? identity.pid
+				: -identity.processGroupId;
+		targets.set(target, { identity, target });
+	}
+	return [...targets.values()];
+}
+
+async function signalVerifiedTargets(
+	targets: readonly VerifiedInterruptTarget[],
+	signal: NodeJS.Signals,
+): Promise<boolean> {
+	let signalled = false;
+	for (const { identity, target } of targets) {
+		if ((await verifyProcessIdentity(identity)) !== "alive") continue;
 		try {
-			process.kill(pid, signal);
-			return true;
-		} catch {
-			return false;
+			process.kill(target, signal);
+			signalled = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
 		}
 	}
+	return signalled;
 }
 
 function runningAttempts(
@@ -75,6 +119,7 @@ function runningAttempts(
 async function escalate(
 	options: InterruptRunOptions,
 	signal: NodeJS.Signals,
+	verifiedTargets: ReadonlyMap<string, readonly VerifiedInterruptTarget[]>,
 ): Promise<void> {
 	const ref = await resolveRunRef(options);
 	const record = await readRunRecord(ref).catch(() => null);
@@ -83,7 +128,10 @@ async function escalate(
 		record,
 		options.attemptId ?? options.taskId,
 	))
-		sendProcessSignal(attempt, signal);
+		await signalVerifiedTargets(
+			verifiedTargets.get(attempt.attemptId) ?? [],
+			signal,
+		);
 	await appendRunEvent(ref, {
 		type: "run.interrupt_requested",
 		status: record.status,
@@ -131,8 +179,11 @@ export async function interruptRun(
 	);
 	const interruptedAttempts: string[] = [];
 	const unsupportedAttempts: string[] = [];
+	const verifiedTargets = new Map<string, VerifiedInterruptTarget[]>();
 	for (const attempt of candidates) {
-		if (sendProcessSignal(attempt, signal))
+		const targets = await verifyInterruptTargets(attempt);
+		verifiedTargets.set(attempt.attemptId, targets);
+		if (await signalVerifiedTargets(targets, signal))
 			interruptedAttempts.push(attempt.attemptId);
 		else unsupportedAttempts.push(attempt.attemptId);
 	}
@@ -173,8 +224,14 @@ export async function interruptRun(
 
 	const termDelay = options.escalateAfterMs ?? 1_000;
 	const killDelay = options.killAfterMs ?? 3_000;
-	setTimeout(() => void escalate(ref, "SIGTERM"), termDelay).unref?.();
-	setTimeout(() => void escalate(ref, "SIGKILL"), killDelay).unref?.();
+	setTimeout(
+		() => void escalate(ref, "SIGTERM", verifiedTargets),
+		termDelay,
+	).unref?.();
+	setTimeout(
+		() => void escalate(ref, "SIGKILL", verifiedTargets),
+		killDelay,
+	).unref?.();
 
 	return result(
 		"interrupt-requested",

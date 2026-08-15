@@ -5,6 +5,7 @@ import {
 	commitAttemptResultIfActive,
 	createAttemptArtifactStore,
 	readRunRecord,
+	RESULT_SCHEMA_VERSION,
 	type ResultEnvelope,
 	type RunAttemptRecord,
 	type RunRef,
@@ -12,6 +13,11 @@ import {
 } from "../artifacts/index.ts";
 import { resolveRunRef } from "./run-ref.ts";
 import { terminatePrivateTmuxServer } from "../runners/tmux-control.ts";
+import {
+	inspectProcessGroup,
+	type ProcessIdentity,
+	verifyProcessIdentity,
+} from "../process-identity.ts";
 import { isTerminalStatus } from "./status.ts";
 
 export interface ReconcileSubagentRunOptions extends RunRef {
@@ -30,6 +36,22 @@ export interface ReconcileSubagentRunResult {
 	record: RunRecord | null;
 }
 
+export async function cleanupInactiveAttemptOwnership(
+	options: ReconcileSubagentRunOptions,
+	activeAttemptId: string,
+): Promise<boolean> {
+	const ref = await resolveRunRef(options);
+	const record = await readRunRecord(ref);
+	if (record === null || record.activeAttemptId !== activeAttemptId) return false;
+	let safe = true;
+	for (const attempt of record.attempts) {
+		if (attempt.attemptId === activeAttemptId) continue;
+		safe = (await terminateAttemptOwnership(attempt)) && safe;
+	}
+	const current = await readRunRecord(ref);
+	return safe && current?.activeAttemptId === activeAttemptId;
+}
+
 function safeArtifactPath(attempt: RunAttemptRecord): string | null {
 	if (attempt.resultPath === undefined || attempt.artifactCwd === undefined)
 		return null;
@@ -43,28 +65,206 @@ function safeArtifactPath(attempt: RunAttemptRecord): string | null {
 
 async function readAttemptResult(
 	attempt: RunAttemptRecord,
+	runId: string,
 ): Promise<ResultEnvelope | null> {
 	const path = safeArtifactPath(attempt);
 	if (path === null) return null;
 	try {
-		return JSON.parse(await readFile(path, "utf8")) as ResultEnvelope;
+		const result = JSON.parse(await readFile(path, "utf8")) as Partial<ResultEnvelope>;
+		if (
+			result.schemaVersion !== RESULT_SCHEMA_VERSION ||
+			result.runId !== runId ||
+			result.attemptId !== attempt.attemptId ||
+			typeof result.cwd !== "string" ||
+			typeof result.backend !== "string" ||
+			typeof result.status !== "string" ||
+			typeof result.startedAt !== "string"
+		)
+			return null;
+		return result as ResultEnvelope;
 	} catch {
 		return null;
 	}
 }
 
-function pidAlive(pid: number | undefined): boolean {
-	if (pid === undefined) return false;
+function processErrorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error
+		? String((error as { code?: unknown }).code)
+		: undefined;
+}
+
+interface OwnedProcessIdentitySet {
+	identities: ProcessIdentity[];
+	incomplete: boolean;
+}
+
+function ownedProcessIdentities(
+	attempt: RunAttemptRecord,
+): OwnedProcessIdentitySet {
+	const candidates = [
+		{
+			pid: attempt.process?.workerPid,
+			processGroupId: attempt.process?.workerProcessGroupId,
+			birthIdentity: attempt.process?.workerProcessBirthIdentity,
+		},
+		{
+			pid: attempt.process?.pid,
+			processGroupId: attempt.process?.processGroupId,
+			birthIdentity: attempt.process?.processBirthIdentity,
+		},
+		{
+			pid: attempt.tmux?.launchPid ?? undefined,
+			processGroupId: attempt.tmux?.launchProcessGroupId ?? undefined,
+			birthIdentity: attempt.tmux?.launchProcessBirthIdentity ?? undefined,
+		},
+	];
+	const identities = new Map<string, ProcessIdentity>();
+	const identityKeysByPid = new Map<number, string>();
+	let incomplete = false;
+	for (const candidate of candidates) {
+		const values = [
+			candidate.pid,
+			candidate.processGroupId,
+			candidate.birthIdentity,
+		];
+		if (values.every((value) => value === undefined)) continue;
+		if (
+			typeof candidate.pid !== "number" ||
+			!Number.isSafeInteger(candidate.pid) ||
+			candidate.pid <= 0 ||
+			typeof candidate.processGroupId !== "number" ||
+			!Number.isSafeInteger(candidate.processGroupId) ||
+			candidate.processGroupId <= 0 ||
+			typeof candidate.birthIdentity !== "string" ||
+			candidate.birthIdentity.length === 0
+		) {
+			incomplete = true;
+			continue;
+		}
+		const key = `${candidate.pid}:${candidate.processGroupId}:${candidate.birthIdentity}`;
+		const priorKey = identityKeysByPid.get(candidate.pid);
+		if (priorKey !== undefined && priorKey !== key) incomplete = true;
+		identityKeysByPid.set(candidate.pid, key);
+		identities.set(key, {
+			pid: candidate.pid,
+			processGroupId: candidate.processGroupId,
+			birthIdentity: candidate.birthIdentity,
+		});
+	}
+	return { identities: [...identities.values()], incomplete };
+}
+
+function signalOwnedProcess(
+	identity: ProcessIdentity,
+	signal: NodeJS.Signals,
+): void {
+	const target =
+		process.platform === "win32" ||
+		identity.pid !== identity.processGroupId
+			? identity.pid
+			: -identity.processGroupId;
 	try {
-		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
+		process.kill(target, signal);
+	} catch (error) {
+		if (processErrorCode(error) !== "ESRCH") throw error;
 	}
 }
 
-function processAlive(attempt: RunAttemptRecord): boolean {
-	return pidAlive(attempt.process?.pid) || pidAlive(attempt.process?.workerPid);
+async function ownerProcessAlive(attempt: RunAttemptRecord): Promise<boolean> {
+	const { identities } = ownedProcessIdentities(attempt);
+	const ownerPid = attempt.process?.workerPid ?? attempt.process?.pid;
+	const owner = identities.find((identity) => identity.pid === ownerPid);
+	return owner !== undefined && (await verifyProcessIdentity(owner)) === "alive";
+}
+
+async function terminateOwnedProcesses(
+	attempt: RunAttemptRecord,
+): Promise<boolean> {
+	const identitySet = ownedProcessIdentities(attempt);
+	const { identities } = identitySet;
+	if (identities.length === 0) return !identitySet.incomplete;
+	const verifiedIdentities = identities;
+	const authorizedGroups = new Set<number>();
+	const recordedLeaderGroups = new Set(
+		verifiedIdentities
+			.filter((identity) => identity.pid === identity.processGroupId)
+			.map((identity) => identity.processGroupId),
+	);
+
+	async function inspectIdentities(): Promise<{
+		alive: ProcessIdentity[];
+		unsafe: boolean;
+	}> {
+		const alive: ProcessIdentity[] = [];
+		let unsafe = false;
+		for (const identity of verifiedIdentities) {
+			const status = await verifyProcessIdentity(identity);
+			if (status === "mismatch" || status === "unknown") unsafe = true;
+			if (status === "alive") {
+				alive.push(identity);
+				if (
+					process.platform !== "win32" &&
+					identity.pid === identity.processGroupId
+				)
+					authorizedGroups.add(identity.processGroupId);
+			}
+		}
+		return { alive, unsafe };
+	}
+
+	function groupsDrained(): boolean | undefined {
+		let unknown = false;
+		for (const processGroupId of recordedLeaderGroups) {
+			const status = inspectProcessGroup(processGroupId);
+			if (status === "alive") return false;
+			if (status === "unknown") unknown = true;
+		}
+		return unknown ? undefined : true;
+	}
+
+	function signalAuthorizedGroups(signal: NodeJS.Signals): void {
+		for (const processGroupId of authorizedGroups) {
+			try {
+				process.kill(-processGroupId, signal);
+			} catch (error) {
+				if (processErrorCode(error) !== "ESRCH") throw error;
+			}
+		}
+	}
+
+	let unsafe = identitySet.incomplete;
+	const initiallyInspected = await inspectIdentities();
+	unsafe ||= initiallyInspected.unsafe;
+	for (const identity of initiallyInspected.alive)
+		signalOwnedProcess(identity, "SIGTERM");
+	for (let attemptIndex = 0; attemptIndex < 10; attemptIndex += 1) {
+		const inspected = await inspectIdentities();
+		unsafe ||= inspected.unsafe;
+		const drained = groupsDrained();
+		if (inspected.alive.length === 0 && drained === true) return !unsafe;
+		if (drained === undefined) unsafe = true;
+		await new Promise((resolveSleep) => setTimeout(resolveSleep, 50));
+	}
+	const beforeKill = await inspectIdentities();
+	unsafe ||= beforeKill.unsafe;
+	for (const identity of beforeKill.alive)
+		signalOwnedProcess(identity, "SIGKILL");
+	signalAuthorizedGroups("SIGKILL");
+	for (let attemptIndex = 0; attemptIndex < 10; attemptIndex += 1) {
+		const inspected = await inspectIdentities();
+		unsafe ||= inspected.unsafe;
+		const drained = groupsDrained();
+		if (inspected.alive.length === 0 && drained === true) return !unsafe;
+		if (drained === undefined) unsafe = true;
+		await new Promise((resolveSleep) => setTimeout(resolveSleep, 50));
+	}
+	const remaining = await inspectIdentities();
+	return (
+		remaining.alive.length === 0 &&
+		groupsDrained() === true &&
+		!unsafe &&
+		!remaining.unsafe
+	);
 }
 
 function heartbeatFresh(
@@ -80,7 +280,27 @@ async function terminateTmuxServer(
 	tmux: RunAttemptRecord["tmux"],
 ): Promise<boolean> {
 	if (tmux?.socketPath === undefined) return true;
-	return await terminatePrivateTmuxServer({ socketPath: tmux.socketPath });
+	try {
+		return await terminatePrivateTmuxServer(tmux);
+	} catch (error) {
+		if (
+			typeof error === "object" &&
+			error !== null &&
+			"terminalBlocked" in error &&
+			(error as { terminalBlocked?: unknown }).terminalBlocked === true
+		)
+			return false;
+		throw error;
+	}
+}
+
+async function terminateAttemptOwnership(
+	attempt: RunAttemptRecord,
+	tmuxFallback?: RunAttemptRecord["tmux"],
+): Promise<boolean> {
+	const processSafe = await terminateOwnedProcesses(attempt);
+	const tmuxSafe = await terminateTmuxServer(attempt.tmux ?? tmuxFallback);
+	return processSafe && tmuxSafe;
 }
 
 function activeAttempt(record: RunRecord): RunAttemptRecord | undefined {
@@ -101,11 +321,13 @@ export async function reconcileSubagentRun(
 	if (record === null)
 		return { status: "not-found", runId: options.runId, record: null };
 	if (isTerminalStatus(record.status)) {
-		const terminalAttempt = activeAttempt(record);
-		if (
-			terminalAttempt?.tmux !== undefined &&
-			!(await terminateTmuxServer(terminalAttempt.tmux))
-		)
+		if (record.activeAttemptId !== null)
+			return { status: "running", runId: options.runId, record };
+		let terminalSafe = true;
+		for (const terminalAttempt of record.attempts)
+			terminalSafe =
+				(await terminateAttemptOwnership(terminalAttempt)) && terminalSafe;
+		if (!terminalSafe)
 			return { status: "running", runId: options.runId, record };
 		return { status: "already-terminal", runId: options.runId, record };
 	}
@@ -113,14 +335,24 @@ export async function reconcileSubagentRun(
 	const attempt = activeAttempt(record);
 	if (attempt === undefined)
 		return { status: "running", runId: options.runId, record };
+	let inactiveSafe = true;
+	for (const inactiveAttempt of record.attempts) {
+		if (inactiveAttempt.attemptId === attempt.attemptId) continue;
+		inactiveSafe =
+			(await terminateAttemptOwnership(inactiveAttempt)) && inactiveSafe;
+	}
+	if (!inactiveSafe)
+		return { status: "running", runId: options.runId, record };
 
-	const result = await readAttemptResult(attempt);
+	const result = await readAttemptResult(attempt, options.runId);
 	if (
 		result !== null &&
 		result.attemptId === attempt.attemptId &&
 		isTerminalStatus(result.status)
 	) {
-		if (!(await terminateTmuxServer(attempt.tmux ?? result.tmux)))
+		if (await ownerProcessAlive(attempt))
+			return { status: "running", runId: options.runId, record };
+		if (!(await terminateAttemptOwnership(attempt, result.tmux)))
 			return { status: "running", runId: options.runId, record };
 		const committed = await commitAttemptResultIfActive(ref, result);
 		await appendRunEvent(ref, {
@@ -138,11 +370,14 @@ export async function reconcileSubagentRun(
 		};
 	}
 
-	if (processAlive(attempt) || heartbeatFresh(attempt, staleAfterMs)) {
+	const ownerPid = attempt.process?.workerPid ?? attempt.process?.pid;
+	if (
+		(await ownerProcessAlive(attempt)) ||
+		(ownerPid === undefined && heartbeatFresh(attempt, staleAfterMs))
+	)
 		return { status: "running", runId: options.runId, record };
-	}
 
-	if (!(await terminateTmuxServer(attempt.tmux)))
+	if (!(await terminateAttemptOwnership(attempt)))
 		return { status: "running", runId: options.runId, record };
 
 	const interrupted = record.interrupt !== undefined;
@@ -178,14 +413,18 @@ export async function reconcileSubagentRun(
 		},
 		sandbox: result?.sandbox ?? { enabled: false },
 		exitCode: null,
-		signal: interrupted ? record.interrupt?.signal ?? null : null,
+		signal: interrupted ? (record.interrupt?.signal ?? null) : null,
 		artifacts: [...(result?.artifacts ?? []), stderr],
 		...(attempt.tmux === undefined ? {} : { tmux: attempt.tmux }),
 		metadata: result?.metadata ?? { contextLengthExceeded: false },
 	});
 	const committed = await commitAttemptResultIfActive(ref, terminalResult);
 	if (!committed.committed)
-		return { status: "running", runId: options.runId, record: committed.record };
+		return {
+			status: "running",
+			runId: options.runId,
+			record: committed.record,
+		};
 	const updated = committed.record;
 	await appendRunEvent(ref, {
 		type: interrupted ? "reconcile.completed" : "reconcile.failed",

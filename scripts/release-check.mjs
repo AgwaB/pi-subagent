@@ -89,12 +89,18 @@ const pack = execFileSync("npm", ["pack", "--dry-run", "--json"], {
 const [summary] = JSON.parse(pack);
 const files = summary.files.map((file) => file.path);
 const required = [
+	"LICENSE",
 	"README.md",
 	"docs/usage.md",
 	"assets/subagent-panel.png",
 	"api.mjs",
 	"src/api.ts",
 	"src/index.ts",
+	"src/process-identity.ts",
+	"src/shell-environment.ts",
+	"src/workers/durable-worker.mjs",
+	"src/workers/process-gate.mjs",
+	"src/workers/terminal-finalizer.mjs",
 	"package.json",
 ];
 const missing = required.filter((path) => !files.includes(path));
@@ -102,17 +108,21 @@ if (missing.length > 0) {
 	console.error(`Package is missing required files: ${missing.join(", ")}`);
 	process.exit(1);
 }
-if (
-	files.some(
-		(path) =>
-			path.startsWith("internal/") ||
-			path.startsWith("node_modules/") ||
-			path.startsWith(".pi/") ||
-			path.startsWith(".harness/"),
-	)
-) {
+const allowedPublicPaths = new Set([
+	"LICENSE",
+	"README.md",
+	"api.mjs",
+	"package.json",
+]);
+const allowedPublicRoots = ["assets/", "docs/", "src/"];
+const unexpected = files.filter(
+	(path) =>
+		!allowedPublicPaths.has(path) &&
+		!allowedPublicRoots.some((root) => path.startsWith(root)),
+);
+if (unexpected.length > 0) {
 	console.error(
-		"Package includes local/internal files that should not be published.",
+		`Package includes files outside the public allowlist: ${unexpected.join(", ")}`,
 	);
 	process.exit(1);
 }

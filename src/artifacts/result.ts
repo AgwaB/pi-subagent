@@ -56,6 +56,24 @@ export interface ResultTmuxMetadata {
 	serverName: string;
 	/** Absolute owner-only socket path used with `tmux -S`. */
 	socketPath: string;
+	/** Digest of the nonce stored only in the owning tmux server environment. */
+	ownershipTokenSha256?: string;
+	/** Durable launch phase used to reconcile a worker that dies during startup. */
+	launchState?: "planned" | "gated" | "launching" | "running";
+	/** PID of the gated tmux launcher while launchState is launching. */
+	launchPid?: number | null;
+	/** Process group of the gated launcher. */
+	launchProcessGroupId?: number | null;
+	/** OS birth identity of the gated launcher. */
+	launchProcessBirthIdentity?: string | null;
+	/** PID and birth identity of the private tmux server. */
+	serverPid?: number | null;
+	serverProcessGroupId?: number | null;
+	serverProcessBirthIdentity?: string | null;
+	/** PID and birth identity of the pane command. */
+	panePid?: number | null;
+	paneProcessGroupId?: number | null;
+	paneProcessBirthIdentity?: string | null;
 	sessionName: string;
 	sessionId: string | null;
 	paneId: string | null;

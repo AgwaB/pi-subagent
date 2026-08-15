@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import {
+	access,
 	chmod,
 	mkdir,
 	mkdtemp,
@@ -14,6 +16,10 @@ import {
 	buildPiArgv,
 	runHeadlessModel,
 } from "../../src/runners/headless-model.ts";
+import {
+	captureProcessIdentity,
+	verifyProcessIdentity,
+} from "../../src/process-identity.ts";
 
 function artifactByType(result, type) {
 	const artifact = result.artifacts.find(
@@ -50,9 +56,33 @@ assert.equal(argvWithoutSession.includes("--session-id"), false);
 const tempRoot = await mkdtemp(
 	join(tmpdir(), "pi-subagent-headless-streaming-"),
 );
+const sleep = (ms) =>
+	new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 try {
 	const cwd = join(tempRoot, "workspace");
 	await mkdir(cwd, { recursive: true });
+	const execProbe = spawn(
+		"/bin/bash",
+		["-c", 'IFS= read -r gate; exec /bin/sleep 30', "identity-exec-probe"],
+		{ detached: true, stdio: ["pipe", "ignore", "ignore"] },
+	);
+	assert.equal(typeof execProbe.pid, "number");
+	try {
+		const preExecIdentity = await captureProcessIdentity(execProbe.pid);
+		execProbe.stdin.end("go\n");
+		await sleep(100);
+		assert.equal(
+			await verifyProcessIdentity(preExecIdentity),
+			"alive",
+			"birth identity must remain stable across exec",
+		);
+	} finally {
+		try {
+			process.kill(-execProbe.pid, "SIGKILL");
+		} catch {
+			// The owned identity probe already exited.
+		}
+	}
 	const fakePi = join(tempRoot, "fake-pi.mjs");
 	await writeFile(
 		fakePi,
@@ -393,6 +423,137 @@ setInterval(() => undefined, 1000);
 	});
 	assert.equal(aborted.status, "cancelled");
 	assert.equal(aborted.failureKind, "abort");
+
+	const gatedPi = join(tempRoot, "fake-pi-gated.mjs");
+	const gatedSideEffect = join(cwd, "gated-side-effect");
+	await writeFile(
+		gatedPi,
+		`#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(gatedSideEffect)}, "started");
+process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "gated" }], provider: "fake", model: "fake/model", usage: { inputTokens: 1, outputTokens: 1 }, stopReason: "end" } }) + "\\n");
+`,
+		"utf8",
+	);
+	await chmod(gatedPi, 0o700);
+	const shellHook = join(tempRoot, "gate-shell-hook.sh");
+	const shellHookSideEffect = join(cwd, "shell-hook-side-effect");
+	const nodeHook = join(tempRoot, "gate-node-hook.cjs");
+	const nodeHookSideEffect = join(cwd, "node-hook-side-effect");
+	await writeFile(
+		shellHook,
+		`echo unsafe > ${JSON.stringify(shellHookSideEffect)}\n`,
+	);
+	await writeFile(
+		nodeHook,
+		`require("node:fs").writeFileSync(${JSON.stringify(nodeHookSideEffect)}, "loaded");\n`,
+	);
+	const previousBashEnv = process.env.BASH_ENV;
+	const previousNodeOptions = process.env.NODE_OPTIONS;
+	process.env.BASH_ENV = shellHook;
+	process.env.NODE_OPTIONS = `--require=${nodeHook}`;
+	let releaseOwnership;
+	const ownershipReleased = new Promise((resolveRelease) => {
+		releaseOwnership = resolveRelease;
+	});
+	let recordedProcess;
+	const gatedRun = runHeadlessModel({
+		cwd,
+		runId: "run_check_headless_gate",
+		attemptId: "attempt-headless-gate",
+		piCommand: gatedPi,
+		agent: "stream-worker",
+		task: "wait for ownership",
+		timeoutMs: 30_000,
+		onProcessStart: async (processMetadata) => {
+			recordedProcess = processMetadata;
+			await ownershipReleased;
+		},
+	});
+	for (let index = 0; index < 100 && recordedProcess === undefined; index += 1)
+		await sleep(10);
+	if (previousBashEnv === undefined) delete process.env.BASH_ENV;
+	else process.env.BASH_ENV = previousBashEnv;
+	if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+	else process.env.NODE_OPTIONS = previousNodeOptions;
+	assert.equal(typeof recordedProcess?.pid, "number");
+	assert.equal(typeof recordedProcess?.processGroupId, "number");
+	assert.equal(typeof recordedProcess?.processBirthIdentity, "string");
+	await sleep(100);
+	await assert.rejects(access(gatedSideEffect));
+	await assert.rejects(
+		access(shellHookSideEffect),
+		"shell startup hooks must not run before the ownership gate",
+	);
+	await assert.rejects(
+		access(nodeHookSideEffect),
+		"loader hooks must not run in the ownership gate",
+	);
+	releaseOwnership();
+	const gatedResult = await gatedRun;
+	assert.equal(gatedResult.status, "completed");
+	assert.equal(await access(gatedSideEffect), undefined);
+	assert.equal(await access(nodeHookSideEffect), undefined);
+
+	const rejectedSideEffect = join(cwd, "rejected-gate-side-effect");
+	await writeFile(
+		gatedPi,
+		`#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(rejectedSideEffect)}, "started");
+`,
+		"utf8",
+	);
+	await assert.rejects(
+		runHeadlessModel({
+			cwd,
+			runId: "run_check_headless_gate_rejected",
+			attemptId: "attempt-headless-gate-rejected",
+			piCommand: gatedPi,
+			agent: "stream-worker",
+			task: "reject ownership",
+			timeoutMs: 30_000,
+			onProcessStart: async () => {
+				throw new Error("persistence rejected");
+			},
+		}),
+		/persistence rejected/u,
+	);
+	await sleep(100);
+	await assert.rejects(access(rejectedSideEffect));
+
+	const stubbornPi = join(tempRoot, "fake-pi-stubborn-group.mjs");
+	const stubbornChildPidPath = join(cwd, "stubborn-child.pid");
+	const stubbornSideEffect = join(cwd, "stubborn-late-side-effect");
+	await writeFile(
+		stubbornPi,
+		`#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const child = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(`import { writeFileSync } from "node:fs"; for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"]) process.on(signal, () => {}); await new Promise((resolve) => setTimeout(resolve, 3000)); writeFileSync(${JSON.stringify(stubbornSideEffect)}, "late"); await new Promise((resolve) => setTimeout(resolve, 10000));`)}], { stdio: "ignore" });
+child.unref();
+writeFileSync(${JSON.stringify(stubbornChildPidPath)}, String(child.pid));
+process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "stubborn-group" }], provider: "fake", model: "fake/model", usage: { inputTokens: 1, outputTokens: 1 }, stopReason: "end" } }) + "\\n");
+`,
+		"utf8",
+	);
+	await chmod(stubbornPi, 0o700);
+	const stubbornResult = await runHeadlessModel({
+		cwd,
+		runId: "run_check_headless_stubborn_group",
+		attemptId: "attempt-headless-stubborn-group",
+		piCommand: stubbornPi,
+		agent: "stream-worker",
+		task: "drain stubborn process group",
+		timeoutMs: 30_000,
+	});
+	assert.equal(stubbornResult.status, "completed");
+	const stubbornChildPid = Number(
+		(await readFile(stubbornChildPidPath, "utf8")).trim(),
+	);
+	assert.throws(() => process.kill(stubbornChildPid, 0));
+	await sleep(3_100);
+	await assert.rejects(access(stubbornSideEffect));
 
 	console.log(
 		JSON.stringify(

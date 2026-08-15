@@ -1,12 +1,20 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beginRunRecord, readRunRecord, upsertRunAttempt } from "../../src/artifacts/index.ts";
+import {
+	beginRunRecord,
+	commitAttemptResultIfActive,
+	createAttemptArtifactStore,
+	readRunRecord,
+	updateAttemptProcess,
+	upsertRunAttempt,
+} from "../../src/artifacts/index.ts";
 
 const tempRoot = await mkdtemp(join(tmpdir(), "pi-subagent-run-lock-"));
+const properLockfile = createRequire(import.meta.url)("proper-lockfile");
 try {
   // 1. Concurrent mutations serialize without losing updates.
   const cwd = join(tempRoot, "concurrent");
@@ -17,47 +25,128 @@ try {
   await Promise.all(attempts.map((attemptId) => upsertRunAttempt({ cwd, runId, attemptId, status: "running", backend: "headless", activate: false })));
   const record = await readRunRecord({ cwd, runId });
   assert.equal(record.attempts.length, attempts.length, "no attempt updates may be lost under concurrent mutation");
+  assert.equal(record.activeAttemptId, null, "activate:false must preserve the active attempt id");
+  assert.equal(record.latestAttemptId, null, "activate:false must preserve the latest attempt id");
 
-  // 2. A stale lock (dead holder pid) is reclaimed.
+  const staleAttemptId = attempts[0];
+  const successorAttemptId = "attempt-successor";
+  await upsertRunAttempt({
+    cwd,
+    runId,
+    attemptId: successorAttemptId,
+    status: "running",
+    backend: "headless",
+  });
+  await updateAttemptProcess({
+    cwd,
+    runId,
+    attemptId: staleAttemptId,
+    process: { pid: 99999999 },
+  });
+  const staleWriteRecord = await readRunRecord({ cwd, runId });
+  assert.equal(staleWriteRecord.activeAttemptId, successorAttemptId, "a stale onlyIfActive update must not reactivate its attempt");
+  assert.equal(staleWriteRecord.attempts.find((attempt) => attempt.attemptId === staleAttemptId)?.process, undefined, "a stale onlyIfActive process update must be a no-op");
+  const staleStore = await createAttemptArtifactStore({
+    cwd,
+    runId,
+    attemptId: staleAttemptId,
+  });
+  const staleResult = await staleStore.writeResult({
+    backend: "headless",
+    status: "completed",
+    failureKind: null,
+    cwd,
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    workspace: { mode: "shared", cwd, worktreePath: null },
+    sandbox: { enabled: false },
+    exitCode: 0,
+    signal: null,
+    artifacts: [],
+    metadata: { contextLengthExceeded: false },
+  });
+  const staleCommit = await commitAttemptResultIfActive(
+    { cwd, runId },
+    staleResult,
+  );
+  assert.equal(staleCommit.committed, false, "a stale terminal result must not replace its successor");
+  const afterStaleCommit = await readRunRecord({ cwd, runId });
+  assert.equal(afterStaleCommit.activeAttemptId, successorAttemptId);
+  assert.equal(afterStaleCommit.status, "running");
+  const duplicateRunId = "run_atomic_duplicate";
+  await beginRunRecord({
+    cwd,
+    runId: duplicateRunId,
+    mode: "single",
+    backend: "headless",
+  });
+  const duplicateReservations = await Promise.allSettled([
+    upsertRunAttempt({
+      cwd,
+      runId: duplicateRunId,
+      attemptId: "attempt_same",
+      status: "pending",
+      backend: "headless",
+      createOnly: true,
+    }),
+    upsertRunAttempt({
+      cwd,
+      runId: duplicateRunId,
+      attemptId: "attempt_same",
+      status: "pending",
+      backend: "headless",
+      createOnly: true,
+    }),
+  ]);
+  assert.equal(
+    duplicateReservations.filter((reservation) => reservation.status === "fulfilled").length,
+    1,
+    "exactly one concurrent creator may reserve an attempt id",
+  );
+  assert.equal(
+    duplicateReservations.filter((reservation) => reservation.status === "rejected").length,
+    1,
+  );
+
+  // 2. Elapsed wall time alone never steals an atomic lock directory.
   const staleCwd = join(tempRoot, "stale");
   const staleRunId = "run_lock_stale";
   const staleLockDir = join(staleCwd, ".pi/agent/runs", staleRunId);
   await mkdir(staleLockDir, { recursive: true });
-  // Spawn a child that exits immediately so its pid is provably dead.
-  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
-  const deadPid = child.pid;
-  await new Promise((resolveExit) => child.on("exit", resolveExit));
-  await writeFile(join(staleLockDir, "run.lock"), `${deadPid}\n${new Date().toISOString()}\n`);
-  const reclaimStart = Date.now();
+  const staleLockPath = join(staleLockDir, "run.lock");
+  await mkdir(staleLockPath);
+  const staleTime = new Date(Date.now() - 60_000);
+  await utimes(staleLockPath, staleTime, staleTime);
+  await assert.rejects(
+    beginRunRecord({ cwd: staleCwd, runId: staleRunId, mode: "single", backend: "headless" }),
+    /Lock file is already being held/,
+    "an old lock must fail closed instead of stealing from a possibly paused writer",
+  );
+  await rm(staleLockPath, { recursive: true, force: true });
   await beginRunRecord({ cwd: staleCwd, runId: staleRunId, mode: "single", backend: "headless" });
-  assert.ok(Date.now() - reclaimStart < 2_000, "stale lock with a dead holder must be reclaimed quickly");
-  assert.ok(await readRunRecord({ cwd: staleCwd, runId: staleRunId }), "mutation proceeds after reclaiming a stale lock");
+  assert.ok(await readRunRecord({ cwd: staleCwd, runId: staleRunId }), "mutation proceeds after explicit stale-lock recovery");
 
-  // 3. A lock held by a live process is never stolen; the waiter times out.
+  // 3. A lock held by a live owner is never stolen; the waiter times out.
   const liveCwd = join(tempRoot, "live");
   const liveRunId = "run_lock_live";
   const liveLockDir = join(liveCwd, ".pi/agent/runs", liveRunId);
   await mkdir(liveLockDir, { recursive: true });
   const liveLockPath = join(liveLockDir, "run.lock");
-  await writeFile(liveLockPath, `${process.pid}\n${new Date().toISOString()}\n`);
-  await assert.rejects(
-    beginRunRecord({ cwd: liveCwd, runId: liveRunId, mode: "single", backend: "headless" }),
-    /timed out waiting for run lock/,
-    "live-holder lock must not be stolen",
-  );
-  assert.equal((await readFile(liveLockPath, "utf8")).split("\n")[0], String(process.pid), "live lock file must remain intact after a timed-out waiter");
-
-  // 4. Unreadable lock content falls back to mtime: old file is reclaimed.
-  const mtimeCwd = join(tempRoot, "mtime");
-  const mtimeRunId = "run_lock_mtime";
-  const mtimeLockDir = join(mtimeCwd, ".pi/agent/runs", mtimeRunId);
-  await mkdir(mtimeLockDir, { recursive: true });
-  const mtimeLockPath = join(mtimeLockDir, "run.lock");
-  await writeFile(mtimeLockPath, "not-a-pid\n");
-  const old = new Date(Date.now() - 60_000);
-  await utimes(mtimeLockPath, old, old);
-  await beginRunRecord({ cwd: mtimeCwd, runId: mtimeRunId, mode: "single", backend: "headless" });
-  assert.ok(await readRunRecord({ cwd: mtimeCwd, runId: mtimeRunId }), "old unreadable lock is reclaimed via mtime heuristic");
+  const releaseLiveLock = await properLockfile.lock(liveLockPath, {
+    realpath: false,
+    lockfilePath: liveLockPath,
+    stale: 10_000,
+    update: 5_000,
+  });
+  try {
+    await assert.rejects(
+      beginRunRecord({ cwd: liveCwd, runId: liveRunId, mode: "single", backend: "headless" }),
+      /Lock file is already being held/,
+      "live-holder lock must not be stolen",
+    );
+  } finally {
+    await releaseLiveLock();
+  }
 
   console.log(JSON.stringify({ name: "check-run-lock", status: "completed" }, null, 2));
 } finally {

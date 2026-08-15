@@ -1,13 +1,12 @@
 import {
 	appendFile,
 	mkdir,
-	open,
 	readFile,
 	rename,
-	rm,
 	stat,
 	writeFile,
 } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type {
 	AsyncDependency,
@@ -29,6 +28,24 @@ const RUN_EVENT_SCHEMA_VERSION = 2 as const;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 5_000;
+const properLockfile = createRequire(import.meta.url)("proper-lockfile") as {
+	lock: (
+		file: string,
+		options: {
+			realpath: boolean;
+			lockfilePath: string;
+			stale: number;
+			update: number;
+			retries: {
+				retries: number;
+				factor: number;
+				minTimeout: number;
+				maxTimeout: number;
+				randomize: boolean;
+			};
+		},
+	) => Promise<() => Promise<void>>;
+};
 
 export type RunEventType =
 	| "run.started"
@@ -60,11 +77,20 @@ export type RunEventType =
 	| "task.cancelled";
 
 export interface ProcessMetadata {
-	pid: number;
+	pid?: number;
 	processGroupId?: number;
+	processBirthIdentity?: string;
 	command?: string;
 	workerPid?: number;
 	workerProcessGroupId?: number;
+	workerProcessBirthIdentity?: string;
+}
+
+export interface WorkerProcessMetadata {
+	workerPid: number;
+	workerProcessGroupId?: number;
+	workerProcessBirthIdentity?: string;
+	command?: string;
 }
 
 export interface RunAttemptRecord {
@@ -182,6 +208,12 @@ export interface UpsertAttemptOptions extends RunRef {
 	activate?: boolean;
 	/** No-op when patching an existing terminal attempt. Used by heartbeats/process updates. */
 	onlyIfActive?: boolean;
+	/** Atomically fail when this attempt id already exists. */
+	createOnly?: boolean;
+	/** Atomically fail when this attempt id does not exist. */
+	mustExist?: boolean;
+	/** Atomically fail when another attempt is currently active. */
+	requireNoActive?: boolean;
 }
 
 export type UpsertTaskOptions = Omit<UpsertAttemptOptions, "attemptId"> & {
@@ -454,101 +486,30 @@ async function writeRecordPath(
 	return record;
 }
 
-async function sleep(ms: number): Promise<void> {
-	await new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
-}
-
-function lockHolderPid(content: string): number | null {
-	const pid = Number.parseInt(content.split("\n")[0] ?? "", 10);
-	return Number.isInteger(pid) && pid > 0 ? pid : null;
-}
-
-function pidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		// EPERM means the process exists but belongs to another user.
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
-
-async function lockIsStale(lockPath: string): Promise<boolean> {
-	try {
-		const content = await readFile(lockPath, "utf8");
-		const pid = lockHolderPid(content);
-		if (pid !== null) return !pidAlive(pid);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; // already released
-		// Unreadable content: fall through to the mtime heuristic below.
-	}
-	try {
-		const info = await stat(lockPath);
-		return Date.now() - info.mtimeMs > LOCK_TIMEOUT_MS;
-	} catch {
-		return false;
-	}
-}
-
 async function withFileLock<T>(
 	lockPath: string,
 	fn: () => Promise<T>,
 ): Promise<T> {
 	await mkdir(dirname(lockPath), { recursive: true });
-	const deadline = Date.now() + LOCK_TIMEOUT_MS;
-	let handle: Awaited<ReturnType<typeof open>> | undefined;
-	while (handle === undefined) {
-		try {
-			handle = await open(lockPath, "wx");
-			await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`);
-			// Two waiters can both judge a lock stale and race rm/open; the loser's rm
-			// can unlink the winner's fresh lock. Confirm the path still carries our
-			// pid; if not, we lost the race and must retry.
-			const owner = lockHolderPid(
-				await readFile(lockPath, "utf8").catch(() => ""),
-			);
-			if (owner !== process.pid) {
-				await handle.close().catch(() => undefined);
-				handle = undefined;
-				await sleep(LOCK_RETRY_MS);
-			}
-		} catch (error) {
-			if (
-				!(
-					error &&
-					typeof error === "object" &&
-					"code" in error &&
-					error.code === "EEXIST"
-				)
-			)
-				throw error;
-			// Reclaim only locks whose recorded holder is provably gone (or whose
-			// content is unreadable and stale by mtime); never steal from a live holder.
-			if (await lockIsStale(lockPath)) {
-				await rm(lockPath, { force: true }).catch(() => undefined);
-				continue;
-			}
-			if (Date.now() >= deadline) {
-				throw new Error(
-					`timed out waiting for run lock ${lockPath}; the lock is held by a live process. Retry later or remove the file if the holder is wedged.`,
-				);
-			}
-			await sleep(LOCK_RETRY_MS);
-		}
-	}
+	const release = await properLockfile.lock(lockPath, {
+		realpath: false,
+		lockfilePath: lockPath,
+		// Never steal a lease based on elapsed wall time. A paused live writer
+		// cannot be distinguished safely from a crashed one without fencing.
+		stale: Number.MAX_SAFE_INTEGER,
+		update: 1_000,
+		retries: {
+			retries: Math.ceil(LOCK_TIMEOUT_MS / LOCK_RETRY_MS),
+			factor: 1,
+			minTimeout: LOCK_RETRY_MS,
+			maxTimeout: LOCK_RETRY_MS,
+			randomize: true,
+		},
+	});
 	try {
 		return await fn();
 	} finally {
-		await handle.close().catch(() => undefined);
-		// Release only if we still own the lock; a reclaimed lock may now belong
-		// to another process and must not be deleted out from under it.
-		try {
-			if (lockHolderPid(await readFile(lockPath, "utf8")) === process.pid) {
-				await rm(lockPath, { force: true });
-			}
-		} catch {
-			// Lock already released or unreadable; leave it alone.
-		}
+		await release();
 	}
 }
 
@@ -746,19 +707,39 @@ export async function upsertRunAttempt(
 			startedAt,
 			updatedAt: now,
 			completedAt: null,
-			activeAttemptId: options.attemptId,
-			latestAttemptId: options.attemptId,
+			activeAttemptId: options.activate === false ? null : options.attemptId,
+			latestAttemptId: options.activate === false ? null : options.attemptId,
 			attempts: [],
 		};
 		const attempts = [...baseRecord.attempts];
 		const index = attempts.findIndex(
 			(attempt) => attempt.attemptId === options.attemptId,
 		);
+		if (options.createOnly === true && index >= 0)
+			throw new Error(
+				`attempt id ${options.attemptId} is already present in run ${baseRecord.runId}`,
+			);
+		if (options.mustExist === true && index < 0)
+			throw new Error(
+				`attempt id ${options.attemptId} is not present in run ${baseRecord.runId}`,
+			);
 		if (
-			index >= 0 &&
+			options.requireNoActive === true &&
+			baseRecord.activeAttemptId !== null &&
+			baseRecord.activeAttemptId !== options.attemptId
+		)
+			throw new Error(
+				`run ${baseRecord.runId} already has active attempt ${baseRecord.activeAttemptId}`,
+			);
+		if (
 			options.onlyIfActive === true &&
-			isTerminalStatus(attempts[index]!.status)
+			(existing === null ||
+				baseRecord.activeAttemptId !== options.attemptId ||
+				index < 0 ||
+				isTerminalStatus(attempts[index]!.status))
 		) {
+			if (existing === null)
+				throw new Error("cannot update an active attempt for a missing run");
 			return { record: baseRecord, value: baseRecord };
 		}
 		if (index >= 0) {
@@ -787,11 +768,13 @@ export async function upsertRunAttempt(
 				? baseRecord.latestAttemptId
 				: options.attemptId;
 		const activeAttemptId =
-			options.status === "pending" || options.status === "running"
-				? options.attemptId
-				: baseRecord.activeAttemptId === options.attemptId
-					? null
-					: baseRecord.activeAttemptId;
+			options.activate === false
+				? baseRecord.activeAttemptId
+				: options.status === "pending" || options.status === "running"
+					? options.attemptId
+					: baseRecord.activeAttemptId === options.attemptId
+						? null
+						: baseRecord.activeAttemptId;
 		const aggregate = aggregateStatus(attempts, latestAttemptId);
 		const record: RunRecord = {
 			...baseRecord,
@@ -828,6 +811,48 @@ export async function updateAttemptProcess(
 		completedAt: null,
 		heartbeatAt: new Date(),
 		onlyIfActive: true,
+	});
+}
+
+export async function updateAttemptWorkerProcess(
+	ref: RunRef & { attemptId: string; process: WorkerProcessMetadata },
+): Promise<RunRecord> {
+	const now = new Date().toISOString();
+	return await withRunMutation(ref, async (existing) => {
+		if (existing === null)
+			throw new Error("cannot update worker process for a missing run");
+		const attempts = [...existing.attempts];
+		const index = attempts.findIndex(
+			(attempt) => attempt.attemptId === ref.attemptId,
+		);
+		if (
+			index < 0 ||
+			existing.activeAttemptId !== ref.attemptId ||
+			isTerminalStatus(attempts[index]!.status)
+		)
+			return { record: existing, value: existing };
+		const current = attempts[index]!;
+		attempts[index] = {
+			...current,
+			updatedAt: now,
+			heartbeatAt: now,
+			process: {
+				...(current.process ?? {}),
+				...(current.process?.command === undefined &&
+				ref.process.command !== undefined
+					? { command: ref.process.command }
+					: {}),
+				workerPid: ref.process.workerPid,
+				workerProcessGroupId: ref.process.workerProcessGroupId,
+				workerProcessBirthIdentity: ref.process.workerProcessBirthIdentity,
+			},
+		};
+		const record = {
+			...existing,
+			updatedAt: now,
+			attempts: sortAttempts(attempts),
+		};
+		return { record, value: record };
 	});
 }
 
@@ -892,6 +917,8 @@ export async function commitAttemptResultIfActive(
 	return await withFileLock(paths.lockPath, async () => {
 		const existing = await readRecordPath(paths);
 		if (existing === null) return { committed: false, record: null };
+		if (result.runId !== existing.runId)
+			return { committed: false, record: existing };
 		const currentActive = existing.activeAttemptId === result.attemptId;
 		const legacyCurrent =
 			existing.activeAttemptId === null &&
@@ -916,6 +943,39 @@ export async function commitAttemptResultIfActive(
 		);
 		await writeRecordPath(paths.runJsonPath, record);
 		return { committed: true, record };
+	});
+}
+
+export async function refreshTerminalAttemptResultIfCurrent(
+	baseRef: RunRef,
+	result: ResultEnvelope,
+): Promise<{ refreshed: boolean; record: RunRecord | null }> {
+	const paths = runPaths(baseRef);
+	await mkdir(paths.runDir, { recursive: true });
+	return await withFileLock(paths.lockPath, async () => {
+		const existing = await readRecordPath(paths);
+		if (existing === null) return { refreshed: false, record: null };
+		if (result.runId !== existing.runId)
+			return { refreshed: false, record: existing };
+		const attempt = existing.attempts.find(
+			(candidate) => candidate.attemptId === result.attemptId,
+		);
+		if (
+			existing.activeAttemptId !== null ||
+			existing.latestAttemptId !== result.attemptId ||
+			!isTerminalStatus(existing.status) ||
+			attempt === undefined ||
+			attempt.status !== result.status ||
+			(attempt.failureKind ?? null) !== result.failureKind
+		)
+			return { refreshed: false, record: existing };
+		const record = await finishAttemptFromResultUnlocked(
+			existing,
+			paths,
+			result,
+		);
+		await writeRecordPath(paths.runJsonPath, record);
+		return { refreshed: true, record };
 	});
 }
 

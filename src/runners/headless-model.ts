@@ -13,7 +13,16 @@ import {
 	type ResultMetadata,
 	type ToolResultBudgetMetadata,
 } from "../artifacts/index.ts";
-import type { ResultWorkspace } from "../artifacts/result.ts";
+import type {
+	ResultTmuxMetadata,
+	ResultWorkspace,
+} from "../artifacts/result.ts";
+import {
+	captureProcessIdentity,
+	inspectProcessGroup,
+	ProcessOwnershipError,
+} from "../process-identity.ts";
+import { processGateEnvironment } from "../shell-environment.ts";
 import type {
 	AgentScope,
 	FailureKind,
@@ -71,13 +80,7 @@ export interface RunHeadlessModelOptions {
 	 */
 	toolResultBudget?: ToolResultBudgetInput;
 	onProcessStart?: (process: ProcessMetadata) => void | Promise<void>;
-	onTmuxStart?: (tmux: {
-		serverName: string;
-		socketPath: string;
-		sessionName: string;
-		sessionId: string | null;
-		paneId: string | null;
-	}) => void | Promise<void>;
+	onTmuxStart?: (tmux: ResultTmuxMetadata) => void | Promise<void>;
 	/** Explicit run-scoped environment additions/removals for the child process. */
 	childEnv?: NodeJS.ProcessEnv;
 }
@@ -320,6 +323,8 @@ const MAX_PARSE_ERRORS = 20;
 const MAX_METADATA_ERRORS = 20;
 const MAX_JSON_LINE_CHARS = 64 * 1024 * 1024;
 const STDERR_TEXT_LIMIT = 256 * 1024;
+const PROCESS_OWNERSHIP_TIMEOUT_MS = 10_000;
+const PROCESS_OWNERSHIP_KILL_GRACE_MS = 500;
 
 function emptyParseResult(): PiJsonParseResult {
 	return { finalAssistantText: "", errors: [], parseErrors: [], metadata: {} };
@@ -730,35 +735,42 @@ async function runProcess(
 		});
 	}
 
-	return await new Promise<ProcessResult>((resolveProcess) => {
-		const child = spawn(argv[0], argv.slice(1), {
+	return await new Promise<ProcessResult>((resolveProcess, rejectProcess) => {
+		const gatePath = fileURLToPath(
+			new URL("../workers/process-gate.mjs", import.meta.url),
+		);
+		const child = spawn(
+			process.execPath,
+			[gatePath],
+			{
 			cwd,
 			shell: false,
 			detached: process.platform !== "win32",
-			stdio: ["ignore", "pipe", "pipe"],
-			...(env === undefined ? {} : { env }),
-		});
-
-		if (child.pid !== undefined) {
-			void Promise.resolve(
-				onProcessStart?.({
-					pid: child.pid,
-					processGroupId: process.platform === "win32" ? undefined : child.pid,
-					command: argv[0],
-				}),
-			).catch(() => undefined);
-		}
+			stdio: ["pipe", "pipe", "pipe"],
+			env: processGateEnvironment(process.env),
+			},
+		);
 
 		let settled = false;
+		let gateReleased = false;
+		let ownershipError: unknown;
 		let stopKind: "timeout" | "abort" | null = null;
 		let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
 		let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
+		let ownershipTimer: ReturnType<typeof setTimeout> | null = null;
+		let authorizedProcessGroupId: number | undefined;
+		let closeHandling = false;
+		let groupDrainResult:
+			| Promise<ProcessOwnershipError | Error | undefined>
+			| undefined;
 
 		function clearTimers(): void {
 			if (timeoutTimer) clearTimeout(timeoutTimer);
 			if (forceKillTimer) clearTimeout(forceKillTimer);
+			if (ownershipTimer) clearTimeout(ownershipTimer);
 			timeoutTimer = null;
 			forceKillTimer = null;
+			ownershipTimer = null;
 		}
 
 		function cleanup(): void {
@@ -768,15 +780,14 @@ async function runProcess(
 
 		function signalChild(signal: NodeJS.Signals): void {
 			try {
-				if (child.pid !== undefined && process.platform !== "win32")
-					process.kill(-child.pid, signal);
+				if (
+					authorizedProcessGroupId !== undefined &&
+					process.platform !== "win32"
+				)
+					process.kill(-authorizedProcessGroupId, signal);
 				else child.kill(signal);
-			} catch {
-				try {
-					child.kill(signal);
-				} catch {
-					/* already exited */
-				}
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
 			}
 		}
 
@@ -814,6 +825,66 @@ async function runProcess(
 			);
 		}
 
+		function rejectOwnership(error: unknown): void {
+			if (settled || ownershipError !== undefined) return;
+			ownershipError = error;
+			signalChild("SIGTERM");
+			forceKillTimer ??= setTimeout(() => {
+				signalChild("SIGKILL");
+			}, PROCESS_OWNERSHIP_KILL_GRACE_MS);
+		}
+
+		async function drainAuthorizedProcessGroup(): Promise<void> {
+			const processGroupId = authorizedProcessGroupId;
+			if (processGroupId === undefined) return;
+			let status = inspectProcessGroup(processGroupId);
+			if (status === "dead") return;
+			if (status === "unknown")
+				throw new ProcessOwnershipError(
+					"headless process group drain could not be verified",
+				);
+			try {
+				process.kill(-processGroupId, "SIGTERM");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
+			}
+			for (let index = 0; index < 10; index += 1) {
+				status = inspectProcessGroup(processGroupId);
+				if (status === "dead") return;
+				if (status === "unknown")
+					throw new ProcessOwnershipError(
+						"headless process group drain could not be verified",
+					);
+				await new Promise((resolveSleep) => setTimeout(resolveSleep, 50));
+			}
+			try {
+				process.kill(-processGroupId, "SIGKILL");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
+			}
+			for (let index = 0; index < 10; index += 1) {
+				status = inspectProcessGroup(processGroupId);
+				if (status === "dead") return;
+				if (status === "unknown")
+					throw new ProcessOwnershipError(
+						"headless process group drain could not be verified",
+					);
+				await new Promise((resolveSleep) => setTimeout(resolveSleep, 50));
+			}
+			throw new ProcessOwnershipError(
+				"headless process group remained populated after termination",
+			);
+		}
+
+		function startGroupDrain(): Promise<ProcessOwnershipError | Error | undefined> {
+			groupDrainResult ??= drainAuthorizedProcessGroup().then(
+				() => undefined,
+				(error) =>
+					error instanceof Error ? error : new Error(String(error)),
+			);
+			return groupDrainResult;
+		}
+
 		child.stdout?.on("data", (chunk: Buffer | string) => {
 			parser.push(toBuffer(chunk));
 		});
@@ -830,8 +901,13 @@ async function runProcess(
 				stderrStream.once("drain", () => child.stderr?.resume());
 			}
 		});
+		child.stdin?.on("error", (error) => {
+			if ((error as NodeJS.ErrnoException).code !== "EPIPE")
+				rejectOwnership(error);
+		});
 
 		child.on("error", () => {
+			if (ownershipError !== undefined) return;
 			settle({
 				status: "failed",
 				failureKind: "spawn",
@@ -840,35 +916,120 @@ async function runProcess(
 			});
 		});
 
+		child.on("exit", () => {
+			void startGroupDrain();
+		});
+
 		child.on("close", (exitCode, signal) => {
-			if (stopKind === null && signal !== null) {
+			if (closeHandling) return;
+			closeHandling = true;
+			void (async () => {
+				const drainError = await startGroupDrain();
+				if (drainError !== undefined) throw drainError;
+				if (ownershipError !== undefined) {
+					if (settled) return;
+					settled = true;
+					cleanup();
+					stderrStream.end();
+					void once(stderrStream, "finish").then(
+						() => rejectProcess(ownershipError),
+						() => rejectProcess(ownershipError),
+					);
+					return;
+				}
+				if (!gateReleased && stopKind === null && exitCode === 125) {
+					settled = true;
+					cleanup();
+					const gateError = new Error(
+						"headless launch gate closed before ownership was recorded",
+					);
+					stderrStream.end();
+					void once(stderrStream, "finish").then(
+						() => rejectProcess(gateError),
+						() => rejectProcess(gateError),
+					);
+					return;
+				}
+				if (stopKind === null && signal !== null) {
+					settle({
+						status: "cancelled",
+						failureKind: "cancelled",
+						exitCode,
+						signal,
+					});
+					return;
+				}
+				const failureKind = stopKind ?? (exitCode === 0 ? null : "model");
 				settle({
-					status: "cancelled",
-					failureKind: "cancelled",
+					status:
+						failureKind === null
+							? "completed"
+							: failureKind === "abort"
+								? "cancelled"
+								: "failed",
+					failureKind,
 					exitCode,
 					signal,
 				});
-				return;
-			}
-			const failureKind = stopKind ?? (exitCode === 0 ? null : "model");
-			settle({
-				status:
-					failureKind === null
-						? "completed"
-						: failureKind === "abort"
-							? "cancelled"
-							: "failed",
-				failureKind,
-				exitCode,
-				signal,
+			})().catch((error) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				stderrStream.end();
+				void once(stderrStream, "finish").then(
+					() => rejectProcess(error),
+					() => rejectProcess(error),
+				);
 			});
 		});
 
-		if (timeoutMs !== undefined) {
-			timeoutTimer = setTimeout(() => {
-				requestStop("timeout");
-			}, timeoutMs);
-		}
+		child.once("spawn", () => {
+			const pid = child.pid;
+			if (pid === undefined) {
+				rejectOwnership(
+					new Error("headless gated launcher did not expose a pid"),
+				);
+				return;
+			}
+			ownershipTimer = setTimeout(() => {
+				rejectOwnership(
+					new Error(
+						"headless gated launch timed out before ownership was recorded",
+					),
+				);
+			}, PROCESS_OWNERSHIP_TIMEOUT_MS);
+			void captureProcessIdentity(pid)
+				.then(async (identity) => {
+					if (
+						process.platform !== "win32" &&
+						identity.pid === identity.processGroupId
+					)
+						authorizedProcessGroupId = identity.processGroupId;
+					await onProcessStart?.({
+						pid: identity.pid,
+						processGroupId: identity.processGroupId,
+						processBirthIdentity: identity.birthIdentity,
+						command: argv[0],
+					});
+					if (settled || ownershipError !== undefined) return;
+					if (ownershipTimer) clearTimeout(ownershipTimer);
+					ownershipTimer = null;
+					gateReleased = true;
+					child.stdin?.end(
+						`${JSON.stringify({
+							argv,
+							cwd,
+							env: env ?? process.env,
+						})}\n`,
+					);
+					if (timeoutMs !== undefined) {
+						timeoutTimer = setTimeout(() => {
+							requestStop("timeout");
+						}, timeoutMs);
+					}
+				})
+				.catch(rejectOwnership);
+		});
 
 		abortSignal?.addEventListener("abort", onAbort, { once: true });
 		if (abortSignal?.aborted) requestStop("abort");
@@ -958,7 +1119,8 @@ export async function runHeadlessModel(
 									};
 									delete env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
 									if (explicitBinding !== undefined)
-										env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = explicitBinding;
+										env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON =
+											explicitBinding;
 									return env;
 								})(),
 								options.onProcessStart,

@@ -65,9 +65,17 @@ interface DefaultResourceLoaderOptionsLike {
 	appendSystemPromptOverride?: (base: string[]) => string[];
 }
 
+interface ModelRegistryFactoryLike {
+	new (modelRuntime: unknown): ModelRegistryLike;
+	create?: (authStorage: unknown) => ModelRegistryLike;
+}
+
 interface PiSdkModule {
-	AuthStorage: { create(): unknown };
-	ModelRegistry: { create(authStorage: unknown): ModelRegistryLike };
+	AuthStorage?: { create(): unknown };
+	ModelRuntime?: {
+		create(options?: { allowModelNetwork?: boolean }): Promise<unknown>;
+	};
+	ModelRegistry: ModelRegistryFactoryLike;
 	SessionManager: { inMemory(cwd?: string): unknown };
 	DefaultResourceLoader: new (
 		options: DefaultResourceLoaderOptionsLike,
@@ -85,6 +93,7 @@ interface ModelLike {
 
 interface ModelRegistryLike {
 	reload?: () => Promise<void>;
+	refresh?: () => Promise<unknown>;
 	getAvailable?: () => ModelLike[];
 	getModels?: () => ModelLike[];
 	find?: (provider: string, modelId: string) => ModelLike | undefined;
@@ -101,6 +110,11 @@ interface AgentSessionLike {
 interface SdkImportResult {
 	module: PiSdkModule;
 	source: string;
+}
+
+interface SdkModelContext {
+	modelRegistry: ModelRegistryLike;
+	sessionOptions: Record<string, unknown>;
 }
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
@@ -137,6 +151,66 @@ function findPackageRoot(
 	return undefined;
 }
 
+function assertPiSdkModule(value: unknown): PiSdkModule {
+	if ((typeof value !== "object" || value === null) && typeof value !== "function")
+		throw new Error("Pi SDK module did not export an object namespace.");
+	const candidate = value as Record<string, unknown>;
+	const modelRegistry = candidate.ModelRegistry as
+		| (Record<string, unknown> & (new (runtime: unknown) => ModelRegistryLike))
+		| undefined;
+	const authStorage = candidate.AuthStorage as
+		| Record<string, unknown>
+		| undefined;
+	const modelRuntime = candidate.ModelRuntime as
+		| Record<string, unknown>
+		| undefined;
+	const sessionManager = candidate.SessionManager as
+		| { inMemory?: unknown }
+		| undefined;
+	const hasLegacyRuntime =
+		typeof authStorage?.create === "function" &&
+		typeof modelRegistry?.create === "function";
+	const hasModernRuntime = typeof modelRuntime?.create === "function";
+	if (
+		typeof modelRegistry !== "function" ||
+		typeof candidate.SessionManager !== "function" ||
+		typeof sessionManager?.inMemory !== "function" ||
+		typeof candidate.DefaultResourceLoader !== "function" ||
+		typeof candidate.getAgentDir !== "function" ||
+		typeof candidate.createAgentSession !== "function" ||
+		(!hasLegacyRuntime && !hasModernRuntime)
+	)
+		throw new Error(
+			"Pi SDK module is incompatible: expected either AuthStorage/ModelRegistry.create or ModelRuntime.create.",
+		);
+	return candidate as unknown as PiSdkModule;
+}
+
+async function createSdkModelContext(
+	piSdk: PiSdkModule,
+): Promise<SdkModelContext> {
+	if (
+		piSdk.AuthStorage !== undefined &&
+		typeof piSdk.ModelRegistry.create === "function"
+	) {
+		const authStorage = piSdk.AuthStorage.create();
+		const modelRegistry = piSdk.ModelRegistry.create(authStorage);
+		return {
+			modelRegistry,
+			sessionOptions: { authStorage, modelRegistry },
+		};
+	}
+	if (piSdk.ModelRuntime === undefined)
+		throw new Error("Pi SDK module does not expose a supported model runtime.");
+	const modelRuntime = await piSdk.ModelRuntime.create({
+		allowModelNetwork: false,
+	});
+	return {
+		modelRegistry: new piSdk.ModelRegistry(modelRuntime),
+		sessionOptions: { modelRuntime },
+	};
+}
+
 async function importPiSdk(): Promise<SdkImportResult> {
 	try {
 		const require = createRequire(import.meta.url);
@@ -144,7 +218,9 @@ async function importPiSdk(): Promise<SdkImportResult> {
 			"@earendil-works/pi-coding-agent/package.json",
 		);
 		return {
-			module: (await import("@earendil-works/pi-coding-agent")) as PiSdkModule,
+			module: assertPiSdkModule(
+				await import("@earendil-works/pi-coding-agent"),
+			),
 			source: dirname(packageJson),
 		};
 	} catch (projectError) {
@@ -171,9 +247,9 @@ async function importPiSdk(): Promise<SdkImportResult> {
 				`Found pi at ${realPiBin}, but could not locate @earendil-works/pi-coding-agent.`,
 			);
 		return {
-			module: (await import(
-				pathToFileURL(join(packageRoot, "dist/index.js")).href
-			)) as PiSdkModule,
+			module: assertPiSdkModule(
+				await import(pathToFileURL(join(packageRoot, "dist/index.js")).href),
+			),
 			source: packageRoot,
 		};
 	}
@@ -259,7 +335,8 @@ async function resolveRequestedModel(
 	modelRegistry: ModelRegistryLike,
 	modelReference: string,
 ): Promise<ModelLike> {
-	await modelRegistry.reload?.();
+	if (modelRegistry.reload !== undefined) await modelRegistry.reload();
+	else await modelRegistry.refresh?.();
 	const parsed = splitThinkingSuffix(modelReference);
 	const reference = parsed.model;
 	const slashIndex = reference.indexOf("/");
@@ -417,8 +494,8 @@ export async function runInlineModel(
 
 	try {
 		const { module: piSdk, source } = await importPiSdk();
-		const authStorage = piSdk.AuthStorage.create();
-		const modelRegistry = piSdk.ModelRegistry.create(authStorage);
+		const { modelRegistry, sessionOptions } =
+			await createSdkModelContext(piSdk);
 		const sessionManager = piSdk.SessionManager.inMemory(cwd);
 		const resourceLoader = createChildResourceLoader(piSdk, options, cwd);
 		await resourceLoader.reload();
@@ -437,8 +514,7 @@ export async function runInlineModel(
 
 		const { session, diagnostics = [] } = await piSdk.createAgentSession({
 			cwd,
-			authStorage,
-			modelRegistry,
+			...sessionOptions,
 			sessionManager,
 			resourceLoader,
 			excludeTools: ["subagent"],
