@@ -13,6 +13,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	abortFailureKind,
+	userCancelledAbortReason,
+} from "../../src/core/constants.ts";
+import {
 	buildPiArgv,
 	runHeadlessModel,
 } from "../../src/runners/headless-model.ts";
@@ -423,6 +427,29 @@ setInterval(() => undefined, 1000);
 	});
 	assert.equal(aborted.status, "cancelled");
 	assert.equal(aborted.failureKind, "abort");
+
+	// An abort whose reason is tagged by the durable worker (operator interrupt
+	// delivered as SIGINT/SIGTERM) is recorded as user_cancelled, matching the
+	// worker's own pre-execution cancellations.
+	const interruptController = new AbortController();
+	const interrupted = await runHeadlessModel({
+		cwd,
+		runId: "run_check_headless_user_cancelled",
+		attemptId: "attempt-user-cancelled",
+		piCommand: abortPi,
+		agent: "stream-worker",
+		task: "stay alive until interrupted",
+		timeoutMs: 30_000,
+		signal: interruptController.signal,
+		onProcessStart: () =>
+			interruptController.abort(
+				userCancelledAbortReason("durable worker received SIGINT"),
+			),
+	});
+	assert.equal(interrupted.status, "cancelled");
+	assert.equal(interrupted.failureKind, "user_cancelled");
+	assert.equal(abortFailureKind(undefined), "abort");
+	assert.equal(abortFailureKind(interruptController.signal), "user_cancelled");
 
 	const gatedPi = join(tempRoot, "fake-pi-gated.mjs");
 	const gatedSideEffect = join(cwd, "gated-side-effect");

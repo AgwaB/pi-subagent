@@ -174,7 +174,9 @@ function failureKindFromError(error) {
 }
 
 function requestCancel(signal) {
-	executionAbort.abort(new Error(`durable worker received ${signal}`));
+	executionAbort.abort(
+		constants.userCancelledAbortReason(`durable worker received ${signal}`),
+	);
 	process.exitCode = 130;
 }
 

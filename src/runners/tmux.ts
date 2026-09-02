@@ -13,6 +13,7 @@ import type {
 	ResultWorkspace,
 } from "../artifacts/result.ts";
 import {
+	abortFailureKind,
 	isFailureKind,
 	sandboxAllowedDomains,
 	type FailureKind,
@@ -574,7 +575,7 @@ async function runTmuxProcess(options: RunTmuxProcessOptions): Promise<{
 							: "failed",
 					failureKind:
 						(error as { failureKind?: unknown })?.failureKind === "abort"
-							? "abort"
+							? abortFailureKind(options.signal)
 							: "spawn",
 					exitCode: null,
 					signal: null,

@@ -56,6 +56,27 @@ export type ResolvedBackend = (typeof RESOLVED_BACKENDS)[number];
 export type Status = (typeof STATUSES)[number];
 export type FailureKind = (typeof FAILURE_KINDS)[number];
 
+/**
+ * Failure kind for a run stopped by its AbortSignal. A plain abort (the caller
+ * dropped the tool call) stays "abort"; an abort whose reason was tagged by
+ * `userCancelledAbortReason` (an operator interrupt delivered to the durable
+ * worker) is recorded as "user_cancelled" on every backend.
+ */
+export function abortFailureKind(
+	signal: AbortSignal | undefined,
+): "abort" | "user_cancelled" {
+	const reason = signal?.reason as { failureKind?: unknown } | undefined;
+	return reason?.failureKind === "user_cancelled" ? "user_cancelled" : "abort";
+}
+
+export function userCancelledAbortReason(
+	message: string,
+): Error & { failureKind: "user_cancelled" } {
+	return Object.assign(new Error(message), {
+		failureKind: "user_cancelled" as const,
+	});
+}
+
 export function isFailureKind(value: unknown): value is FailureKind {
 	return (
 		typeof value === "string" &&

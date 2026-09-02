@@ -42,6 +42,8 @@ Every call has an `action`. The default is `run`, so omitting `action` starts a 
 
 State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
 
+Cancellation kinds: `interrupt` on an async (durable-worker) run records `failureKind: "user_cancelled"` whether the interrupt lands before or during model execution. `abort` means the caller dropped its own tool call (the parent `AbortSignal` fired), and `cancelled` means the child process died from an external signal that no interrupt or abort requested.
+
 `reconcileSubagentRun()` returns `status:"running"` only when current liveness evidence says the run may still be executing. If verified cleanup cannot complete safely, it returns `status:"cleanup-blocked"` with a stable `cleanupBlocked.reason` and the affected attempt IDs; callers should surface that state rather than treating it as ordinary execution. Process ownership uses Linux boot ID plus kernel start ticks, or a bundled macOS `proc_pidinfo` helper with microsecond process start time. Missing or unverifiable platform identity fails closed and is never signal authority.
 
 Attempt-scoped supervisors should pass `expectedAttemptId` to `reconcileSubagentRun()`. If another attempt has become active/latest, reconciliation returns `status:"superseded"` before cleanup or registry mutation. This prevents a delayed finalizer from stale-terminalizing its successor.

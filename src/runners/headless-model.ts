@@ -31,7 +31,7 @@ import type {
 	ThinkingLevel,
 	ToolResultBudgetInput,
 } from "../core/constants.ts";
-import { sandboxAllowedDomains } from "../core/constants.ts";
+import { abortFailureKind, sandboxAllowedDomains } from "../core/constants.ts";
 import { SandboxUnavailableError, withSandboxedArgv } from "../sandbox/srt.ts";
 import {
 	flushToolCallTelemetry,
@@ -729,7 +729,7 @@ async function runProcess(
 	if (abortSignal?.aborted) {
 		return await finishWith({
 			status: "cancelled",
-			failureKind: "abort",
+			failureKind: abortFailureKind(abortSignal),
 			exitCode: null,
 			signal: null,
 		});
@@ -959,12 +959,15 @@ async function runProcess(
 					});
 					return;
 				}
-				const failureKind = stopKind ?? (exitCode === 0 ? null : "model");
+				const failureKind =
+					stopKind === "abort"
+						? abortFailureKind(abortSignal)
+						: (stopKind ?? (exitCode === 0 ? null : "model"));
 				settle({
 					status:
 						failureKind === null
 							? "completed"
-							: failureKind === "abort"
+							: stopKind === "abort"
 								? "cancelled"
 								: "failed",
 					failureKind,

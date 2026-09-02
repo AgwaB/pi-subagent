@@ -12,6 +12,7 @@ import {
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import {
 	THINKING_LEVELS,
+	abortFailureKind,
 	type AgentScope,
 	type FailureKind,
 	type ThinkingLevel,
@@ -563,12 +564,10 @@ export async function runInlineModel(
 	toolCallArtifactRefs = await flushToolCallTelemetry(toolCallTelemetry, store);
 
 	const completedAt = new Date();
+	const cancelledByAbort = failureKind === "abort";
+	if (cancelledByAbort) failureKind = abortFailureKind(options.signal);
 	const status =
-		failureKind === null
-			? "completed"
-			: failureKind === "abort"
-				? "cancelled"
-				: "failed";
+		failureKind === null ? "completed" : cancelledByAbort ? "cancelled" : "failed";
 	const artifacts: ArtifactRef[] = [
 		await store.writeTextArtifact("stderr", stderrText),
 		await store.writeTextArtifact("output", outputText),
@@ -585,7 +584,7 @@ export async function runInlineModel(
 		workspace: options.workspace ?? { mode: "shared", cwd },
 		sandbox: { enabled: false },
 		exitCode: null,
-		signal: failureKind === "abort" ? "ABORT" : null,
+		signal: cancelledByAbort ? "ABORT" : null,
 		artifacts,
 		correlationId: options.correlationId,
 		metadata: {
