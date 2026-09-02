@@ -271,7 +271,7 @@ function errorText(value: unknown): string | undefined {
  * Pi reports per-request usage on each assistant message; keeping only the
  * last one drops every earlier turn's tokens and cost.
  */
-function sumUsageValues(total: unknown, next: unknown): unknown {
+export function sumUsageValues(total: unknown, next: unknown): unknown {
 	if (typeof next === "number") {
 		if (!Number.isFinite(next)) return total;
 		return typeof total === "number" ? total + next : next;

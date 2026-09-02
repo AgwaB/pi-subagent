@@ -17,7 +17,7 @@ import {
 	type FailureKind,
 	type ThinkingLevel,
 } from "../core/constants.ts";
-import { detectContextLengthExceeded } from "./headless-model.ts";
+import { detectContextLengthExceeded, sumUsageValues } from "./headless-model.ts";
 import {
 	flushToolCallTelemetry,
 	ToolCallTelemetryCollector,
@@ -294,6 +294,38 @@ function assistantTextFromMessages(messages: unknown): string {
 	return text;
 }
 
+/**
+ * Provider, model, summed usage, and the last stop reason from the session's
+ * assistant messages, mirroring what the headless runner derives from
+ * `message_end` events so inline results carry the same accounting metadata.
+ */
+export function assistantMetadataFromMessages(messages: unknown): {
+	provider?: string;
+	model?: string;
+	usage?: unknown;
+	stopReason?: string;
+} {
+	if (!Array.isArray(messages)) return {};
+	const metadata: {
+		provider?: string;
+		model?: string;
+		usage?: unknown;
+		stopReason?: string;
+	} = {};
+	for (const message of messages) {
+		if (typeof message !== "object" || message === null) continue;
+		const record = message as Record<string, unknown>;
+		if (record.role !== "assistant") continue;
+		if (typeof record.provider === "string") metadata.provider = record.provider;
+		if (typeof record.model === "string") metadata.model = record.model;
+		if (record.usage !== undefined)
+			metadata.usage = sumUsageValues(metadata.usage, record.usage);
+		if (typeof record.stopReason === "string")
+			metadata.stopReason = record.stopReason;
+	}
+	return metadata;
+}
+
 function maybeAssistantTextFromAgentEnd(event: unknown): string {
 	if (typeof event !== "object" || event === null) return "";
 	const record = event as Record<string, unknown>;
@@ -487,6 +519,7 @@ export async function runInlineModel(
 	let stderrText = "";
 	let outputText = "";
 	let failureKind: FailureKind | null = null;
+	let assistantMetadata: ReturnType<typeof assistantMetadataFromMessages> = {};
 	let toolCallArtifactRefs: ArtifactRef[] = [];
 	const toolCallTelemetry =
 		options.captureToolCalls === true
@@ -544,6 +577,7 @@ export async function runInlineModel(
 			if (outputText.length === 0)
 				outputText = assistantTextFromMessages(session.messages);
 			if (outputText.length === 0) outputText = stdoutText;
+			assistantMetadata = assistantMetadataFromMessages(session.messages);
 		} finally {
 			if (typeof unsubscribe === "function") unsubscribe();
 			session.dispose?.();
@@ -589,6 +623,7 @@ export async function runInlineModel(
 		correlationId: options.correlationId,
 		metadata: {
 			contextLengthExceeded: detectContextLengthExceeded({ stderrText }),
+			...assistantMetadata,
 		},
 	});
 }

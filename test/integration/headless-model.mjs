@@ -5,6 +5,14 @@ import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { parsePiJsonLines, runHeadlessModel } from "../../src/runners/headless-model.ts";
 
+// Model-backed checks honor the same overrides an operator would pass to the
+// tool, so a run can be pinned to a specific provider/model.
+const checkModelInput = {
+  ...(process.env.PI_SUBAGENT_CHECK_MODEL ? { model: process.env.PI_SUBAGENT_CHECK_MODEL } : {}),
+  ...(process.env.PI_SUBAGENT_CHECK_THINKING ? { thinking: process.env.PI_SUBAGENT_CHECK_THINKING } : {}),
+};
+
+
 function artifactByType(result, type) {
   const ref = result.artifacts.find((artifact) => artifact.type === type);
   assert.ok(ref, `missing ${type} artifact`);
@@ -35,6 +43,7 @@ try {
   await mkdir(cwd, { recursive: true });
 
   const result = await runHeadlessModel({
+    ...checkModelInput,
     cwd,
     runId: "run_check_headless_model",
     taskId: "task-1",

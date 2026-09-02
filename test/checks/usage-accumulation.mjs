@@ -123,3 +123,37 @@ function assistantEvent(type, usage, text = "chunk") {
 }
 
 console.log("usage-accumulation checks passed");
+
+// Inline runs derive the same metadata from the SDK session's messages: usage
+// is summed across assistant messages, provider/model/stopReason come from the
+// latest assistant message, and non-assistant messages are ignored.
+{
+	const { assistantMetadataFromMessages } = await import("../../src/runners/inline.ts");
+	const metadata = assistantMetadataFromMessages([
+		{ role: "user", content: "hi", usage: { input: 999 } },
+		{
+			role: "assistant",
+			provider: "fake",
+			model: "fake/model",
+			usage: { input: 1000, output: 10, cost: { total: 0.5 } },
+			stopReason: "toolUse",
+		},
+		{ role: "toolResult", content: "x" },
+		{
+			role: "assistant",
+			provider: "fake",
+			model: "fake/model",
+			usage: { input: 200, output: 5, cost: { total: 0.25 } },
+			stopReason: "stop",
+		},
+	]);
+	assert.deepEqual(metadata, {
+		provider: "fake",
+		model: "fake/model",
+		usage: { input: 1200, output: 15, cost: { total: 0.75 } },
+		stopReason: "stop",
+	});
+	assert.deepEqual(assistantMetadataFromMessages(undefined), {});
+	assert.deepEqual(assistantMetadataFromMessages([{ role: "user" }]), {});
+}
+console.log("inline assistant metadata checks passed");

@@ -27,6 +27,8 @@ try {
       task: "Reply exactly: parent-session-ok",
       timeoutMs: 60_000,
       parentSessionId,
+      ...(process.env.PI_SUBAGENT_CHECK_MODEL ? { model: process.env.PI_SUBAGENT_CHECK_MODEL } : {}),
+      ...(process.env.PI_SUBAGENT_CHECK_THINKING ? { thinking: process.env.PI_SUBAGENT_CHECK_THINKING } : {}),
     },
   });
 

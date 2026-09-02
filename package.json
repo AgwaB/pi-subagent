@@ -82,7 +82,7 @@
     "check:integration": "npm run check:model:inline && npm run check:model:headless && npm run check:model:tmux"
   },
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.54",
+    "@anthropic-ai/sandbox-runtime": "^0.0.75",
     "jiti": "^2.7.0",
     "proper-lockfile": "^4.1.2",
     "typebox": "^1.3.25"
