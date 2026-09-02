@@ -18,7 +18,7 @@ pi install npm:@agwab/pi-subagent
 
 Then reload Pi.
 
-Requires Node.js `>=22.19.0` on macOS or Linux. The package includes a source-auditable universal macOS helper for kernel process birth identity; users do not need a compiler. The published helper is rebuilt from the included C source and executed on both arm64 and Intel macOS runners before npm publish. Native Windows is not supported (POSIX process groups, tmux, and `which`-based Pi discovery); use WSL2.
+Requires Node.js `>=22.19.0` on macOS or Linux and Pi (`@earendil-works/pi-coding-agent`) 0.79 or newer; this release is validated against Pi 0.84.4. The engine imports Pi's SDK from the host process at runtime, so the version you run `pi` with is the version subagents use. The package includes a source-auditable universal macOS helper for kernel process birth identity; users do not need a compiler. The published helper is rebuilt from the included C source and executed on both arm64 and Intel macOS runners before npm publish. Native Windows is not supported (POSIX process groups, tmux, and `which`-based Pi discovery); use WSL2.
 
 For local development, add this package as a Pi extension source and reload Pi.
 
@@ -149,4 +149,5 @@ const status = await getSubagentStatus({ runId: run.runId });
 
 ## Detailed docs
 
-- [`docs/usage.md`](./docs/usage.md) — full argument reference, code API, `action` behavior, backend selection, sandbox/worktree behavior, artifacts, and validation notes.
+- [`docs/usage.md`](./docs/usage.md) — full argument reference, code API, `action` behavior, backend selection, sandbox/worktree behavior, artifacts, environment variables, and validation notes.
+- [`docs/api.md`](./docs/api.md) — per-export reference for `@agwab/pi-subagent/api` (runs, prune, durable launch barrier, types).

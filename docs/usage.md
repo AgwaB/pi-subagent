@@ -111,7 +111,7 @@ await recordSubagentChildEvent({
 
 `runSubagent` accepts the same run options as the tool, plus an optional `signal`. Existing-run helpers accept `runId`, optional `cwd`, optional `attemptId`, and optional `runsDir`; when `cwd` is omitted they use the global locator index first and fall back to the current cwd for legacy records. The API is intentionally object-only and does not expose the lower-level runner internals.
 
-The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import internal files such as `src/orchestrate/*` because only documented package subpaths are public.
+The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import internal files such as `src/orchestrate/*` because only documented package subpaths are public. Every export is listed with its signature in [`api.md`](./api.md).
 
 ### General durable launch barrier
 
@@ -546,6 +546,35 @@ Status filters are `all`, `running`, `completed`, and `failed`. In the `all` sta
 Stale or malformed locators are counted in the header and skipped. Active runs whose process metadata is dead and whose heartbeat/update timestamp is stale are rendered read-only as `failed` with failure `stale`; the panel does not mutate run records. It may prune old stale locator pointers only; use `action:"reconcile"` to repair local registry state from durable artifacts when possible.
 
 The panel is for human inspection; existing-run tool actions remain the programmatic interface.
+
+## Environment variables
+
+Operator-facing:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PI_SUBAGENT_RUN_INDEX_DIR` | `~/.pi/agent/subagent-runs` | Directory for the global run-locator index used to resolve a `runId` without `cwd`. |
+| `PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS` | 30 days | Age after which locators are swept (background sweep on locator writes and when the panel lists runs). Negative disables pruning. |
+| `PI_SUBAGENT_HEARTBEAT_MS` | `5000` | Durable-worker heartbeat interval written to the attempt record; reconciliation treats missing heartbeats as liveness evidence. |
+| `PI_SUBAGENT_EVENT_READ_CACHE_MAX` | `64` | Maximum `events.jsonl` files kept in the in-process read cache used by status/wait/panel. `0` disables the cache. |
+| `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Pi's agent directory; the sandbox grants write access to exactly its `settings.json.lock`, `auth.json.lock`, and `trust.json.lock`. |
+
+Internal (set by the engine for its own child processes; do not set by hand):
+
+| Variable | Set by | Purpose |
+|---|---|---|
+| `PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON` | async launcher | Binds a durable worker to its run/attempt; stripped from tmux child environments. |
+| `PI_SUBAGENT_TMUX_OWNERSHIP_TOKEN` | tmux runner | Ownership token verified before a tmux session is signalled. |
+| `PI_SUBAGENT_TOOL_RESULT_BUDGET_MAX_CHARS`, `…_STATE_PATH`, `…_FORCE_EVICT_FRACTION` | headless runner | Carries the `toolResultBudget` option and context-recovery state into the headless child. |
+
+Test-only seams (used by `npm run validate`; no effect in normal operation unless set):
+
+| Variable | Purpose |
+|---|---|
+| `PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS` | Delays worker execution start so interrupt checks can race it. |
+| `PI_SUBAGENT_DURABLE_WORKER_TERMINAL_WRITE_DELAY_MS` | Delays the worker's terminal write to exercise late-commit paths. |
+| `PI_SUBAGENT_PANEL_NOW_MS` | Fixes the panel's notion of "now" for deterministic rendering. |
+| `PI_SUBAGENT_CHECK_MODEL`, `PI_SUBAGENT_CHECK_THINKING` | Pins model-backed check scenarios to a provider/model and thinking level; without credentials those scenarios report `skipped`. |
 
 ## Development validation
 
