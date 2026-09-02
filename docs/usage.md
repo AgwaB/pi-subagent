@@ -41,7 +41,7 @@ Every call has an `action`. The default is `run`, so omitting `action` starts a 
 | `reconcile` | Re-read durable artifacts and repair stale/orphaned state when possible. | `runId`, optional `cwd` |
 | `prune` | Delete old terminal runs under `<cwd>/<runsDir>`. Dry run unless `yes` is true. | optional `cwd`, `runsDir`, `keep` (default 50), `olderThanDays`, `yes` |
 
-State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Nothing deletes run directories automatically: `prune` (also `/subagent prune [--yes] [--keep N] [--older-than DAYS]` from the prompt, or `pruneSubagentRuns` from the code API) keeps the newest `keep` fully terminal runs, optionally restricted to runs older than `olderThanDays`, reports the selection with byte counts, and deletes only when `yes` is true. Runs with a non-terminal run, attempt, or task status are skipped even when stale (`reconcile` them first), unreadable or malformed run records are skipped, ordering and `olderThanDays` use the record's `updatedAt`, and a deleted run's global locator is removed only when it points at the same cwd and runs dir. Deletion is fenced: the runs directory must resolve (after symlinks) inside the cwd, symlinked entries are never followed, and each run is re-validated under its run lock and renamed away before removal, so a concurrent mutation is never partially deleted (one that arrives after removal starts a fresh record). Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
+State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Nothing deletes run directories automatically: `prune` (also `/subagent prune [--yes] [--keep N] [--older-than DAYS]` from the prompt, or `pruneSubagentRuns` from the code API) keeps the newest `keep` fully terminal runs, optionally restricted to runs older than `olderThanDays`, reports the selection with byte counts, and deletes only when `yes` is true. Runs with a non-terminal run, attempt, or task status are skipped even when stale (`reconcile` them first), unreadable or malformed run records are skipped, ordering and `olderThanDays` use the record's `updatedAt`, and a deleted run's global locator is removed only when it points at the same cwd and runs dir. Deletion is fenced: the runs directory must resolve (after symlinks) inside the cwd, symlinked entries are never followed, and each run is re-validated under its run lock (with an exact `updatedAt` generation check) and renamed away before removal, with the lock held through locator cleanup, so a concurrent mutation is never partially deleted: it waits and then either fails or, via `beginRunRecord`, starts a fresh record strictly after the deletion completed. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
 
 Cancellation kinds: `interrupt` on an async (durable-worker) run records `failureKind: "user_cancelled"` whether the interrupt lands before or during model execution. `abort` means the caller dropped its own tool call (the parent `AbortSignal` fired), and `cancelled` means the child process died from an external signal that no interrupt or abort requested.
 
@@ -505,19 +505,23 @@ Timeout notes:
 Runs write durable evidence under:
 
 ```text
-.pi/agent/runs/<run-id>/
-├── run.json
-├── events.jsonl
-└── attempts/
-    └── <attempt-id>/
-        ├── result.json
-        ├── worker.json
-        ├── task.md
-        ├── system-prompt.md
-        ├── stdout.log
-        ├── stderr.log
-        └── output.log
+.pi/agent/runs/
+├── .locks/<run-id>.lock      # per-run mutation lock (directory), beside the run
+└── <run-id>/
+    ├── run.json
+    ├── events.jsonl
+    └── attempts/
+        └── <attempt-id>/
+            ├── result.json
+            ├── worker.json
+            ├── task.md
+            ├── system-prompt.md
+            ├── stdout.log
+            ├── stderr.log
+            └── output.log
 ```
+
+Run locks live in the hidden `.locks/` directory beside the run directories (earlier versions kept `run.lock` inside each run directory), so a lock stays a stable fence while its run directory is renamed or removed by `prune`. Two engine versions mutating the same run concurrently do not exclude each other; in practice a run is only ever mutated by the engine that launched it.
 
 `worker.json` is the launch payload a detached worker reads once at startup. Long prompt strings are not inlined: the task text is stored in `task.md` and the compiled system prompt (when present) in `system-prompt.md`, and `worker.json` references them as `input.taskRef` / `input.systemPromptRef` with `{ path, bytes, sha256 }`. The worker resolves each reference from the payload's own directory and refuses a sidecar whose size or digest does not match, so the payload digest recorded by the durable launch barrier still binds the prompt bytes. Payloads written by earlier versions with inline `input.task` / `input.systemPrompt` remain valid and are accepted unchanged; a payload may not carry both forms of the same field. Callers that already persist the identical prompt bytes elsewhere may hard-link to these sidecars.
 

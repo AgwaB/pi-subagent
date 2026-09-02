@@ -13,6 +13,8 @@ const { formatPruneSubagentRunsSummary, pruneSubagentRuns } = await import("../.
 const { pruneSubagentRuns: apiPrune } = await import("../../api.mjs");
 
 const cwd = await mkdtemp(join(tmpdir(), "pi-subagent-prune-cwd-"));
+// Run directories only: the hidden `.locks` directory is registry state.
+const listRuns = async (dir) => (await readdir(dir)).filter((name) => !name.startsWith("."));
 const otherCwd = await mkdtemp(join(tmpdir(), "pi-subagent-prune-other-"));
 const DAY = 24 * 60 * 60 * 1000;
 const now = Date.parse("2026-09-02T00:00:00.000Z");
@@ -64,7 +66,7 @@ try {
 	assert.deepEqual(dry.skippedUnreadable, ["run_unreadable"]);
 	assert.deepEqual(dry.deletedRunIds, []);
 	assert.equal(dry.selected[0].bytes >= 300, true, "bytes are measured for selected runs");
-	assert.equal((await readdir(join(cwd, ".pi/agent/runs"))).length, 9, "dry run deletes nothing");
+	assert.equal((await listRuns(join(cwd, ".pi/agent/runs"))).length, 9, "dry run deletes nothing");
 	const text = formatPruneSubagentRunsSummary(dry);
 	assert.match(text, /dry run/u);
 	assert.match(text, /Re-run with yes: true/u);
@@ -110,7 +112,7 @@ try {
 	assert.equal(toolDry.isError, false);
 	assert.equal(toolDry.details.summary.status, "dry-run");
 	assert.deepEqual(toolDry.details.summary.selected.map((run) => run.runId).sort(), ["run_t0", "run_t1", "run_t2", "run_t3"]);
-	assert.equal((await readdir(join(cwd, ".pi/agent/runs"))).length, 6, "tool dry run deletes nothing");
+	assert.equal((await listRuns(join(cwd, ".pi/agent/runs"))).length, 6, "tool dry run deletes nothing");
 	const toolInvalid = await registeredTool.execute(
 		"prune-invalid",
 		{ action: "prune", keep: -1 },
@@ -130,7 +132,7 @@ try {
 	assert.equal(toolYes.isError, false);
 	assert.equal(toolYes.details.summary.status, "pruned");
 	assert.deepEqual(toolYes.details.summary.deletedRunIds.sort(), ["run_t0", "run_t1", "run_t2", "run_t3"]);
-	assert.equal((await readdir(join(cwd, ".pi/agent/runs"))).sort().join(","), "run_active,run_unreadable");
+	assert.equal((await listRuns(join(cwd, ".pi/agent/runs"))).sort().join(","), "run_active,run_unreadable");
 
 	// 6. Slash-command argument parsing and the registered /subagent prune handler.
 	assert.deepEqual(mod.parsePruneCommandArgs(""), {});
@@ -187,6 +189,26 @@ try {
 	assert.ok(malformed.skippedUnreadable.includes("run_bad_shape"));
 	await stat(join(cwd, ".pi/agent/runs", "run_bad_shape", "run.json"));
 
+	// 8b. Terminal-looking records with malformed attempts, unknown statuses, a
+	// dangling activeAttemptId, or an id that does not match the directory are
+	// unreadable too, never deleted.
+	const malformedShapes = {
+		run_bad_attempt: { schemaVersion: 2, runId: "run_bad_attempt", status: "completed", attempts: [{ status: "completed" }], activeAttemptId: null },
+		run_bad_status: { schemaVersion: 2, runId: "run_bad_status", status: "done", attempts: [], activeAttemptId: null },
+		run_bad_active: { schemaVersion: 2, runId: "run_bad_active", status: "completed", attempts: [{ attemptId: "a1", status: "completed" }], activeAttemptId: "ghost" },
+		run_bad_id: { schemaVersion: 2, runId: "run_other", status: "completed", attempts: [], activeAttemptId: null },
+	};
+	for (const [runId, record] of Object.entries(malformedShapes)) {
+		await mkdir(join(cwd, ".pi/agent/runs", runId), { recursive: true });
+		await writeFile(join(cwd, ".pi/agent/runs", runId, "run.json"), JSON.stringify({ mode: "single", backend: "headless", startedAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:00:00.000Z", ...record }));
+	}
+	const malformedAll = await pruneSubagentRuns({ cwd, keep: 0, yes: true, now });
+	for (const runId of Object.keys(malformedShapes)) {
+		assert.ok(malformedAll.skippedUnreadable.includes(runId), `${runId} is unreadable: ${JSON.stringify(malformedAll)}`);
+		await stat(join(cwd, ".pi/agent/runs", runId, "run.json"));
+		await rm(join(cwd, ".pi/agent/runs", runId), { recursive: true, force: true });
+	}
+
 	// 9. Ordering and olderThanDays use the record's updatedAt, not completedAt.
 	await seedRun("run_touched", { status: "completed", ageDays: 90 });
 	{
@@ -238,7 +260,7 @@ try {
 	} else {
 		await assert.rejects(stat(join(cwd, ".pi/agent/runs", "run_stale_completed")), /ENOENT/u);
 	}
-	assert.equal((await readdir(join(cwd, ".pi/agent/runs"))).some((name) => name.startsWith("run_stale_completed.pruning")), false, "no tombstone is left behind");
+	assert.equal((await readdir(join(cwd, ".pi/agent/runs", ".locks"))).some((name) => name.includes(".pruning-")), false, "no tombstone is left behind");
 	await rm(outside, { recursive: true, force: true });
 	await rm(linkedCwd, { recursive: true, force: true });
 	await rm(linkedEntryCwd, { recursive: true, force: true });

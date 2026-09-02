@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 
@@ -17,6 +18,17 @@ if (!payloadPath) {
 	console.error("durable worker missing payload path");
 	process.exit(2);
 }
+
+// Primitive signal handling from the very first statement: a stop that lands
+// while the runtime modules are still importing is remembered and replayed
+// once the real cancellation path exists, instead of killing the worker
+// before it can record anything.
+let earlySignal;
+const rememberEarlySignal = (signal) => {
+	earlySignal ??= signal;
+};
+process.on("SIGINT", () => rememberEarlySignal("SIGINT"));
+process.on("SIGTERM", () => rememberEarlySignal("SIGTERM"));
 
 const jiti = createJiti(import.meta.url, { interopDefault: false });
 const [
@@ -44,13 +56,46 @@ function requestCancel(signal) {
 	process.exitCode = 130;
 }
 
-// Install signal handling before anything that can take time (payload and
-// sidecar reads included) so an early operator interrupt is recorded instead
-// of killing the worker with no terminal result. Keep handling repeated
-// signals: escalation re-sends SIGTERM, and a `once` handler would let the
-// second delivery kill the worker before it records a terminal result.
+// Keep handling repeated signals: escalation re-sends SIGTERM, and a `once`
+// handler would let the second delivery kill the worker before it records a
+// terminal result. A signal remembered during module import is replayed now.
 process.on("SIGINT", () => requestCancel("SIGINT"));
 process.on("SIGTERM", () => requestCancel("SIGTERM"));
+if (earlySignal !== undefined) requestCancel(earlySignal);
+
+/**
+ * The payload lives at `<runsDir>/<runId>/attempts/<attemptId>/worker.json`
+ * and the worker is spawned with the run's cwd, so the run/attempt reference
+ * can be recovered from the path alone when the payload itself is unreadable.
+ * Returns undefined when the path does not have that shape.
+ */
+async function referenceFromPayloadPath(path) {
+	const attemptDir = dirname(path);
+	const attemptsDir = dirname(attemptDir);
+	const runDir = dirname(attemptsDir);
+	const runsDir = dirname(runDir);
+	if (basename(attemptsDir) !== "attempts") return undefined;
+	const runId = basename(runDir);
+	const attemptId = basename(attemptDir);
+	const safe = /^[A-Za-z0-9._-]+$/u;
+	if (!safe.test(runId) || !safe.test(attemptId)) return undefined;
+	// The registry stores the logical cwd (it may be a symlinked spelling of
+	// process.cwd()); use it so the terminal commit matches the record.
+	let record;
+	try {
+		record = JSON.parse(await readFile(join(runDir, "run.json"), "utf8"));
+	} catch {
+		record = undefined;
+	}
+	const cwd =
+		typeof record?.cwd === "string" && record.cwd.length > 0 ? record.cwd : process.cwd();
+	const runsDirRelative =
+		typeof record?.runsDir === "string" && record.runsDir.length > 0
+			? record.runsDir
+			: relative(cwd, runsDir);
+	if (runsDirRelative.startsWith("..") || isAbsolute(runsDirRelative)) return undefined;
+	return { cwd, runId, attemptId, runsDir: runsDirRelative };
+}
 
 function spawnTerminalFinalizer({ ref, attemptId, status, worker, cwd }) {
 	const finalizerPath = fileURLToPath(
@@ -82,24 +127,28 @@ function spawnTerminalFinalizer({ ref, attemptId, status, worker, cwd }) {
 async function failUnresolvedPayload(raw, error) {
 	const message = error instanceof Error ? error.message : String(error);
 	console.error(message);
-	const cwd = typeof raw?.cwd === "string" ? raw.cwd : undefined;
-	const runId = typeof raw?.runId === "string" ? raw.runId : undefined;
-	const attemptId = typeof raw?.attemptId === "string" ? raw.attemptId : undefined;
+	// Prefer the payload's own plain fields; fall back to the reference encoded
+	// in the payload path when the payload is unreadable or malformed.
+	const fromPath = await referenceFromPayloadPath(payloadPath);
+	const cwd = typeof raw?.cwd === "string" ? raw.cwd : fromPath?.cwd;
+	const runId = typeof raw?.runId === "string" ? raw.runId : fromPath?.runId;
+	const attemptId = typeof raw?.attemptId === "string" ? raw.attemptId : fromPath?.attemptId;
 	if (cwd === undefined || runId === undefined || attemptId === undefined) {
 		process.exit(1);
 	}
-	const runsDir = typeof raw?.input?.runsDir === "string" ? raw.input.runsDir : undefined;
+	const runsDir =
+		typeof raw?.input?.runsDir === "string" ? raw.input.runsDir : fromPath?.runsDir;
 	try {
 		const worker = await processIdentity.captureProcessIdentity(process.pid);
 		const store = await artifacts.createAttemptArtifactStore({ cwd, runId, attemptId, runsDir });
 		const stderr = await store.writeTextArtifact("stderr", `${message}\n`);
 		const status = executionAbort.signal.aborted ? "cancelled" : "failed";
 		await store.writeResult({
-			backend: raw.backend ?? "headless",
+			backend: raw?.backend ?? "headless",
 			status,
 			failureKind: executionAbort.signal.aborted ? "user_cancelled" : "guard_failure",
 			cwd,
-			startedAt: raw.startedAt ?? new Date().toISOString(),
+			startedAt: raw?.startedAt ?? new Date().toISOString(),
 			completedAt: new Date().toISOString(),
 			workspace: { mode: "shared", cwd },
 			sandbox: { enabled: Boolean(raw?.input?.sandbox) },
@@ -116,7 +165,12 @@ async function failUnresolvedPayload(raw, error) {
 	process.exit(1);
 }
 
-const payloadBytes = await readFile(payloadPath);
+let payloadBytes;
+try {
+	payloadBytes = await readFile(payloadPath);
+} catch (error) {
+	await failUnresolvedPayload(undefined, new Error(`durable worker payload could not be read: ${error instanceof Error ? error.message : String(error)}`));
+}
 // The launch digest covers the payload file exactly as written. Prompt
 // sidecars are bound through the size/SHA-256 references inside it and are
 // verified before use, so resolving them here does not weaken the digest.
@@ -125,8 +179,7 @@ let rawPayload;
 try {
 	rawPayload = JSON.parse(payloadBytes.toString("utf8"));
 } catch (error) {
-	console.error(`durable worker payload is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
-	process.exit(1);
+	await failUnresolvedPayload(undefined, new Error(`durable worker payload is not valid JSON: ${error instanceof Error ? error.message : String(error)}`));
 }
 let payload;
 try {

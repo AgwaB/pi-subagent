@@ -3,12 +3,14 @@ import { join, relative, resolve } from "node:path";
 
 import { readRunRecord, removeRunIfStill, runPaths } from "../artifacts/registry.ts";
 import type { RunRecord } from "../artifacts/registry.ts";
+import { STATUSES } from "../core/constants.ts";
 import { readRunLocator, removeRunLocator } from "./run-ref.ts";
 
 const DEFAULT_KEEP = 50;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
+const SAFE_RUN_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 const TERMINAL = new Set<string>(["completed", "failed", "cancelled"]);
+const KNOWN_STATUS = new Set<string>(STATUSES);
 
 export interface PruneSubagentRunsOptions {
 	cwd?: string;
@@ -62,23 +64,46 @@ function normalizeOlderThanDays(value: number | undefined): number | undefined {
 	return value;
 }
 
+function requireStatus(value: unknown, what: string): string {
+	if (typeof value !== "string" || !KNOWN_STATUS.has(value))
+		throw new Error(`${what} has an unknown status ${JSON.stringify(value)}`);
+	return value;
+}
+
 /**
- * A run is prunable only when the run and every attempt/task carry a terminal
- * status. Throws on a structurally malformed record so the caller can classify
- * it as unreadable instead of guessing.
+ * A run is prunable only when the record is well formed and the run and every
+ * attempt/task carry a terminal status. Throws on anything malformed (missing
+ * ids, unknown statuses, dangling active attempt, id mismatch) so the caller
+ * classifies the directory as unreadable instead of guessing.
  */
-export function isFullyTerminalRunRecord(record: RunRecord): boolean {
-	if (!TERMINAL.has(record.status)) return false;
+export function isFullyTerminalRunRecord(record: RunRecord, expectedRunId?: string): boolean {
+	if (typeof record !== "object" || record === null) throw new Error("run record is not an object");
+	if (typeof record.runId !== "string" || record.runId.length === 0)
+		throw new Error("run record has no runId");
+	if (expectedRunId !== undefined && record.runId !== expectedRunId)
+		throw new Error(`run record id ${record.runId} does not match directory ${expectedRunId}`);
+	const status = requireStatus(record.status, "run record");
 	if (!Array.isArray(record.attempts)) throw new Error("run record has no attempts array");
+	const attemptIds = new Set<string>();
+	let terminal = TERMINAL.has(status);
 	for (const attempt of record.attempts) {
-		if (typeof attempt?.status !== "string") throw new Error("attempt record has no status");
-		if (!TERMINAL.has(attempt.status)) return false;
+		if (typeof attempt?.attemptId !== "string" || attempt.attemptId.length === 0)
+			throw new Error("attempt record has no attemptId");
+		attemptIds.add(attempt.attemptId);
+		if (!TERMINAL.has(requireStatus(attempt.status, `attempt ${attempt.attemptId}`))) terminal = false;
 	}
 	for (const task of record.tasks ?? []) {
-		if (typeof task?.status !== "string") throw new Error("task record has no status");
-		if (!TERMINAL.has(task.status)) return false;
+		if (typeof task?.taskId !== "string" || task.taskId.length === 0)
+			throw new Error("task record has no taskId");
+		if (!TERMINAL.has(requireStatus(task.status, `task ${task.taskId}`))) terminal = false;
 	}
-	return true;
+	if (
+		record.activeAttemptId !== null &&
+		record.activeAttemptId !== undefined &&
+		!attemptIds.has(record.activeAttemptId)
+	)
+		throw new Error(`run record activeAttemptId ${record.activeAttemptId} is not an attempt`);
+	return terminal;
 }
 
 function recordUpdatedAt(record: RunRecord): { updatedAt: string; updatedMs: number } {
@@ -108,9 +133,12 @@ async function removeLocatorIfOwned(
 	runId: string,
 	cwd: string,
 	runsDir: string,
+	notAfterMs: number,
 ): Promise<void> {
 	const locator = await readRunLocator(runId);
 	if (locator === null) return;
+	const locatorUpdatedMs = Date.parse(locator.updatedAt);
+	if (Number.isFinite(locatorUpdatedMs) && locatorUpdatedMs > notAfterMs) return;
 	// Compare physical paths: cwd/runsDir here are realpaths, locators store
 	// the path as given (for example /var vs /private/var on macOS).
 	const locatorCwd = await realpath(locator.cwd).catch(() => resolve(locator.cwd));
@@ -194,13 +222,15 @@ export async function pruneSubagentRuns(
 	const runsDirRelative = relative(cwd, runsDir);
 	const ref = (runId: string) => ({ cwd, runsDir: runsDirRelative, runId });
 
+	const scanStartedAt = Date.now();
 	const entries = await readdir(runsDir, { withFileTypes: true }).catch(() => []);
 	const terminal: Array<PruneSubagentRunCandidate & { updatedMs: number }> = [];
 	const skippedActive: string[] = [];
 	const skippedUnreadable: string[] = [];
 	let scanned = 0;
 	for (const entry of entries) {
-		// Dirent.isDirectory() is false for symlinks, so linked entries are skipped.
+		// Dirent.isDirectory() is false for symlinks, so linked entries are
+		// skipped; hidden entries (the `.locks` directory) are not runs.
 		if (!entry.isDirectory() || !SAFE_RUN_ID.test(entry.name)) continue;
 		scanned += 1;
 		const runId = entry.name;
@@ -210,7 +240,7 @@ export async function pruneSubagentRuns(
 				skippedUnreadable.push(runId);
 				continue;
 			}
-			if (!isFullyTerminalRunRecord(record)) {
+			if (!isFullyTerminalRunRecord(record, runId)) {
 				skippedActive.push(runId);
 				continue;
 			}
@@ -246,18 +276,28 @@ export async function pruneSubagentRuns(
 					deleteErrors.push({ runId: candidate.runId, message: "run directory changed since scan; skipped" });
 					continue;
 				}
-				const outcome = await removeRunIfStill(ref(candidate.runId), (record) => {
-					try {
-						return isFullyTerminalRunRecord(record);
-					} catch {
-						return false;
-					}
-				});
+				const outcome = await removeRunIfStill(
+					ref(candidate.runId),
+					(record) => {
+						try {
+							return isFullyTerminalRunRecord(record, candidate.runId);
+						} catch {
+							return false;
+						}
+					},
+					{
+						// Exact generation check: a record touched since the scan is
+						// not the one that was selected.
+						expectedUpdatedAt: candidate.updatedAt,
+						// Locator cleanup runs under the same lock, and only for a
+						// locator that predates this prune.
+						afterRemove: () => removeLocatorIfOwned(candidate.runId, cwd, runsDir, scanStartedAt),
+					},
+				);
 				if (outcome !== "removed") {
 					deleteErrors.push({ runId: candidate.runId, message: `run ${outcome} since scan; skipped` });
 					continue;
 				}
-				await removeLocatorIfOwned(candidate.runId, cwd, runsDir);
 				deletedRunIds.push(candidate.runId);
 				deletedBytes += candidate.bytes;
 			} catch (error) {

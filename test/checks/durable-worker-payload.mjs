@@ -257,6 +257,66 @@ try {
 		assert.match(brokenStderr, /task\.md|ENOENT|sidecar|reference/iu, `stderr explains the failure: ${brokenStderr}`);
 	}
 
+	// 5c. A payload that is not even valid JSON still terminalizes: the worker
+	// recovers the run/attempt reference from the payload path.
+	{
+		const jsonRunId = "run_payload_invalid_json";
+		const jsonAttemptId = "attempt_payload_invalid_json";
+		const jsonStartedAt = new Date();
+		const jsonStore = await createAttemptArtifactStore({ cwd, runId: jsonRunId, attemptId: jsonAttemptId });
+		const jsonPayloadPath = jsonStore.pathFor("worker");
+		await writeFile(jsonPayloadPath, "{");
+		const jsonRunning = await jsonStore.writeResult({
+			backend: "headless",
+			status: "running",
+			failureKind: null,
+			cwd,
+			startedAt: jsonStartedAt,
+			completedAt: null,
+			workspace: { mode: "shared", cwd },
+			sandbox: { enabled: false },
+			exitCode: null,
+			signal: null,
+			artifacts: [jsonStore.refFor("worker", 1)],
+			metadata: { contextLengthExceeded: false },
+		});
+		await upsertRunAttempt({
+			cwd,
+			runId: jsonRunId,
+			attemptId: jsonAttemptId,
+			status: "running",
+			backend: "headless",
+			startedAt: jsonStartedAt,
+			artifactCwd: cwd,
+			resultPath: jsonRunning.artifacts.find((artifact) => artifact.type === "result")?.path,
+			createOnly: true,
+			requireNoActive: true,
+			activate: true,
+		});
+		await beginRunRecord({
+			cwd,
+			runId: jsonRunId,
+			mode: "single",
+			backend: "headless",
+			startedAt: jsonStartedAt,
+			dependency: "unclassified",
+			activeAttemptId: jsonAttemptId,
+			attempts: [],
+		});
+		const jsonWorker = spawn(process.execPath, [workerScript, jsonPayloadPath], {
+			cwd,
+			detached: process.platform !== "win32",
+			stdio: "ignore",
+		});
+		jsonWorker.unref();
+		const jsonWait = await waitForSubagent({ cwd, runId: jsonRunId, attemptId: jsonAttemptId, timeoutMs: 60_000, pollIntervalMs: 100 });
+		assert.equal(jsonWait.status, "completed", `worker with an unparseable payload must terminalize: ${JSON.stringify(jsonWait)}`);
+		assert.equal(jsonWait.snapshot?.status, "failed");
+		assert.equal(jsonWait.snapshot?.failureKind, "guard_failure");
+		assert.equal((await readRunRecord({ cwd, runId: jsonRunId }))?.activeAttemptId, null);
+		assert.match(await readFile(join(jsonStore.attemptDir, "stderr.log"), "utf8"), /not valid JSON/u);
+	}
+
 	// 6. End to end: a real detached durable worker launches from the reference payload.
 	const launched = await startAsyncSubagentRun({
 		cwd,

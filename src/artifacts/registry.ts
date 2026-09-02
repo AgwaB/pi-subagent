@@ -26,6 +26,8 @@ import type {
 } from "./result.ts";
 
 const DEFAULT_RUNS_DIR = ".pi/agent/runs";
+/** Hidden directory under a runs dir that holds per-run lock directories. */
+export const RUN_LOCKS_DIR = ".locks";
 const RUN_RECORD_SCHEMA_VERSION = 2 as const;
 const RUN_EVENT_SCHEMA_VERSION = 2 as const;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -46,7 +48,6 @@ const properLockfile = createRequire(import.meta.url)("proper-lockfile") as {
 				maxTimeout: number;
 				randomize: boolean;
 			};
-			onCompromised?: (error: Error) => void;
 		},
 	) => Promise<() => Promise<void>>;
 };
@@ -445,7 +446,9 @@ export function runPaths(ref: RunRef): RunPaths {
 		runDir,
 		runJsonPath: join(runDir, "run.json"),
 		eventsPath: join(runDir, "events.jsonl"),
-		lockPath: join(runDir, "run.lock"),
+		// The run lock lives beside the run directory, not inside it, so it stays
+		// a stable fence while the directory itself is renamed or removed.
+		lockPath: join(runsDir, RUN_LOCKS_DIR, `${ref.runId}.lock`),
 	};
 }
 
@@ -493,15 +496,11 @@ async function writeRecordPath(
 async function withFileLock<T>(
 	lockPath: string,
 	fn: () => Promise<T>,
-	options: { onCompromised?: (error: Error) => void } = {},
 ): Promise<T> {
 	await mkdir(dirname(lockPath), { recursive: true });
 	const release = await properLockfile.lock(lockPath, {
 		realpath: false,
 		lockfilePath: lockPath,
-		...(options.onCompromised === undefined
-			? {}
-			: { onCompromised: options.onCompromised }),
 		// Never steal a lease based on elapsed wall time. A paused live writer
 		// cannot be distinguished safely from a crashed one without fencing.
 		stale: Number.MAX_SAFE_INTEGER,
@@ -522,37 +521,46 @@ async function withFileLock<T>(
 }
 
 /**
- * Remove a run directory only while holding its run lock and only if
- * `isRemovable(record)` still holds under that lock, so a mutation cannot
- * interleave between validation and deletion. The directory is renamed to a
- * sibling tombstone under the lock (atomic) and the tombstone is deleted
- * afterwards, so a mutation that arrives later writes into a fresh directory
- * and is never partially deleted. Symlinked run directories are never
- * followed.
+ * Remove a run directory while holding its run lock for the whole operation:
+ * re-validation (`isRemovable`, plus an exact `expectedUpdatedAt` generation
+ * check when given), an `lstat` that refuses symlinks, an atomic rename to a
+ * sibling tombstone, removal of the tombstone, and the caller's `afterRemove`
+ * (for example locator cleanup). Because the lock lives beside the run
+ * directory rather than inside it, every mutation serializes with the
+ * deletion: one that arrives while the lock is held waits and then either
+ * fails or, through `beginRunRecord`, starts a fresh record after the
+ * deletion has fully completed. Nothing is ever partially deleted.
  */
 export async function removeRunIfStill(
 	ref: RunRef,
 	isRemovable: (record: RunRecord) => boolean,
+	options: {
+		expectedUpdatedAt?: string;
+		afterRemove?: () => Promise<void>;
+	} = {},
 ): Promise<"removed" | "changed" | "missing"> {
 	const paths = runPaths(ref);
-	const tombstone = `${paths.runDir}.pruning-${process.pid}-${randomBytes(4).toString("hex")}`;
-	const outcome = await withFileLock(
-		paths.lockPath,
-		async () => {
-			const existing = await readRecordPath(paths);
-			if (existing === null) return "missing" as const;
-			if (!isRemovable(existing)) return "changed" as const;
-			const info = await lstat(paths.runDir);
-			if (!info.isDirectory()) return "changed" as const;
-			await rename(paths.runDir, tombstone);
-			return "removed" as const;
-		},
-		// The lock directory moves with the run directory; a lock-refresh that
-		// notices the move must not throw from a timer.
-		{ onCompromised: () => undefined },
+	const tombstone = join(
+		paths.runsDir,
+		RUN_LOCKS_DIR,
+		`${ref.runId}.pruning-${process.pid}-${randomBytes(4).toString("hex")}`,
 	);
-	if (outcome === "removed") await rm(tombstone, { recursive: true, force: true });
-	return outcome;
+	return await withFileLock(paths.lockPath, async () => {
+		const existing = await readRecordPath(paths);
+		if (existing === null) return "missing" as const;
+		if (!isRemovable(existing)) return "changed" as const;
+		if (
+			options.expectedUpdatedAt !== undefined &&
+			existing.updatedAt !== options.expectedUpdatedAt
+		)
+			return "changed" as const;
+		const info = await lstat(paths.runDir);
+		if (!info.isDirectory()) return "changed" as const;
+		await rename(paths.runDir, tombstone);
+		await rm(tombstone, { recursive: true, force: true });
+		await options.afterRemove?.();
+		return "removed" as const;
+	});
 }
 
 async function withRunMutation<T>(
@@ -563,8 +571,8 @@ async function withRunMutation<T>(
 	) => Promise<{ record: RunRecord; value: T }>,
 ): Promise<T> {
 	const paths = runPaths(ref);
-	await mkdir(paths.runDir, { recursive: true });
 	return await withFileLock(paths.lockPath, async () => {
+		await mkdir(paths.runDir, { recursive: true });
 		const existing = await readRecordPath(paths);
 		const { record, value } = await fn(existing, paths);
 		await writeRecordPath(paths.runJsonPath, record);

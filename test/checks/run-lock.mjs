@@ -3,12 +3,13 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, utimes } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	beginRunRecord,
 	commitAttemptResultIfActive,
 	createAttemptArtifactStore,
 	readRunRecord,
+	runPaths,
 	updateAttemptProcess,
 	upsertRunAttempt,
 } from "../../src/artifacts/index.ts";
@@ -111,9 +112,8 @@ try {
   // 2. Elapsed wall time alone never steals an atomic lock directory.
   const staleCwd = join(tempRoot, "stale");
   const staleRunId = "run_lock_stale";
-  const staleLockDir = join(staleCwd, ".pi/agent/runs", staleRunId);
-  await mkdir(staleLockDir, { recursive: true });
-  const staleLockPath = join(staleLockDir, "run.lock");
+  const staleLockPath = runPaths({ cwd: staleCwd, runId: staleRunId }).lockPath;
+  await mkdir(dirname(staleLockPath), { recursive: true });
   await mkdir(staleLockPath);
   const staleTime = new Date(Date.now() - 60_000);
   await utimes(staleLockPath, staleTime, staleTime);
@@ -129,9 +129,8 @@ try {
   // 3. A lock held by a live owner is never stolen; the waiter times out.
   const liveCwd = join(tempRoot, "live");
   const liveRunId = "run_lock_live";
-  const liveLockDir = join(liveCwd, ".pi/agent/runs", liveRunId);
-  await mkdir(liveLockDir, { recursive: true });
-  const liveLockPath = join(liveLockDir, "run.lock");
+  const liveLockPath = runPaths({ cwd: liveCwd, runId: liveRunId }).lockPath;
+  await mkdir(dirname(liveLockPath), { recursive: true });
   const releaseLiveLock = await properLockfile.lock(liveLockPath, {
     realpath: false,
     lockfilePath: liveLockPath,

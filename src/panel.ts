@@ -613,7 +613,8 @@ async function loadRunsFromCwd(
 	let invalid = 0;
 
 	for (const runEntry of runEntries) {
-		if (!runEntry.isDirectory()) continue;
+		// Hidden entries such as the `.locks` directory are not runs.
+		if (!runEntry.isDirectory() || runEntry.name.startsWith(".")) continue;
 		const runDir = join(runsDir, runEntry.name);
 		const registry = await readJson(join(runDir, "run.json"));
 		if (isRegistryRunRecord(registry)) {
