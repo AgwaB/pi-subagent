@@ -31,6 +31,7 @@ import {
 	tmuxOwnershipTokenDigest,
 	TmuxOwnershipError,
 } from "../../src/runners/tmux-control.ts";
+import { userCancelledAbortReason } from "../../src/core/constants.ts";
 import { runTmuxModel } from "../../src/runners/tmux.ts";
 import {
 	captureProcessIdentity,
@@ -276,6 +277,39 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 			Date.now() - hungOwnershipStartedAt < 2_000,
 			"abort must bound a hung tmux ownership callback",
 		);
+
+		// After the pane is running, a tagged operator abort (what the durable
+		// worker sends on SIGTERM/SIGINT) must be recorded as user_cancelled,
+		// while a plain caller abort stays "abort".
+		const longPanePi = join(tempRoot, "long-pane-pi");
+		await writeFile(
+			longPanePi,
+			`#!/usr/bin/env node
+await new Promise((resolveSleep) => setTimeout(resolveSleep, 20_000));
+`,
+			{ mode: 0o700 },
+		);
+		for (const [label, reason, expectedKind] of [
+			["tagged", userCancelledAbortReason("durable worker received SIGTERM"), "user_cancelled"],
+			["plain", undefined, "abort"],
+		]) {
+			const runningAbort = new AbortController();
+			const runningResult = await runTmuxModel({
+				cwd: paneGateCwd,
+				runId: `run_tmux_running_abort_${label}`,
+				attemptId: `attempt_tmux_running_abort_${label}`,
+				piCommand: longPanePi,
+				agent: "running-abort-worker",
+				task: `abort while running (${label})`,
+				timeoutMs: 30_000,
+				signal: runningAbort.signal,
+				onTmuxStart: async (tmux) => {
+					if (tmux.launchState === "running") runningAbort.abort(reason);
+				},
+			});
+			assert.equal(runningResult.status, "cancelled", `${label}: ${JSON.stringify(runningResult)}`);
+			assert.equal(runningResult.failureKind, expectedKind, `${label} abort after launch records ${expectedKind}`);
+		}
 
 		const executionError = new TmuxOwnershipError(
 			"sandbox execution callback ownership failure",

@@ -41,6 +41,7 @@ let orphanWorkerPid;
 let orphanChildPid;
 let unrelatedProcess;
 let workerRaceProbe;
+let epermProcess;
 let partialCleanupChild;
 let partialCleanupUnrelated;
 let deadLeaderChildPid;
@@ -1007,6 +1008,88 @@ try {
 	await sleep(900);
 	await assert.rejects(access(deadLeaderSideEffect));
 
+	// macOS answers a process-group signal with EPERM while the group holds only
+	// an unreaped zombie. Reconciliation must treat that as "not delivered" and
+	// let its liveness checks decide, never throw out of the initial SIGTERM.
+	const epermCwd = join(tempRoot, "eperm-group");
+	epermProcess = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+	assert.equal(typeof epermProcess.pid, "number");
+	const epermIdentity = await captureProcessIdentity(epermProcess.pid);
+	// A terminal result with a lingering owned process group: reconcile commits
+	// the result only after draining the group, which starts with SIGTERM.
+	const epermStore = await createAttemptArtifactStore({
+		cwd: epermCwd,
+		runId: "run_reconcile_eperm",
+		attemptId: "attempt_eperm",
+	});
+	const epermEnvelope = await epermStore.writeResult({
+		backend: "headless",
+		status: "completed",
+		failureKind: null,
+		cwd: epermCwd,
+		startedAt: new Date().toISOString(),
+		completedAt: new Date().toISOString(),
+		workspace: { mode: "shared", cwd: epermCwd, worktreePath: null },
+		sandbox: { enabled: false },
+		exitCode: 0,
+		signal: null,
+		artifacts: [],
+		metadata: { contextLengthExceeded: false },
+	});
+	// The owning durable worker is already dead; only the child group lingers.
+	const epermWorker = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+	const epermWorkerIdentity = await captureProcessIdentity(epermWorker.pid);
+	epermWorker.kill("SIGKILL");
+	for (let index = 0; index < 100 && pidAlive(epermWorker.pid); index += 1) await sleep(10);
+	await createRunningAttempt(epermCwd, "run_reconcile_eperm", "attempt_eperm", {
+		heartbeatAt: new Date(Date.now() - 60_000).toISOString(),
+		process: {
+			pid: epermIdentity.pid,
+			processGroupId: epermIdentity.processGroupId,
+			processBirthIdentity: epermIdentity.birthIdentity,
+			workerPid: epermWorkerIdentity.pid,
+			workerProcessGroupId: epermWorkerIdentity.processGroupId,
+			workerProcessBirthIdentity: epermWorkerIdentity.birthIdentity,
+			command: "headless child",
+		},
+		resultPath: epermEnvelope.artifacts.find((artifact) => artifact.type === "result")?.path,
+	});
+	const realKillForEperm = process.kill;
+	let epermGroupSignals = 0;
+	process.kill = function epermGroupKill(pid, signal) {
+		if (typeof pid === "number" && pid < 0 && signal !== 0 && signal !== undefined) {
+			epermGroupSignals += 1;
+			// The real process keeps running; simulate the kernel refusing delivery.
+			throw Object.assign(new Error("kill EPERM"), { code: "EPERM", errno: -1, syscall: "kill" });
+		}
+		return realKillForEperm.call(process, pid, signal);
+	};
+	let epermReconcile;
+	try {
+		epermReconcile = await reconcileSubagentRun({
+			cwd: epermCwd,
+			runId: "run_reconcile_eperm",
+			staleAfterMs: 1,
+		});
+	} finally {
+		process.kill = realKillForEperm;
+	}
+	assert.ok(epermGroupSignals >= 1, `reconcile attempted a process-group signal: ${JSON.stringify(epermReconcile)}`);
+	assert.equal(
+		epermReconcile.status,
+		"cleanup-blocked",
+		`EPERM on a live group must surface as cleanup-blocked, not throw: ${JSON.stringify(epermReconcile)}`,
+	);
+	assert.equal(pidAlive(epermProcess.pid), true, "the live process was not killed through the patched path");
+	// Once the process is actually gone, the same run reconciles to a terminal state.
+	realKillForEperm.call(process, epermProcess.pid, "SIGKILL");
+	for (let index = 0; index < 100 && pidAlive(epermProcess.pid); index += 1) await sleep(10);
+	const epermAfter = await reconcileSubagentRun({ cwd: epermCwd, runId: "run_reconcile_eperm", staleAfterMs: 1 });
+	assert.ok(
+		["committed-result", "already-terminal"].includes(epermAfter.status),
+		`dead process lets the terminal result commit: ${JSON.stringify(epermAfter)}`,
+	);
+
 	console.log(
 		JSON.stringify({ name: "check-reconcile", status: "completed" }, null, 2),
 	);
@@ -1029,6 +1112,13 @@ try {
 			process.kill(-unrelatedProcess.pid, "SIGKILL");
 		} catch {
 			unrelatedProcess.kill("SIGKILL");
+		}
+	}
+	if (epermProcess?.pid && pidAlive(epermProcess.pid)) {
+		try {
+			process.kill(-epermProcess.pid, "SIGKILL");
+		} catch {
+			epermProcess.kill("SIGKILL");
 		}
 	}
 	if (workerRaceProbe?.pid && pidAlive(workerRaceProbe.pid)) {
