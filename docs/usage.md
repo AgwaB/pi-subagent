@@ -500,10 +500,14 @@ Runs write durable evidence under:
     └── <attempt-id>/
         ├── result.json
         ├── worker.json
+        ├── task.md
+        ├── system-prompt.md
         ├── stdout.log
         ├── stderr.log
         └── output.log
 ```
+
+`worker.json` is the launch payload a detached worker reads once at startup. Long prompt strings are not inlined: the task text is stored in `task.md` and the compiled system prompt (when present) in `system-prompt.md`, and `worker.json` references them as `input.taskRef` / `input.systemPromptRef` with `{ path, bytes, sha256 }`. The worker resolves each reference from the payload's own directory and refuses a sidecar whose size or digest does not match, so the payload digest recorded by the durable launch barrier still binds the prompt bytes. Payloads written by earlier versions with inline `input.task` / `input.systemPrompt` remain valid and are accepted unchanged; a payload may not carry both forms of the same field. Callers that already persist the identical prompt bytes elsewhere may hard-link to these sidecars.
 
 `run.json` records a `parentSessionId` field: the Pi session id of the session that launched the run, injected from the tool context (not a model-settable argument). Consumers (e.g. status panels) can use it to scope a shared per-`cwd` runs directory to the session that owns each run. The field is omitted when no session id is available, and older records simply lack it.
 

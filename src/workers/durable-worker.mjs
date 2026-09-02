@@ -19,18 +19,31 @@ if (!payloadPath) {
 }
 
 const jiti = createJiti(import.meta.url, { interopDefault: false });
-const [orchestration, artifacts, launchBarrier, constants, processIdentity] =
-	await Promise.all([
+const [
+	orchestration,
+	artifacts,
+	launchBarrier,
+	constants,
+	processIdentity,
+	payloadModule,
+] = await Promise.all([
 	jiti.import("../orchestrate/run.ts"),
 	jiti.import("../artifacts/index.ts"),
 	jiti.import("../durable-launch-barrier.ts"),
 	jiti.import("../core/constants.ts"),
 	jiti.import("../process-identity.ts"),
-	]);
+	jiti.import("../durable-worker-payload.ts"),
+]);
 
 const payloadBytes = await readFile(payloadPath);
+// The launch digest covers the payload file exactly as written. Prompt
+// sidecars are bound through the size/SHA-256 references inside it and are
+// verified before use, so resolving them here does not weaken the digest.
 const launchPayloadSha256 = createHash("sha256").update(payloadBytes).digest("hex");
-const payload = JSON.parse(payloadBytes.toString("utf8"));
+const payload = await payloadModule.resolveDurableWorkerPayload(
+	JSON.parse(payloadBytes.toString("utf8")),
+	payloadPath,
+);
 const { input, cwd, runId, attemptId } = payload;
 const heartbeatMs = Math.max(
 	50,

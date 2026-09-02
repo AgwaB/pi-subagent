@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -31,6 +30,7 @@ import {
 import { writeRunLocator } from "./run-ref.ts";
 import { readRunResult, waitForRun } from "./status.ts";
 import { captureProcessIdentity } from "../process-identity.ts";
+import { writeDurableWorkerPayload } from "../durable-worker-payload.ts";
 
 export interface StartAsyncSubagentRunOptions {
 	input: ResolveInput;
@@ -237,12 +237,16 @@ export async function startAsyncSubagentRun(
 		runsDir: input.runsDir,
 	});
 	const payloadPath = store.pathFor("worker");
-	const payloadText = `${JSON.stringify({ input, cwd: options.cwd, backend: options.backend, runId, attemptId, startedAt: startedAt.toISOString() }, null, 2)}\n`;
-	await writeFile(payloadPath, payloadText);
-	const workerRef = store.refFor(
-		"worker",
-		Buffer.byteLength(payloadText, "utf8"),
-	);
+	const payload = await writeDurableWorkerPayload({
+		payloadPath,
+		input,
+		cwd: options.cwd,
+		backend: options.backend,
+		runId,
+		attemptId,
+		startedAt: startedAt.toISOString(),
+	});
+	const workerRef = store.refFor("worker", payload.bytes);
 
 	const running = await store.writeResult({
 		backend: options.backend,
