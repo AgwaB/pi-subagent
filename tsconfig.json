@@ -6,6 +6,8 @@
     "lib": ["es2023"],
     "types": ["node"],
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
     "skipLibCheck": true,
