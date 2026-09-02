@@ -616,6 +616,53 @@ try {
 				previousTerminalDelay;
 	}
 
+	// When the kernel refuses every initial signal with EPERM (macOS, zombie-only
+	// group), interrupt must report the attempt as unsupported rather than throw.
+	{
+		const epermTarget = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+		const epermIdentity = await captureProcessIdentity(epermTarget.pid);
+		const epermRunId = "run_interrupt_eperm_target";
+		const epermAttemptId = "attempt_interrupt_eperm_target";
+		const epermStartedAt = new Date();
+		await beginRunRecord({
+			cwd,
+			runId: epermRunId,
+			mode: "single",
+			backend: "headless",
+			startedAt: epermStartedAt,
+			activeAttemptId: epermAttemptId,
+			attempts: [
+				{
+					attemptId: epermAttemptId,
+					status: "running",
+					backend: "headless",
+					startedAt: epermStartedAt.toISOString(),
+					process: {
+						pid: epermIdentity.pid,
+						processGroupId: epermIdentity.processGroupId,
+						processBirthIdentity: epermIdentity.birthIdentity,
+					},
+				},
+			],
+		});
+		const realKill = process.kill;
+		process.kill = function epermKill(pid, signal) {
+			if (typeof pid === "number" && (pid === epermIdentity.pid || pid === -epermIdentity.processGroupId) && signal !== 0 && signal !== undefined)
+				throw Object.assign(new Error("kill EPERM"), { code: "EPERM", errno: -1, syscall: "kill" });
+			return realKill.call(process, pid, signal);
+		};
+		let epermInterrupt;
+		try {
+			epermInterrupt = await interruptSubagent({ cwd, runId: epermRunId, reason: "eperm" });
+		} finally {
+			process.kill = realKill;
+		}
+		assert.equal(epermInterrupt.status, "unsupported", JSON.stringify(epermInterrupt));
+		assert.deepEqual(epermInterrupt.unsupportedAttempts, [epermAttemptId]);
+		assert.equal(pidAlive(epermTarget.pid), true);
+		realKill.call(process, epermTarget.pid, "SIGKILL");
+	}
+
 	const shortTarget = spawn("/bin/sleep", ["30"], {
 		detached: true,
 		stdio: "ignore",
