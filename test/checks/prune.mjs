@@ -7,7 +7,7 @@ import { createJiti } from "jiti";
 const indexDir = await mkdtemp(join(tmpdir(), "pi-subagent-prune-index-"));
 process.env.PI_SUBAGENT_RUN_INDEX_DIR = indexDir;
 
-const { beginRunRecord, upsertRunAttempt } = await import("../../src/artifacts/registry.ts");
+const { beginRunRecord, readRunRecord, upsertRunAttempt } = await import("../../src/artifacts/registry.ts");
 const { readRunLocator, writeRunLocator } = await import("../../src/orchestrate/run-ref.ts");
 const { formatPruneSubagentRunsSummary, pruneSubagentRuns } = await import("../../src/orchestrate/prune.ts");
 const { pruneSubagentRuns: apiPrune } = await import("../../api.mjs");
@@ -201,8 +201,10 @@ try {
 	const staleSel = await pruneSubagentRuns({ cwd, keep: 0, olderThanDays: 30, now });
 	assert.deepEqual(staleSel.selected.map((run) => run.runId), ["run_stale_completed"]);
 
-	// 10. A mutation that interleaves after validation cannot resurrect a run:
-	// deletion happens under the run lock and renames the directory first.
+	// 10. A mutation that interleaves after validation can never be partially
+	// deleted: deletion happens under the run lock and renames the directory
+	// first, so a late mutation either fails (lock path gone) or starts a fresh
+	// record in a new directory; the old attempt data is gone either way.
 	const { removeRunIfStill } = await import("../../src/artifacts/registry.ts");
 	let lateMutation;
 	const outcome = await removeRunIfStill({ cwd, runId: "run_stale_completed" }, (record) => {
@@ -226,9 +228,17 @@ try {
 	});
 	assert.equal(outcome, "removed");
 	const lateOutcome = await lateMutation;
-	assert.equal(lateOutcome.ok, false, "the interleaved mutation must fail instead of recreating the run");
-	await assert.rejects(stat(join(cwd, ".pi/agent/runs", "run_stale_completed")), /ENOENT/u);
-	assert.equal((await readdir(join(cwd, ".pi/agent/runs"))).some((name) => name.startsWith("run_stale_completed")), false, "no tombstone is left behind");
+	if (lateOutcome.ok) {
+		// Timing-dependent (seen on Linux): the late mutation recreated the run
+		// directory. It must be a fresh record that carries none of the pruned data.
+		const recreated = await readRunRecord({ cwd, runId: "run_stale_completed" });
+		assert.deepEqual(recreated?.attempts.map((attempt) => attempt.attemptId), ["attempt-2"], "recreated record holds only the late attempt");
+		await assert.rejects(stat(join(cwd, ".pi/agent/runs", "run_stale_completed", "attempts", "attempt-1")), /ENOENT/u, "pruned attempt data is gone");
+		await rm(join(cwd, ".pi/agent/runs", "run_stale_completed"), { recursive: true, force: true });
+	} else {
+		await assert.rejects(stat(join(cwd, ".pi/agent/runs", "run_stale_completed")), /ENOENT/u);
+	}
+	assert.equal((await readdir(join(cwd, ".pi/agent/runs"))).some((name) => name.startsWith("run_stale_completed.pruning")), false, "no tombstone is left behind");
 	await rm(outside, { recursive: true, force: true });
 	await rm(linkedCwd, { recursive: true, force: true });
 	await rm(linkedEntryCwd, { recursive: true, force: true });

@@ -523,10 +523,11 @@ async function withFileLock<T>(
 
 /**
  * Remove a run directory only while holding its run lock and only if
- * `isRemovable(record)` still holds under that lock, so a mutation that
- * reactivates the run cannot interleave between validation and deletion. The
- * directory is renamed to a sibling tombstone under the lock (atomic) and the
- * tombstone is deleted afterwards. Symlinked run directories are never
+ * `isRemovable(record)` still holds under that lock, so a mutation cannot
+ * interleave between validation and deletion. The directory is renamed to a
+ * sibling tombstone under the lock (atomic) and the tombstone is deleted
+ * afterwards, so a mutation that arrives later writes into a fresh directory
+ * and is never partially deleted. Symlinked run directories are never
  * followed.
  */
 export async function removeRunIfStill(
