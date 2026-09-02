@@ -319,17 +319,23 @@ try {
 
 	// 5d. Valid JSON that is not a launch envelope (`{}`), and an envelope whose
 	// ids do not match its location, terminalize the same way.
+	const foreignCwd = join(root, "foreign-project");
+	await (await import("node:fs/promises")).mkdir(foreignCwd, { recursive: true });
 	for (const [label, payloadText] of [
 		["empty-object", "{}\n"],
 		["id-mismatch", JSON.stringify({ input: { task: "x" }, cwd, backend: "headless", runId: "run_somewhere_else", attemptId: "attempt_elsewhere", startedAt: new Date().toISOString() })],
 		["bad-fields", JSON.stringify({ input: { task: "x" }, cwd: "", backend: "bogus", runId: "", attemptId: "", startedAt: "yesterday" })],
+		// Matching ids but bookkeeping redirected elsewhere: must bind to the payload location.
+		["wrong-cwd", (runId, attemptId) => JSON.stringify({ input: { task: "x" }, cwd: foreignCwd, backend: "headless", runId, attemptId, startedAt: new Date().toISOString() })],
+		["escaping-runs-dir", (runId, attemptId) => JSON.stringify({ input: { task: "x", runsDir: "../outside" }, cwd, backend: "headless", runId, attemptId, startedAt: new Date().toISOString() })],
 	]) {
 		const shapeRunId = `run_payload_shape_${label}`;
 		const shapeAttemptId = `attempt_payload_shape_${label}`;
 		const shapeStartedAt = new Date();
 		const shapeStore = await createAttemptArtifactStore({ cwd, runId: shapeRunId, attemptId: shapeAttemptId });
 		const shapePayloadPath = shapeStore.pathFor("worker");
-		await writeFile(shapePayloadPath, payloadText);
+		const shapeText = typeof payloadText === "function" ? payloadText(shapeRunId, shapeAttemptId) : payloadText;
+		await writeFile(shapePayloadPath, shapeText);
 		const shapeRunning = await shapeStore.writeResult({
 			backend: "headless",
 			status: "running",
@@ -341,7 +347,7 @@ try {
 			sandbox: { enabled: false },
 			exitCode: null,
 			signal: null,
-			artifacts: [shapeStore.refFor("worker", Buffer.byteLength(payloadText))],
+			artifacts: [shapeStore.refFor("worker", Buffer.byteLength(shapeText))],
 			metadata: { contextLengthExceeded: false },
 		});
 		await upsertRunAttempt({
@@ -366,6 +372,8 @@ try {
 		assert.equal(shapeWait.snapshot?.failureKind, "guard_failure", label);
 		assert.equal((await readRunRecord({ cwd, runId: shapeRunId }))?.activeAttemptId, null, label);
 	}
+	await assert.rejects(stat(join(foreignCwd, ".pi")), /ENOENT/u, "a redirected cwd must not receive any bookkeeping");
+	await assert.rejects(stat(join(root, "outside")), /ENOENT/u, "an escaping runsDir must not be created");
 
 	// 6. End to end: a real detached durable worker launches from the reference payload.
 	const launched = await startAsyncSubagentRun({

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import { readFile, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 
@@ -196,14 +196,28 @@ let payload;
 try {
 	payloadModule.assertDurableWorkerPayloadShape(rawPayload);
 	payload = await payloadModule.resolveDurableWorkerPayload(rawPayload, payloadPath);
-	// The payload must describe the attempt directory it was read from.
+	// The payload must describe exactly the attempt directory it was read
+	// from: ids, cwd, and the effective runs directory all bind to the path,
+	// so a tampered envelope cannot redirect bookkeeping elsewhere.
 	const located = await referenceFromPayloadPath(payloadPath);
-	if (
-		located !== undefined &&
-		(located.runId !== payload.runId || located.attemptId !== payload.attemptId)
-	)
+	if (located === undefined)
+		throw new Error(`durable worker payload location ${payloadPath} is not an attempt directory`);
+	if (located.runId !== payload.runId || located.attemptId !== payload.attemptId)
 		throw new Error(
 			`durable worker payload ids (${payload.runId}/${payload.attemptId}) do not match the payload location ${payloadPath}`,
+		);
+	const physical = async (path) => {
+		try {
+			return await realpath(path);
+		} catch {
+			return resolve(path);
+		}
+	};
+	const payloadRunsDir = await physical(resolve(payload.cwd, payload.input.runsDir ?? ".pi/agent/runs"));
+	const locatedRunsDir = await physical(resolve(located.cwd, located.runsDir));
+	if (payloadRunsDir !== locatedRunsDir)
+		throw new Error(
+			`durable worker payload cwd/runsDir (${payloadRunsDir}) do not match the payload location (${locatedRunsDir})`,
 		);
 } catch (error) {
 	await failUnresolvedPayload(rawPayload, error);
@@ -344,24 +358,30 @@ const workerProcessMetadata = {
 	workerProcessGroupId: workerIdentity.processGroupId,
 	workerProcessBirthIdentity: workerIdentity.birthIdentity,
 };
-const workerRecord = await artifacts.updateAttemptWorkerProcess({
+// Ownership bookkeeping runs before the guarded execution block; a failure
+// here must still end the attempt through the same terminal path.
+try {
+	const workerRecord = await artifacts.updateAttemptWorkerProcess({
 		...runRef,
 		attemptId,
 		process: workerProcessMetadata,
 	});
-const persistedWorker = workerRecord.attempts.find(
-	(candidate) => candidate.attemptId === attemptId,
-);
-if (
-	workerRecord.activeAttemptId !== attemptId ||
-	persistedWorker?.process?.workerPid !== workerIdentity.pid ||
-	persistedWorker.process.workerProcessGroupId !== workerIdentity.processGroupId ||
-	persistedWorker.process.workerProcessBirthIdentity !==
-		workerIdentity.birthIdentity
-)
-	throw new Error(
-		"durable worker ownership metadata was not committed to the active attempt",
+	const persistedWorker = workerRecord.attempts.find(
+		(candidate) => candidate.attemptId === attemptId,
 	);
+	if (
+		workerRecord.activeAttemptId !== attemptId ||
+		persistedWorker?.process?.workerPid !== workerIdentity.pid ||
+		persistedWorker.process.workerProcessGroupId !== workerIdentity.processGroupId ||
+		persistedWorker.process.workerProcessBirthIdentity !==
+			workerIdentity.birthIdentity
+	)
+		throw new Error(
+			"durable worker ownership metadata was not committed to the active attempt",
+		);
+} catch (error) {
+	await failUnresolvedPayload(rawPayload, error);
+}
 heartbeat = setInterval(() => {
 	void artifacts
 		.recordAttemptHeartbeat({ ...runRef, attemptId })
