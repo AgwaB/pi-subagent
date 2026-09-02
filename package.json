@@ -68,6 +68,7 @@
     "check:durable-worker-preflight": "node ./test/checks/durable-worker-preflight.mjs",
     "check:durable-worker-payload": "node ./test/checks/durable-worker-payload.mjs",
     "check:sandbox-agent-locks": "node ./test/checks/sandbox-agent-locks.mjs",
+    "check:run-locator-sweep": "node ./test/checks/run-locator-sweep.mjs",
     "check:model:inline": "node ./test/integration/inline-model.mjs",
     "check:model:headless": "node ./test/integration/headless-model.mjs",
     "check:model:tmux": "node ./test/integration/tmux-model.mjs",
@@ -76,7 +77,7 @@
     "release:check": "node ./scripts/release-check.mjs",
     "check": "npm run check:static",
     "check:types": "tsc -p tsconfig.json",
-    "check:static": "npm run check:types && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:parent-session && npm run check:panel-session-scope && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:lifecycle && npm run check:fail-fast && npm run check:schema-sync && npm run check:run-lock && npm run check:darwin-process-identity && npm run check:release-workflow && npm run check:release-version && npm run check:reconcile && npm run check:tmux-ownership && npm run check:inline-sdk-compat && npm run check:headless-streaming && npm run check:usage-accumulation && npm run check:tool-result-budget && npm run check:durable-launch-barrier && npm run check:durable-worker-binding && npm run check:durable-worker-preflight && npm run check:durable-worker-payload && npm run check:sandbox-agent-locks",
+    "check:static": "npm run check:types && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:parent-session && npm run check:panel-session-scope && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:lifecycle && npm run check:fail-fast && npm run check:schema-sync && npm run check:run-lock && npm run check:darwin-process-identity && npm run check:release-workflow && npm run check:release-version && npm run check:reconcile && npm run check:tmux-ownership && npm run check:inline-sdk-compat && npm run check:headless-streaming && npm run check:usage-accumulation && npm run check:tool-result-budget && npm run check:durable-launch-barrier && npm run check:durable-worker-binding && npm run check:durable-worker-preflight && npm run check:durable-worker-payload && npm run check:sandbox-agent-locks && npm run check:run-locator-sweep",
     "check:integration": "npm run check:model:inline && npm run check:model:headless && npm run check:model:tmux"
   },
   "dependencies": {

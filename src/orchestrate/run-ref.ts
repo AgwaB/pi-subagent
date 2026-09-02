@@ -150,6 +150,65 @@ async function localRunDirExists(
 	return info?.isDirectory() === true;
 }
 
+/**
+ * Stale locators were previously pruned only when the run panel listed the
+ * index, so a machine that never opened the panel accumulated tens of
+ * thousands of entries. Writing a locator now also sweeps the index once per
+ * process, in the background, with a bounded number of deletions so the
+ * launch path never waits on it.
+ */
+const LOCATOR_SWEEP_MAX_DELETES = 500;
+let locatorSweepStarted = false;
+let locatorSweepPromise: Promise<number> | undefined;
+
+export async function pruneStaleRunLocators(
+	options: { maxDeletes?: number; now?: number } = {},
+): Promise<number> {
+	const maxDeletes = options.maxDeletes ?? LOCATOR_SWEEP_MAX_DELETES;
+	const now = options.now ?? Date.now();
+	const indexDir = runIndexDir();
+	const entries = await readdir(indexDir, { withFileTypes: true }).catch(
+		() => [],
+	);
+	let pruned = 0;
+	for (const entry of entries) {
+		if (pruned >= maxDeletes) break;
+		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+		const path = join(indexDir, entry.name);
+		try {
+			const info = await stat(path);
+			if (olderThanPruneThreshold(info.mtimeMs, now) && (await pruneLocator(path)))
+				pruned += 1;
+		} catch {
+			// A concurrently removed entry is not an error.
+		}
+	}
+	return pruned;
+}
+
+/** Test seam: forget that a sweep already ran in this process. */
+export function resetRunLocatorSweepForTests(): void {
+	locatorSweepStarted = false;
+	locatorSweepPromise = undefined;
+}
+
+/** Test seam: await the background sweep started by the last locator write. */
+export async function awaitRunLocatorSweepForTests(): Promise<number> {
+	return (await locatorSweepPromise) ?? 0;
+}
+
+function scheduleRunLocatorSweep(): void {
+	if (locatorSweepStarted) return;
+	locatorSweepStarted = true;
+	locatorSweepPromise = new Promise<number>((resolveSweep) => {
+		setImmediate(() => {
+			pruneStaleRunLocators()
+				.then(resolveSweep)
+				.catch(() => resolveSweep(0));
+		});
+	});
+}
+
 export async function writeRunLocator(
 	options: WriteRunLocatorOptions,
 ): Promise<void> {
@@ -174,6 +233,7 @@ export async function writeRunLocator(
 	const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
 	await writeFile(tempPath, `${JSON.stringify(locator, null, 2)}\n`);
 	await rename(tempPath, path);
+	scheduleRunLocatorSweep();
 }
 
 export async function readRunLocator(

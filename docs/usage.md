@@ -515,7 +515,7 @@ Runs write durable evidence under:
 
 `run.json` records a `parentSessionId` field: the Pi session id of the session that launched the run, injected from the tool context (not a model-settable argument). Consumers (e.g. status panels) can use it to scope a shared per-`cwd` runs directory to the session that owns each run. The field is omitted when no session id is available, and older records simply lack it.
 
-Recent runs also write a small locator file under Pi's global subagent-run index. A locator contains the `runId`, absolute `cwd`, optional `runsDir`, optional `parentSessionId`, optional `correlationId`, and `updatedAt`. It is not authoritative evidence and can become stale if the pointed-to run directory is moved or deleted; use `run.json`, `events.jsonl`, and attempt `result.json` as the source of truth.
+Recent runs also write a small locator file under Pi's global subagent-run index. Locators older than `PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS` (default 30 days; a negative value disables pruning) are swept in the background the first time a process writes a locator, at most 500 per sweep, and again whenever the run panel lists the index. A locator contains the `runId`, absolute `cwd`, optional `runsDir`, optional `parentSessionId`, optional `correlationId`, and `updatedAt`. It is not authoritative evidence and can become stale if the pointed-to run directory is moved or deleted; use `run.json`, `events.jsonl`, and attempt `result.json` as the source of truth.
 
 Older `schemaVersion: 1` artifacts under `<run-id>/<task-id>/` are still readable for compatibility.
 
