@@ -59,6 +59,13 @@ try {
   const completedWorkspace = await resolveWorkspace({ cwd: repo, input: { worktree: true }, mode: "single", runId: "run_check_worktree_removed", taskIndex: 0 });
   await writeFile(join(completedWorkspace.cwd, "README.md"), "base\ncompleted change\n");
   await writeFile(join(completedWorkspace.cwd, "new-file.txt"), "new content\n");
+  // Pi runtime state written by the child session inside the worktree must not
+  // appear as task output.
+  await mkdir(join(completedWorkspace.cwd, ".pi", "agent", "runs", "run_nested", "attempts", "a1"), { recursive: true });
+  await writeFile(join(completedWorkspace.cwd, ".pi", "agent", "runs", "run_nested", "run.json"), "{}\n");
+  await mkdir(join(completedWorkspace.cwd, ".pi", "workflows"), { recursive: true });
+  await writeFile(join(completedWorkspace.cwd, ".pi", "workflows", "index.json"), "{}\n");
+  await writeFile(join(completedWorkspace.cwd, ".pi", "workflows", "my-spec.json"), "{\"name\":\"kept\"}\n");
   const completed = await syntheticResult(repo, "run_check_worktree_removed", "attempt-1", "completed", {
     mode: completedWorkspace.mode,
     cwd: completedWorkspace.baseCwd,
@@ -72,6 +79,12 @@ try {
   const completedDiff = await readFile(join(repo, finalizedCompleted.workspace.worktreeDiffPath), "utf8");
   assert.match(completedDiff, /completed change/);
   assert.match(completedDiff, /new-file\.txt/);
+  assert.match(completedDiff, /my-spec\.json/, "user files under .pi/workflows stay in the diff");
+  assert.doesNotMatch(completedDiff, /\.pi\/agent\/runs/, "nested run state is excluded from the diff");
+  assert.doesNotMatch(completedDiff, /index\.json/, "workflow index is excluded from the diff");
+  const completedStatus = await readFile(join(repo, finalizedCompleted.workspace.worktreeStatusPath), "utf8");
+  assert.match(completedStatus, /new-file\.txt/);
+  assert.doesNotMatch(completedStatus, /\.pi\/agent\/runs|index\.json/);
 
   const failedWorkspace = await resolveWorkspace({ cwd: repo, input: { worktree: true }, mode: "single", runId: "run_check_worktree_kept", taskIndex: 1 });
   await writeFile(join(failedWorkspace.cwd, "README.md"), "base\nfailed change\n");

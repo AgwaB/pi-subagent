@@ -85,12 +85,24 @@ async function gitOutputAllowFailure(cwd: string, args: readonly string[]): Prom
   }
 }
 
+/**
+ * Pi runtime state that a child session writes inside the worktree is not task
+ * output: nested subagent runs and the workflow index would otherwise show up
+ * as "new files" in every diff artifact.
+ */
+const WORKTREE_DIFF_EXCLUDES = [
+  ":(glob,exclude)**/.pi/agent/runs/**",
+  ":(glob,exclude)**/.pi/workflows/index.json",
+  ":(glob,exclude)**/.pi/workflows/index.lock",
+];
+
 async function captureWorktreeArtifacts(result: ResultEnvelope, worktreePath: string): Promise<ArtifactRef[]> {
   const store = await createAttemptArtifactStore({ cwd: result.cwd, runId: result.runId, attemptId: result.attemptId });
-  await gitOutputAllowFailure(worktreePath, ["add", "-N", "--", "."]);
-  const status = await gitOutputAllowFailure(worktreePath, ["status", "--short"]);
-  const diffStat = await gitOutputAllowFailure(worktreePath, ["diff", "--stat", "--", "."]);
-  const diff = await gitOutputAllowFailure(worktreePath, ["diff", "--binary", "--", "."]);
+  const pathspec = [".", ...WORKTREE_DIFF_EXCLUDES];
+  await gitOutputAllowFailure(worktreePath, ["add", "-N", "--", ...pathspec]);
+  const status = await gitOutputAllowFailure(worktreePath, ["status", "--short", "--", ...pathspec]);
+  const diffStat = await gitOutputAllowFailure(worktreePath, ["diff", "--stat", "--", ...pathspec]);
+  const diff = await gitOutputAllowFailure(worktreePath, ["diff", "--binary", "--", ...pathspec]);
   return [
     await store.writeTextArtifact("worktree-status", status.length > 0 ? status : "(clean)\n"),
     await store.writeTextArtifact("worktree-diff", `${diffStat.trimEnd()}${diffStat.trim() && diff.trim() ? "\n\n" : ""}${diff}`),

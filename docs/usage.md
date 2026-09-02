@@ -405,7 +405,7 @@ completed -> capture status/diff artifacts, then remove the worktree
 failed/cancelled -> capture status/diff artifacts, keep the worktree for debugging
 ```
 
-Worktree evidence is recorded in `result.json` under `workspace.worktreeCleanupStatus`, `workspace.worktreeStatusPath`, and `workspace.worktreeDiffPath`.
+Worktree evidence is recorded in `result.json` under `workspace.worktreeCleanupStatus`, `workspace.worktreeStatusPath`, and `workspace.worktreeDiffPath`. The status/diff artifacts cover tracked and untracked changes but exclude Pi runtime state the child session writes inside the worktree (`.pi/agent/runs/**`, `.pi/workflows/index.json`, `.pi/workflows/index.lock`); other files under `.pi/` are reported like any other change.
 
 Kept worktrees (from failed or cancelled runs) live in `.pi-subagent-worktrees/` **next to** the repository root, not inside it, and are never pruned automatically. To clean up after debugging:
 
