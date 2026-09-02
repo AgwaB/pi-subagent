@@ -1135,6 +1135,16 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 				if (parentSessionId !== undefined)
 					validation.input.parentSessionId = parentSessionId;
 
+				// The effective cwd is the extension context's cwd, not the host
+				// process cwd. Pin it on the input before backend resolution so a
+				// foreign context cwd routes away from inline here, in prepared
+				// execution, and in the durable payload alike.
+				if (
+					validation.input.cwd === undefined &&
+					resolve(cwd) !== resolve(process.cwd())
+				)
+					validation.input.cwd = cwd;
+
 				const resolved = resolveBackend(validation.input);
 				if (resolved.status === "failed") return validationFailure(resolved);
 

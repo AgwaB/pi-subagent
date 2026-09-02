@@ -424,7 +424,7 @@ Backend is optional. When omitted, the engine uses auto-selection:
 | `visible: true` | `tmux` |
 | `sandbox: true` | `headless`, unless tmux/visible is explicit |
 | worktree isolation requested (`worktree`, `workspace: "worktree"`, `worktreePolicy: "required"`, or `workspace: "auto"` with a sandbox) | `headless` |
-| `cwd` set to a directory other than the parent process cwd | `headless` |
+| effective cwd (the `cwd` argument, or the extension context's cwd when the argument is omitted) is a directory other than the parent process cwd | `headless` |
 | normal `agent`/`task` | `inline` |
 
 Supported explicit backend values are `auto`, `inline`, `headless`, and `tmux`. Most users should omit `backend`. Use `visible: true` only when you want a tmux-backed visible worker.
