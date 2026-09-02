@@ -265,6 +265,57 @@ try {
 	await rm(linkedCwd, { recursive: true, force: true });
 	await rm(linkedEntryCwd, { recursive: true, force: true });
 
+	// 10b. Every registry writer that targets an existing run serializes with
+	// the deletion and never recreates a directory for a pruned run: a late
+	// event append fails, and late commit/refresh/terminal-event writers report
+	// "not current" without leaving a ghost directory behind.
+	{
+		const {
+			appendRunEvent,
+			appendTerminalEventsIfCurrent,
+			commitAttemptResultIfActive,
+			refreshTerminalAttemptResultIfCurrent,
+		} = await import("../../src/artifacts/registry.ts");
+		const { createAttemptArtifactStore } = await import("../../src/artifacts/store.ts");
+		await seedRun("run_late_writers", { status: "completed", ageDays: 90 });
+		const lateStore = await createAttemptArtifactStore({ cwd, runId: "run_late_writers", attemptId: "attempt-1" });
+		const lateResult = await lateStore.writeResult({
+			backend: "headless",
+			status: "completed",
+			failureKind: null,
+			cwd,
+			startedAt: new Date(now - 90 * DAY),
+			completedAt: new Date(now - 90 * DAY),
+			workspace: { mode: "shared", cwd },
+			sandbox: { enabled: false },
+			exitCode: 0,
+			signal: null,
+			artifacts: [],
+			metadata: { contextLengthExceeded: false },
+		});
+		const lateRef = { cwd, runId: "run_late_writers" };
+		const lateWriters = [];
+		const removed = await removeRunIfStill(lateRef, (record) => {
+			// The locked writers start while the lock is held; they must wait.
+			lateWriters.push(
+				commitAttemptResultIfActive(lateRef, lateResult).then((value) => `commit:${value.committed}`),
+				refreshTerminalAttemptResultIfCurrent(lateRef, lateResult).then((value) => `refresh:${value.refreshed}`),
+				appendTerminalEventsIfCurrent(lateRef, { attemptId: "attempt-1", status: "completed", attemptMessage: "late", runMessage: "late" }).then((value) => `terminal:${value.current}`),
+			);
+			return record.status === "completed";
+		});
+		assert.equal(removed, "removed");
+		const lateOutcomes = await Promise.all(lateWriters);
+		assert.deepEqual(lateOutcomes, ["commit:false", "refresh:false", "terminal:false"]);
+		// An unlocked event append after removal fails instead of creating a directory.
+		await assert.rejects(
+			appendRunEvent(lateRef, { type: "run.mark_background", status: "completed", message: "late" }),
+			/ENOENT/u,
+			"late event append must fail",
+		);
+		await assert.rejects(stat(join(cwd, ".pi/agent/runs", "run_late_writers")), /ENOENT/u, "no ghost directory is recreated by late writers");
+	}
+
 	// 11. Default keep is 50 and the api.mjs export is the same function.
 	const viaApi = await apiPrune({ cwd });
 	assert.equal(viaApi.keep, 50);

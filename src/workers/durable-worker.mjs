@@ -129,26 +129,37 @@ async function failUnresolvedPayload(raw, error) {
 	console.error(message);
 	// Prefer the payload's own plain fields; fall back to the reference encoded
 	// in the payload path when the payload is unreadable or malformed.
+	// The path-derived reference wins whenever it exists: it is where the
+	// launcher put this payload. Raw fields are used only when they are safe
+	// and the path gives no answer.
 	const fromPath = await referenceFromPayloadPath(payloadPath);
-	const cwd = typeof raw?.cwd === "string" ? raw.cwd : fromPath?.cwd;
-	const runId = typeof raw?.runId === "string" ? raw.runId : fromPath?.runId;
-	const attemptId = typeof raw?.attemptId === "string" ? raw.attemptId : fromPath?.attemptId;
+	const safeId = /^[A-Za-z0-9._-]+$/u;
+	const rawId = (value) => (typeof value === "string" && safeId.test(value) ? value : undefined);
+	const cwd = fromPath?.cwd ?? (typeof raw?.cwd === "string" && raw.cwd.length > 0 ? raw.cwd : undefined);
+	const runId = fromPath?.runId ?? rawId(raw?.runId);
+	const attemptId = fromPath?.attemptId ?? rawId(raw?.attemptId);
 	if (cwd === undefined || runId === undefined || attemptId === undefined) {
 		process.exit(1);
 	}
 	const runsDir =
-		typeof raw?.input?.runsDir === "string" ? raw.input.runsDir : fromPath?.runsDir;
+		fromPath?.runsDir ??
+		(typeof raw?.input?.runsDir === "string" && raw.input.runsDir.length > 0 ? raw.input.runsDir : undefined);
 	try {
 		const worker = await processIdentity.captureProcessIdentity(process.pid);
 		const store = await artifacts.createAttemptArtifactStore({ cwd, runId, attemptId, runsDir });
 		const stderr = await store.writeTextArtifact("stderr", `${message}\n`);
 		const status = executionAbort.signal.aborted ? "cancelled" : "failed";
+		const backend = ["inline", "headless", "tmux"].includes(raw?.backend) ? raw.backend : "headless";
+		const startedAt =
+			typeof raw?.startedAt === "string" && Number.isFinite(Date.parse(raw.startedAt))
+				? raw.startedAt
+				: new Date().toISOString();
 		await store.writeResult({
-			backend: raw?.backend ?? "headless",
+			backend,
 			status,
 			failureKind: executionAbort.signal.aborted ? "user_cancelled" : "guard_failure",
 			cwd,
-			startedAt: raw?.startedAt ?? new Date().toISOString(),
+			startedAt,
 			completedAt: new Date().toISOString(),
 			workspace: { mode: "shared", cwd },
 			sandbox: { enabled: Boolean(raw?.input?.sandbox) },
@@ -183,7 +194,17 @@ try {
 }
 let payload;
 try {
+	payloadModule.assertDurableWorkerPayloadShape(rawPayload);
 	payload = await payloadModule.resolveDurableWorkerPayload(rawPayload, payloadPath);
+	// The payload must describe the attempt directory it was read from.
+	const located = await referenceFromPayloadPath(payloadPath);
+	if (
+		located !== undefined &&
+		(located.runId !== payload.runId || located.attemptId !== payload.attemptId)
+	)
+		throw new Error(
+			`durable worker payload ids (${payload.runId}/${payload.attemptId}) do not match the payload location ${payloadPath}`,
+		);
 } catch (error) {
 	await failUnresolvedPayload(rawPayload, error);
 }

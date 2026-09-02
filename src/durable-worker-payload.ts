@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 /**
  * Durable worker launch payload (`worker.json`).
@@ -133,6 +133,33 @@ function requireTextRef(value: unknown, ref: string): DurableWorkerTextRef {
  * pass through unchanged. Sidecars are read only from the payload's own
  * directory and must match the referenced size and SHA-256 exactly.
  */
+const SAFE_ID = /^[A-Za-z0-9._-]+$/u;
+const BACKENDS = new Set(["inline", "headless", "tmux"]);
+
+/**
+ * Structural validation of a launch payload before anything in the worker
+ * relies on its fields: plain-field presence and shape, safe ids, a known
+ * backend, a parseable start time, and an absolute cwd.
+ */
+export function assertDurableWorkerPayloadShape(
+	payload: unknown,
+): asserts payload is DurableWorkerPayload {
+	if (!isRecord(payload)) throw new Error("durable worker payload must be an object");
+	for (const field of ["cwd", "runId", "attemptId", "backend", "startedAt"] as const) {
+		if (typeof payload[field] !== "string" || (payload[field] as string).length === 0)
+			throw new Error(`durable worker payload ${field} must be a non-empty string`);
+	}
+	if (!isRecord(payload.input)) throw new Error("durable worker payload input must be an object");
+	const { cwd, runId, attemptId, backend, startedAt } = payload as unknown as DurableWorkerPayload;
+	if (!SAFE_ID.test(runId)) throw new Error(`durable worker payload runId ${JSON.stringify(runId)} is not a safe id`);
+	if (!SAFE_ID.test(attemptId))
+		throw new Error(`durable worker payload attemptId ${JSON.stringify(attemptId)} is not a safe id`);
+	if (!BACKENDS.has(backend)) throw new Error(`durable worker payload backend ${JSON.stringify(backend)} is unknown`);
+	if (!Number.isFinite(Date.parse(startedAt)))
+		throw new Error(`durable worker payload startedAt ${JSON.stringify(startedAt)} is not a timestamp`);
+	if (!isAbsolute(cwd)) throw new Error("durable worker payload cwd must be absolute");
+}
+
 export async function resolveDurableWorkerPayload<T extends { input?: unknown }>(
 	payload: T,
 	payloadPath: string,

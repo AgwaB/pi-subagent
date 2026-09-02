@@ -963,7 +963,8 @@ export async function commitAttemptResultIfActive(
 	result: ResultEnvelope,
 ): Promise<{ committed: boolean; record: RunRecord | null }> {
 	const paths = runPaths(baseRef);
-	await mkdir(paths.runDir, { recursive: true });
+	// Operates on an existing record only: never create a run directory here,
+	// so a late commit cannot resurrect a run that prune removed.
 	return await withFileLock(paths.lockPath, async () => {
 		const existing = await readRecordPath(paths);
 		if (existing === null) return { committed: false, record: null };
@@ -1001,7 +1002,6 @@ export async function refreshTerminalAttemptResultIfCurrent(
 	result: ResultEnvelope,
 ): Promise<{ refreshed: boolean; record: RunRecord | null }> {
 	const paths = runPaths(baseRef);
-	await mkdir(paths.runDir, { recursive: true });
 	return await withFileLock(paths.lockPath, async () => {
 		const existing = await readRecordPath(paths);
 		if (existing === null) return { refreshed: false, record: null };
@@ -1120,8 +1120,11 @@ export async function recordInterruptRequest(
 	});
 }
 
+// Events are appended only to runs that `beginRunRecord` already created;
+// the directory is deliberately not created here, so an event written after
+// prune removed the run fails with ENOENT instead of leaving an event-only
+// ghost directory behind.
 async function appendJsonLine(path: string, event: RunEvent): Promise<void> {
-	await mkdir(dirname(path), { recursive: true });
 	await appendFile(path, `${JSON.stringify(event)}\n`);
 }
 
@@ -1132,7 +1135,6 @@ export async function appendRunEvent(
 	},
 ): Promise<RunEvent> {
 	const paths = runPaths(ref);
-	await mkdir(paths.runDir, { recursive: true });
 	const timestamp =
 		event.timestamp === undefined
 			? new Date().toISOString()
@@ -1257,7 +1259,6 @@ export async function appendTerminalEventsIfCurrent(
 	if (!isTerminalStatus(options.status))
 		throw new Error("terminal event publication requires terminal status");
 	const paths = runPaths(ref);
-	await mkdir(paths.runDir, { recursive: true });
 	return await withFileLock(paths.lockPath, async () => {
 		const record = await readRecordPath(paths);
 		if (

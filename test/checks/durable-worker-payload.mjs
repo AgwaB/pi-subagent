@@ -317,6 +317,56 @@ try {
 		assert.match(await readFile(join(jsonStore.attemptDir, "stderr.log"), "utf8"), /not valid JSON/u);
 	}
 
+	// 5d. Valid JSON that is not a launch envelope (`{}`), and an envelope whose
+	// ids do not match its location, terminalize the same way.
+	for (const [label, payloadText] of [
+		["empty-object", "{}\n"],
+		["id-mismatch", JSON.stringify({ input: { task: "x" }, cwd, backend: "headless", runId: "run_somewhere_else", attemptId: "attempt_elsewhere", startedAt: new Date().toISOString() })],
+		["bad-fields", JSON.stringify({ input: { task: "x" }, cwd: "", backend: "bogus", runId: "", attemptId: "", startedAt: "yesterday" })],
+	]) {
+		const shapeRunId = `run_payload_shape_${label}`;
+		const shapeAttemptId = `attempt_payload_shape_${label}`;
+		const shapeStartedAt = new Date();
+		const shapeStore = await createAttemptArtifactStore({ cwd, runId: shapeRunId, attemptId: shapeAttemptId });
+		const shapePayloadPath = shapeStore.pathFor("worker");
+		await writeFile(shapePayloadPath, payloadText);
+		const shapeRunning = await shapeStore.writeResult({
+			backend: "headless",
+			status: "running",
+			failureKind: null,
+			cwd,
+			startedAt: shapeStartedAt,
+			completedAt: null,
+			workspace: { mode: "shared", cwd },
+			sandbox: { enabled: false },
+			exitCode: null,
+			signal: null,
+			artifacts: [shapeStore.refFor("worker", Buffer.byteLength(payloadText))],
+			metadata: { contextLengthExceeded: false },
+		});
+		await upsertRunAttempt({
+			cwd,
+			runId: shapeRunId,
+			attemptId: shapeAttemptId,
+			status: "running",
+			backend: "headless",
+			startedAt: shapeStartedAt,
+			artifactCwd: cwd,
+			resultPath: shapeRunning.artifacts.find((artifact) => artifact.type === "result")?.path,
+			createOnly: true,
+			requireNoActive: true,
+			activate: true,
+		});
+		await beginRunRecord({ cwd, runId: shapeRunId, mode: "single", backend: "headless", startedAt: shapeStartedAt, dependency: "unclassified", activeAttemptId: shapeAttemptId, attempts: [] });
+		const shapeWorker = spawn(process.execPath, [workerScript, shapePayloadPath], { cwd, detached: process.platform !== "win32", stdio: "ignore" });
+		shapeWorker.unref();
+		const shapeWait = await waitForSubagent({ cwd, runId: shapeRunId, attemptId: shapeAttemptId, timeoutMs: 60_000, pollIntervalMs: 100 });
+		assert.equal(shapeWait.status, "completed", `${label}: worker must terminalize: ${JSON.stringify(shapeWait)}`);
+		assert.equal(shapeWait.snapshot?.status, "failed", label);
+		assert.equal(shapeWait.snapshot?.failureKind, "guard_failure", label);
+		assert.equal((await readRunRecord({ cwd, runId: shapeRunId }))?.activeAttemptId, null, label);
+	}
+
 	// 6. End to end: a real detached durable worker launches from the reference payload.
 	const launched = await startAsyncSubagentRun({
 		cwd,
