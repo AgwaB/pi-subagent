@@ -1,13 +1,14 @@
-import { readdir, rm, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { lstat, readdir, realpath, stat } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 
-import { readRunRecord, runPaths } from "../artifacts/registry.ts";
+import { readRunRecord, removeRunIfStill, runPaths } from "../artifacts/registry.ts";
 import type { RunRecord } from "../artifacts/registry.ts";
 import { readRunLocator, removeRunLocator } from "./run-ref.ts";
 
 const DEFAULT_KEEP = 50;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
+const TERMINAL = new Set<string>(["completed", "failed", "cancelled"]);
 
 export interface PruneSubagentRunsOptions {
 	cwd?: string;
@@ -24,6 +25,7 @@ export interface PruneSubagentRunsOptions {
 export interface PruneSubagentRunCandidate {
 	runId: string;
 	status: RunRecord["status"];
+	/** Last update of the run record; ordering and `olderThanDays` use this. */
 	updatedAt: string;
 	bytes: number;
 }
@@ -41,7 +43,7 @@ export interface PruneSubagentRunsSummary {
 	deletedBytes: number;
 	/** Non-terminal runs; never deleted. Use `reconcile` on stale ones first. */
 	skippedActive: string[];
-	/** Directories without a readable run record; never deleted. */
+	/** Directories without a readable, well-formed run record; never deleted. */
 	skippedUnreadable: string[];
 	deleteErrors: Array<{ runId: string; message: string }>;
 }
@@ -60,17 +62,32 @@ function normalizeOlderThanDays(value: number | undefined): number | undefined {
 	return value;
 }
 
-function isTerminal(status: RunRecord["status"]): boolean {
-	return status === "completed" || status === "failed" || status === "cancelled";
+/**
+ * A run is prunable only when the run and every attempt/task carry a terminal
+ * status. Throws on a structurally malformed record so the caller can classify
+ * it as unreadable instead of guessing.
+ */
+export function isFullyTerminalRunRecord(record: RunRecord): boolean {
+	if (!TERMINAL.has(record.status)) return false;
+	if (!Array.isArray(record.attempts)) throw new Error("run record has no attempts array");
+	for (const attempt of record.attempts) {
+		if (typeof attempt?.status !== "string") throw new Error("attempt record has no status");
+		if (!TERMINAL.has(attempt.status)) return false;
+	}
+	for (const task of record.tasks ?? []) {
+		if (typeof task?.status !== "string") throw new Error("task record has no status");
+		if (!TERMINAL.has(task.status)) return false;
+	}
+	return true;
 }
 
-/** A run is prunable only when the run and every attempt/task are terminal. */
-function isFullyTerminal(record: RunRecord): boolean {
-	return (
-		isTerminal(record.status) &&
-		record.attempts.every((attempt) => isTerminal(attempt.status)) &&
-		(record.tasks ?? []).every((task) => isTerminal(task.status))
-	);
+function recordUpdatedAt(record: RunRecord): { updatedAt: string; updatedMs: number } {
+	for (const candidate of [record.updatedAt, record.completedAt]) {
+		if (typeof candidate !== "string") continue;
+		const parsed = Date.parse(candidate);
+		if (Number.isFinite(parsed)) return { updatedAt: candidate, updatedMs: parsed };
+	}
+	throw new Error("run record has no valid updatedAt");
 }
 
 async function directoryBytes(path: string): Promise<number> {
@@ -94,9 +111,40 @@ async function removeLocatorIfOwned(
 ): Promise<void> {
 	const locator = await readRunLocator(runId);
 	if (locator === null) return;
-	const locatorRunsDir = resolve(locator.cwd, locator.runsDir ?? ".pi/agent/runs");
-	if (resolve(locator.cwd) !== cwd || locatorRunsDir !== runsDir) return;
+	// Compare physical paths: cwd/runsDir here are realpaths, locators store
+	// the path as given (for example /var vs /private/var on macOS).
+	const locatorCwd = await realpath(locator.cwd).catch(() => resolve(locator.cwd));
+	const locatorRunsDir = await realpath(
+		resolve(locator.cwd, locator.runsDir ?? ".pi/agent/runs"),
+	).catch(() => resolve(locatorCwd, locator.runsDir ?? ".pi/agent/runs"));
+	if (locatorCwd !== cwd || locatorRunsDir !== runsDir) return;
 	await removeRunLocator(runId);
+}
+
+/**
+ * Resolve the physical runs directory and require it to sit inside the
+ * physical cwd: a symlinked `runsDir` (or ancestor) must not turn a prune
+ * into a deletion elsewhere on disk. Returns null when the directory does
+ * not exist (nothing to prune).
+ */
+async function resolvePhysicalRunsDir(
+	cwd: string,
+	runsDir: string,
+): Promise<{ physicalCwd: string; physicalRunsDir: string } | null> {
+	const physicalCwd = await realpath(cwd);
+	let physicalRunsDir: string;
+	try {
+		physicalRunsDir = await realpath(runsDir);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+		throw error;
+	}
+	const rel = relative(physicalCwd, physicalRunsDir);
+	if (rel.startsWith("..") || resolve(physicalCwd, rel) !== physicalRunsDir)
+		throw new Error(
+			`runsDir resolves outside cwd (${physicalRunsDir} is not inside ${physicalCwd}); refusing to prune through a symlink.`,
+		);
+	return { physicalCwd, physicalRunsDir };
 }
 
 /**
@@ -104,6 +152,9 @@ async function removeLocatorIfOwned(
  * newest `keep` and, when given, are older than `olderThanDays`. Runs that are
  * not terminal are never touched, so a run still owned by a worker survives
  * even when it is stale; reconcile it first. Dry run unless `yes` is true.
+ * Each deletion re-validates the record under the run lock and renames the
+ * directory before removing it, so a concurrent mutation cannot reactivate a
+ * run that is being deleted.
  */
 export async function pruneSubagentRuns(
 	options: PruneSubagentRunsOptions = {},
@@ -117,7 +168,31 @@ export async function pruneSubagentRuns(
 		runsDir: options.runsDir,
 		runId: "run_prune_probe",
 	});
-	const { cwd, runsDir } = probe;
+	const summaryBase = {
+		cwd: probe.cwd,
+		runsDir: probe.runsDir,
+		keep,
+		...(olderThanDays === undefined ? {} : { olderThanDays }),
+	};
+	const physical = await resolvePhysicalRunsDir(probe.cwd, probe.runsDir);
+	if (physical === null)
+		return {
+			status: options.yes === true ? "pruned" : "dry-run",
+			...summaryBase,
+			scanned: 0,
+			terminal: 0,
+			selected: [],
+			deletedRunIds: [],
+			deletedBytes: 0,
+			skippedActive: [],
+			skippedUnreadable: [],
+			deleteErrors: [],
+		};
+	// All further work uses physical paths so no symlink is followed.
+	const cwd = physical.physicalCwd;
+	const runsDir = physical.physicalRunsDir;
+	const runsDirRelative = relative(cwd, runsDir);
+	const ref = (runId: string) => ({ cwd, runsDir: runsDirRelative, runId });
 
 	const entries = await readdir(runsDir, { withFileTypes: true }).catch(() => []);
 	const terminal: Array<PruneSubagentRunCandidate & { updatedMs: number }> = [];
@@ -125,32 +200,25 @@ export async function pruneSubagentRuns(
 	const skippedUnreadable: string[] = [];
 	let scanned = 0;
 	for (const entry of entries) {
+		// Dirent.isDirectory() is false for symlinks, so linked entries are skipped.
 		if (!entry.isDirectory() || !SAFE_RUN_ID.test(entry.name)) continue;
 		scanned += 1;
 		const runId = entry.name;
-		let record: RunRecord | null = null;
 		try {
-			record = await readRunRecord({ cwd, runsDir: options.runsDir, runId });
+			const record = await readRunRecord(ref(runId));
+			if (record === null) {
+				skippedUnreadable.push(runId);
+				continue;
+			}
+			if (!isFullyTerminalRunRecord(record)) {
+				skippedActive.push(runId);
+				continue;
+			}
+			const { updatedAt, updatedMs } = recordUpdatedAt(record);
+			terminal.push({ runId, status: record.status, updatedAt, updatedMs, bytes: 0 });
 		} catch {
-			record = null;
-		}
-		if (record === null) {
 			skippedUnreadable.push(runId);
-			continue;
 		}
-		if (!isFullyTerminal(record)) {
-			skippedActive.push(runId);
-			continue;
-		}
-		const updatedAt = record.completedAt ?? record.updatedAt;
-		const updatedMs = Date.parse(updatedAt);
-		terminal.push({
-			runId,
-			status: record.status,
-			updatedAt,
-			updatedMs: Number.isFinite(updatedMs) ? updatedMs : 0,
-			bytes: 0,
-		});
 	}
 	terminal.sort((a, b) => b.updatedMs - a.updatedMs || a.runId.localeCompare(b.runId));
 
@@ -172,20 +240,23 @@ export async function pruneSubagentRuns(
 	let deletedBytes = 0;
 	if (options.yes === true) {
 		for (const candidate of selected) {
-			const runDir = join(runsDir, candidate.runId);
 			try {
-				// Re-read immediately before deletion so a run that became active
-				// after the scan is never removed.
-				const latest = await readRunRecord({
-					cwd,
-					runsDir: options.runsDir,
-					runId: candidate.runId,
-				});
-				if (latest === null || !isFullyTerminal(latest)) {
-					deleteErrors.push({ runId: candidate.runId, message: "run changed since scan; skipped" });
+				const info = await lstat(join(runsDir, candidate.runId));
+				if (!info.isDirectory()) {
+					deleteErrors.push({ runId: candidate.runId, message: "run directory changed since scan; skipped" });
 					continue;
 				}
-				await rm(runDir, { recursive: true, force: true });
+				const outcome = await removeRunIfStill(ref(candidate.runId), (record) => {
+					try {
+						return isFullyTerminalRunRecord(record);
+					} catch {
+						return false;
+					}
+				});
+				if (outcome !== "removed") {
+					deleteErrors.push({ runId: candidate.runId, message: `run ${outcome} since scan; skipped` });
+					continue;
+				}
 				await removeLocatorIfOwned(candidate.runId, cwd, runsDir);
 				deletedRunIds.push(candidate.runId);
 				deletedBytes += candidate.bytes;
@@ -200,10 +271,7 @@ export async function pruneSubagentRuns(
 
 	return {
 		status: options.yes === true ? "pruned" : "dry-run",
-		cwd,
-		runsDir,
-		keep,
-		...(olderThanDays === undefined ? {} : { olderThanDays }),
+		...summaryBase,
 		scanned,
 		terminal: terminal.length,
 		selected,

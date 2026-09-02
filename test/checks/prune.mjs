@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createJiti } from "jiti";
@@ -36,6 +36,11 @@ async function seedRun(runId, { status, ageDays, activeAttempt = false, bytes = 
 	const attemptDir = join(cwd, ".pi/agent/runs", runId, "attempts", "attempt-1");
 	await mkdir(attemptDir, { recursive: true });
 	await writeFile(join(attemptDir, "output.log"), "x".repeat(bytes));
+	// Age the record: ordering and olderThanDays use the record's updatedAt.
+	const recordPath = join(cwd, ".pi/agent/runs", runId, "run.json");
+	const record = JSON.parse(await readFile(recordPath, "utf8"));
+	record.updatedAt = completedAt.toISOString();
+	await writeFile(recordPath, `${JSON.stringify(record, null, 2)}\n`);
 	await writeRunLocator({ runId, cwd: locatorCwd });
 }
 
@@ -151,7 +156,84 @@ try {
 	assert.equal(notices.at(-1).level, "warning");
 	assert.match(notices.at(-1).message, /Usage: \/subagent panel \| \/subagent prune/u);
 
-	// 7. Default keep is 50 and the api.mjs export is the same function.
+	// 7. Symlinked runs roots are refused; symlinked run entries are skipped.
+	const outside = await mkdtemp(join(tmpdir(), "pi-subagent-prune-outside-"));
+	await mkdir(join(outside, "run_victim", "attempts"), { recursive: true });
+	await writeFile(
+		join(outside, "run_victim", "run.json"),
+		JSON.stringify({ schemaVersion: 2, runId: "run_victim", mode: "single", backend: "headless", status: "completed", startedAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:00:00.000Z", activeAttemptId: null, attempts: [] }),
+	);
+	const linkedCwd = await mkdtemp(join(tmpdir(), "pi-subagent-prune-linked-"));
+	await mkdir(join(linkedCwd, ".pi", "agent"), { recursive: true });
+	await symlink(outside, join(linkedCwd, ".pi", "agent", "runs"));
+	await assert.rejects(
+		pruneSubagentRuns({ cwd: linkedCwd, keep: 0, yes: true }),
+		/refusing to prune through a symlink/u,
+		"a symlinked runs root must not be followed",
+	);
+	await stat(join(outside, "run_victim", "run.json"));
+	const linkedEntryCwd = await mkdtemp(join(tmpdir(), "pi-subagent-prune-linked-entry-"));
+	await mkdir(join(linkedEntryCwd, ".pi", "agent", "runs"), { recursive: true });
+	await symlink(join(outside, "run_victim"), join(linkedEntryCwd, ".pi", "agent", "runs", "run_link"));
+	const linkedEntry = await pruneSubagentRuns({ cwd: linkedEntryCwd, keep: 0, yes: true });
+	assert.equal(linkedEntry.scanned, 0, "symlinked run entries are not scanned");
+	await stat(join(outside, "run_victim", "run.json"));
+	assert.equal((await pruneSubagentRuns({ cwd: await mkdtemp(join(tmpdir(), "pi-subagent-prune-none-")), yes: true })).scanned, 0, "missing runs dir is a no-op");
+
+	// 8. Malformed records are skipped as unreadable, never thrown or deleted.
+	await mkdir(join(cwd, ".pi/agent/runs", "run_bad_shape"), { recursive: true });
+	await writeFile(join(cwd, ".pi/agent/runs", "run_bad_shape", "run.json"), JSON.stringify({ schemaVersion: 2, runId: "run_bad_shape", status: "completed" }));
+	const malformed = await pruneSubagentRuns({ cwd, keep: 0, yes: true, now });
+	assert.ok(malformed.skippedUnreadable.includes("run_bad_shape"));
+	await stat(join(cwd, ".pi/agent/runs", "run_bad_shape", "run.json"));
+
+	// 9. Ordering and olderThanDays use the record's updatedAt, not completedAt.
+	await seedRun("run_touched", { status: "completed", ageDays: 90 });
+	{
+		const recordPath = join(cwd, ".pi/agent/runs", "run_touched", "run.json");
+		const record = JSON.parse(await readFile(recordPath, "utf8"));
+		record.updatedAt = new Date(now - 1 * DAY).toISOString(); // touched recently (e.g. mark-background)
+		await writeFile(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+	}
+	const touched = await pruneSubagentRuns({ cwd, keep: 0, olderThanDays: 30, now });
+	assert.equal(touched.selected.some((run) => run.runId === "run_touched"), false, "recently updated run is not older than 30 days");
+	await seedRun("run_stale_completed", { status: "completed", ageDays: 90 });
+	const staleSel = await pruneSubagentRuns({ cwd, keep: 0, olderThanDays: 30, now });
+	assert.deepEqual(staleSel.selected.map((run) => run.runId), ["run_stale_completed"]);
+
+	// 10. A mutation that interleaves after validation cannot resurrect a run:
+	// deletion happens under the run lock and renames the directory first.
+	const { removeRunIfStill } = await import("../../src/artifacts/registry.ts");
+	let lateMutation;
+	const outcome = await removeRunIfStill({ cwd, runId: "run_stale_completed" }, (record) => {
+		// Interleave: a retry tries to reactivate the run while we hold the lock.
+		lateMutation = upsertRunAttempt({
+			cwd,
+			runId: "run_stale_completed",
+			attemptId: "attempt-2",
+			status: "running",
+			backend: "headless",
+			failureKind: null,
+			startedAt: new Date(),
+			completedAt: null,
+			activate: true,
+			onlyIfActive: false,
+		}).then(
+			() => ({ ok: true }),
+			(error) => ({ ok: false, error }),
+		);
+		return record.status === "completed";
+	});
+	assert.equal(outcome, "removed");
+	const lateOutcome = await lateMutation;
+	assert.equal(lateOutcome.ok, false, "the interleaved mutation must fail instead of recreating the run");
+	await assert.rejects(stat(join(cwd, ".pi/agent/runs", "run_stale_completed")), /ENOENT/u);
+	assert.equal((await readdir(join(cwd, ".pi/agent/runs"))).some((name) => name.startsWith("run_stale_completed")), false, "no tombstone is left behind");
+	await rm(outside, { recursive: true, force: true });
+	await rm(linkedCwd, { recursive: true, force: true });
+	await rm(linkedEntryCwd, { recursive: true, force: true });
+
+	// 11. Default keep is 50 and the api.mjs export is the same function.
 	const viaApi = await apiPrune({ cwd });
 	assert.equal(viaApi.keep, 50);
 	assert.equal(viaApi.status, "dry-run");

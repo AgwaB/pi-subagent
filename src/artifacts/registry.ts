@@ -1,8 +1,11 @@
+import { randomBytes } from "node:crypto";
 import {
 	appendFile,
+	lstat,
 	mkdir,
 	readFile,
 	rename,
+	rm,
 	stat,
 	writeFile,
 } from "node:fs/promises";
@@ -43,6 +46,7 @@ const properLockfile = createRequire(import.meta.url)("proper-lockfile") as {
 				maxTimeout: number;
 				randomize: boolean;
 			};
+			onCompromised?: (error: Error) => void;
 		},
 	) => Promise<() => Promise<void>>;
 };
@@ -489,11 +493,15 @@ async function writeRecordPath(
 async function withFileLock<T>(
 	lockPath: string,
 	fn: () => Promise<T>,
+	options: { onCompromised?: (error: Error) => void } = {},
 ): Promise<T> {
 	await mkdir(dirname(lockPath), { recursive: true });
 	const release = await properLockfile.lock(lockPath, {
 		realpath: false,
 		lockfilePath: lockPath,
+		...(options.onCompromised === undefined
+			? {}
+			: { onCompromised: options.onCompromised }),
 		// Never steal a lease based on elapsed wall time. A paused live writer
 		// cannot be distinguished safely from a crashed one without fencing.
 		stale: Number.MAX_SAFE_INTEGER,
@@ -511,6 +519,39 @@ async function withFileLock<T>(
 	} finally {
 		await release();
 	}
+}
+
+/**
+ * Remove a run directory only while holding its run lock and only if
+ * `isRemovable(record)` still holds under that lock, so a mutation that
+ * reactivates the run cannot interleave between validation and deletion. The
+ * directory is renamed to a sibling tombstone under the lock (atomic) and the
+ * tombstone is deleted afterwards. Symlinked run directories are never
+ * followed.
+ */
+export async function removeRunIfStill(
+	ref: RunRef,
+	isRemovable: (record: RunRecord) => boolean,
+): Promise<"removed" | "changed" | "missing"> {
+	const paths = runPaths(ref);
+	const tombstone = `${paths.runDir}.pruning-${process.pid}-${randomBytes(4).toString("hex")}`;
+	const outcome = await withFileLock(
+		paths.lockPath,
+		async () => {
+			const existing = await readRecordPath(paths);
+			if (existing === null) return "missing" as const;
+			if (!isRemovable(existing)) return "changed" as const;
+			const info = await lstat(paths.runDir);
+			if (!info.isDirectory()) return "changed" as const;
+			await rename(paths.runDir, tombstone);
+			return "removed" as const;
+		},
+		// The lock directory moves with the run directory; a lock-refresh that
+		// notices the move must not throw from a timer.
+		{ onCompromised: () => undefined },
+	);
+	if (outcome === "removed") await rm(tombstone, { recursive: true, force: true });
+	return outcome;
 }
 
 async function withRunMutation<T>(
