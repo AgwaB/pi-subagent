@@ -415,9 +415,13 @@ Backend is optional. When omitted, the engine uses auto-selection:
 |---|---|
 | `visible: true` | `tmux` |
 | `sandbox: true` | `headless`, unless tmux/visible is explicit |
+| worktree isolation requested (`worktree`, `workspace: "worktree"`, `worktreePolicy: "required"`, or `workspace: "auto"` with a sandbox) | `headless` |
+| `cwd` set to a directory other than the parent process cwd | `headless` |
 | normal `agent`/`task` | `inline` |
 
 Supported explicit backend values are `auto`, `inline`, `headless`, and `tmux`. Most users should omit `backend`. Use `visible: true` only when you want a tmux-backed visible worker.
+
+`inline` runs the child session inside the parent Pi process and inherits the parent's ambient extensions. An extension that re-registers a built-in tool (for example a `bash` wrapper) binds that tool to the parent's process cwd, so inline cannot guarantee that tools operate inside a managed worktree or in another `cwd`. Auto-selection therefore uses `headless` for those requests, and an explicit `backend: "inline"` combined with a worktree request is rejected as a validation error instead of silently running against the shared checkout.
 
 Child sessions load Pi's normal ambient extensions and skills by default, so package tools such as web access are available when enabled in Pi settings. Pass `extensions: []` or `skills: []` for a hermetic child. Recursive subagent spawning is blocked by excluding the `subagent` tool from child sessions.
 

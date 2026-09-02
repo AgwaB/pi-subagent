@@ -3,7 +3,8 @@ import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createAttemptArtifactStore, type ArtifactRef, type ResultEnvelope } from "../artifacts/index.ts";
-import type { ResolveInput, WorkspaceMode, WorktreePolicy } from "../core/constants.ts";
+import type { ResolveInput, WorkspaceMode } from "../core/constants.ts";
+import { resolveWorktreeIntent } from "./intent.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,16 +26,6 @@ export class WorkspacePolicyError extends Error {
   readonly failureKind = "validation" as const;
 }
 
-function workspaceMode(input: ResolveInput): WorkspaceMode {
-  const workspace = input.workspace;
-  if (typeof workspace === "string") return workspace;
-  return workspace?.mode ?? "shared";
-}
-
-function hasExplicitWorkspaceAuto(input: ResolveInput): boolean {
-  return input.workspace === "auto" || (typeof input.workspace === "object" && input.workspace !== null && input.workspace.mode === "auto");
-}
-
 function explicitWorkspacePath(input: ResolveInput): string | undefined {
   const workspace = input.workspace;
   if (typeof workspace === "object" && workspace !== null) return workspace.path;
@@ -42,27 +33,6 @@ function explicitWorkspacePath(input: ResolveInput): string | undefined {
   return undefined;
 }
 
-function worktreePolicy(input: ResolveInput): WorktreePolicy {
-  return input.worktreePolicy ?? "auto";
-}
-
-function resolveWorktreeIntent(input: ResolveInput): "shared" | "worktree" {
-  const policy = worktreePolicy(input);
-  const workspace = workspaceMode(input);
-
-  // Explicit isolation requests are honored or fail loudly in a non-git cwd;
-  // they are never silently downgraded to shared.
-  if (policy === "required") return "worktree";
-  if (input.worktree === true || typeof input.worktree === "string") return "worktree";
-  if (workspace === "worktree") return "worktree";
-  if (policy === "never") return "shared";
-  if (hasExplicitWorkspaceAuto(input) && input.sandbox !== undefined && input.sandbox !== null) return "worktree";
-
-  // Default is shared for both single and parallel runs. Parallel fanout is
-  // usually read-only (reviews, analysis); callers running parallel mutating
-  // tasks should request worktree isolation explicitly.
-  return "shared";
-}
 
 async function gitOutput(cwd: string, args: readonly string[]): Promise<string> {
   const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf8" });

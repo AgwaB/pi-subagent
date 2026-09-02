@@ -46,6 +46,52 @@ const cases = [
     expected: { status: "failed", failureKind: "validation" },
     errorIncludes: "unsupported backend",
   },
+  {
+    name: "auto with worktree:true resolves to headless (inline cannot isolate)",
+    input: { worktree: true, agent: "worker", task: "inspect" },
+    expected: { backend: "headless", status: "completed" },
+  },
+  {
+    name: "auto with workspace mode worktree resolves to headless",
+    input: { workspace: { mode: "worktree" }, agent: "worker", task: "inspect" },
+    expected: { backend: "headless", status: "completed" },
+  },
+  {
+    name: "auto with worktreePolicy required resolves to headless",
+    input: { worktreePolicy: "required", agent: "worker", task: "inspect" },
+    expected: { backend: "headless", status: "completed" },
+  },
+  {
+    name: "auto with a cwd outside the process cwd resolves to headless",
+    input: { cwd: process.cwd() === "/" ? "/tmp" : "/", agent: "worker", task: "inspect" },
+    expected: { backend: "headless", status: "completed" },
+  },
+  {
+    name: "auto with the process cwd stays inline",
+    input: { cwd: process.cwd(), agent: "worker", task: "inspect" },
+    expected: { backend: "inline", status: "completed" },
+  },
+  {
+    name: "auto with worktreePolicy never stays inline",
+    input: { worktreePolicy: "never", agent: "worker", task: "inspect" },
+    expected: { backend: "inline", status: "completed" },
+  },
+  {
+    name: "explicit inline with worktree:true fails closed",
+    input: { backend: "inline", worktree: true, agent: "worker", task: "inspect" },
+    expected: { backend: "inline", status: "failed", failureKind: "validation" },
+    errorIncludes: "inline execution cannot isolate a worktree",
+  },
+  {
+    name: "explicit inline with a different cwd stays inline",
+    input: { backend: "inline", cwd: process.cwd() === "/" ? "/tmp" : "/", agent: "worker", task: "inspect" },
+    expected: { backend: "inline", status: "completed" },
+  },
+  {
+    name: "explicit headless with worktree stays headless",
+    input: { backend: "headless", worktree: true, agent: "worker", task: "inspect" },
+    expected: { backend: "headless", status: "completed" },
+  },
 ];
 
 for (const testCase of cases) {
