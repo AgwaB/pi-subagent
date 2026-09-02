@@ -176,9 +176,88 @@ try {
 		/already declares taskRef/u,
 	);
 
-	// 6. End to end: a real detached durable worker launches from the reference payload.
+	// 5b. Provider-free: a real detached worker whose sidecar is missing must
+	// still end the attempt in a terminal state (the launcher already recorded
+	// it as running), instead of exiting and leaving the run "running" forever.
 	const cwd = join(root, "project");
 	await (await import("node:fs/promises")).mkdir(cwd, { recursive: true });
+	{
+		const brokenRunId = "run_payload_broken_sidecar";
+		const brokenAttemptId = "attempt_payload_broken";
+		const brokenStartedAt = new Date();
+		const brokenStore = await createAttemptArtifactStore({ cwd, runId: brokenRunId, attemptId: brokenAttemptId });
+		const brokenPayloadPath = brokenStore.pathFor("worker");
+		const brokenWritten = await writeDurableWorkerPayload({
+			payloadPath: brokenPayloadPath,
+			input: { backend: "headless", task: "This prompt will go missing.", onComplete: "detach", sandbox: false },
+			cwd,
+			backend: "headless",
+			runId: brokenRunId,
+			attemptId: brokenAttemptId,
+			startedAt: brokenStartedAt.toISOString(),
+		});
+		const brokenRunning = await brokenStore.writeResult({
+			backend: "headless",
+			status: "running",
+			failureKind: null,
+			cwd,
+			startedAt: brokenStartedAt,
+			completedAt: null,
+			workspace: { mode: "shared", cwd },
+			sandbox: { enabled: false },
+			exitCode: null,
+			signal: null,
+			artifacts: [brokenStore.refFor("worker", brokenWritten.bytes)],
+			metadata: { contextLengthExceeded: false },
+		});
+		await upsertRunAttempt({
+			cwd,
+			runId: brokenRunId,
+			attemptId: brokenAttemptId,
+			status: "running",
+			backend: "headless",
+			startedAt: brokenStartedAt,
+			artifactCwd: cwd,
+			resultPath: brokenRunning.artifacts.find((artifact) => artifact.type === "result")?.path,
+			createOnly: true,
+			requireNoActive: true,
+			activate: true,
+		});
+		await beginRunRecord({
+			cwd,
+			runId: brokenRunId,
+			mode: "single",
+			backend: "headless",
+			startedAt: brokenStartedAt,
+			dependency: "unclassified",
+			activeAttemptId: brokenAttemptId,
+			attempts: [],
+		});
+		await rm(join(brokenStore.attemptDir, "task.md"));
+		const brokenWorker = spawn(process.execPath, [workerScript, brokenPayloadPath], {
+			cwd,
+			detached: process.platform !== "win32",
+			stdio: "ignore",
+		});
+		brokenWorker.unref();
+		const brokenWait = await waitForSubagent({
+			cwd,
+			runId: brokenRunId,
+			attemptId: brokenAttemptId,
+			timeoutMs: 60_000,
+			pollIntervalMs: 100,
+		});
+		assert.equal(brokenWait.status, "completed", `worker with a missing sidecar must terminalize: ${JSON.stringify(brokenWait)}`);
+		assert.equal(brokenWait.snapshot?.status, "failed");
+		assert.equal(brokenWait.snapshot?.failureKind, "guard_failure");
+		const brokenRecord = await readRunRecord({ cwd, runId: brokenRunId });
+		assert.equal(brokenRecord?.status, "failed");
+		assert.equal(brokenRecord?.activeAttemptId, null, "the failed attempt no longer holds active ownership");
+		const brokenStderr = await readFile(join(brokenStore.attemptDir, "stderr.log"), "utf8");
+		assert.match(brokenStderr, /task\.md|ENOENT|sidecar|reference/iu, `stderr explains the failure: ${brokenStderr}`);
+	}
+
+	// 6. End to end: a real detached durable worker launches from the reference payload.
 	const launched = await startAsyncSubagentRun({
 		cwd,
 		backend: checkBackend,

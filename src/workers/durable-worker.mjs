@@ -35,15 +35,105 @@ const [
 	jiti.import("../durable-worker-payload.ts"),
 ]);
 
+const executionAbort = new AbortController();
+
+function requestCancel(signal) {
+	executionAbort.abort(
+		constants.userCancelledAbortReason(`durable worker received ${signal}`),
+	);
+	process.exitCode = 130;
+}
+
+// Install signal handling before anything that can take time (payload and
+// sidecar reads included) so an early operator interrupt is recorded instead
+// of killing the worker with no terminal result. Keep handling repeated
+// signals: escalation re-sends SIGTERM, and a `once` handler would let the
+// second delivery kill the worker before it records a terminal result.
+process.on("SIGINT", () => requestCancel("SIGINT"));
+process.on("SIGTERM", () => requestCancel("SIGTERM"));
+
+function spawnTerminalFinalizer({ ref, attemptId, status, worker, cwd }) {
+	const finalizerPath = fileURLToPath(
+		new URL("./terminal-finalizer.mjs", import.meta.url),
+	);
+	const finalizerPayload = Buffer.from(
+		JSON.stringify({ ref, attemptId, status, worker }),
+	).toString("base64url");
+	const finalizer = spawn(process.execPath, [finalizerPath, finalizerPayload], {
+		cwd,
+		detached: true,
+		stdio: "ignore",
+		env: {
+			PATH: "/usr/bin:/bin",
+			LC_ALL: "C",
+			LANG: "C",
+		},
+	});
+	finalizer.unref();
+}
+
+/**
+ * The launcher has already recorded the attempt as running. If the payload
+ * cannot be resolved (missing, truncated, or tampered prompt sidecar, or a
+ * malformed reference) the attempt must still end in a terminal state, so
+ * write a guard failure from the plain fields of the raw payload and hand the
+ * commit to the finalizer exactly like a normal failure.
+ */
+async function failUnresolvedPayload(raw, error) {
+	const message = error instanceof Error ? error.message : String(error);
+	console.error(message);
+	const cwd = typeof raw?.cwd === "string" ? raw.cwd : undefined;
+	const runId = typeof raw?.runId === "string" ? raw.runId : undefined;
+	const attemptId = typeof raw?.attemptId === "string" ? raw.attemptId : undefined;
+	if (cwd === undefined || runId === undefined || attemptId === undefined) {
+		process.exit(1);
+	}
+	const runsDir = typeof raw?.input?.runsDir === "string" ? raw.input.runsDir : undefined;
+	try {
+		const worker = await processIdentity.captureProcessIdentity(process.pid);
+		const store = await artifacts.createAttemptArtifactStore({ cwd, runId, attemptId, runsDir });
+		const stderr = await store.writeTextArtifact("stderr", `${message}\n`);
+		const status = executionAbort.signal.aborted ? "cancelled" : "failed";
+		await store.writeResult({
+			backend: raw.backend ?? "headless",
+			status,
+			failureKind: executionAbort.signal.aborted ? "user_cancelled" : "guard_failure",
+			cwd,
+			startedAt: raw.startedAt ?? new Date().toISOString(),
+			completedAt: new Date().toISOString(),
+			workspace: { mode: "shared", cwd },
+			sandbox: { enabled: Boolean(raw?.input?.sandbox) },
+			exitCode: null,
+			signal: null,
+			artifacts: [store.refFor("worker"), stderr],
+			correlationId: raw?.input?.correlationId,
+			metadata: { contextLengthExceeded: false },
+		});
+		spawnTerminalFinalizer({ ref: { cwd, runId, runsDir }, attemptId, status, worker, cwd });
+	} catch (writeError) {
+		console.error(writeError instanceof Error ? (writeError.stack ?? writeError.message) : String(writeError));
+	}
+	process.exit(1);
+}
+
 const payloadBytes = await readFile(payloadPath);
 // The launch digest covers the payload file exactly as written. Prompt
 // sidecars are bound through the size/SHA-256 references inside it and are
 // verified before use, so resolving them here does not weaken the digest.
 const launchPayloadSha256 = createHash("sha256").update(payloadBytes).digest("hex");
-const payload = await payloadModule.resolveDurableWorkerPayload(
-	JSON.parse(payloadBytes.toString("utf8")),
-	payloadPath,
-);
+let rawPayload;
+try {
+	rawPayload = JSON.parse(payloadBytes.toString("utf8"));
+} catch (error) {
+	console.error(`durable worker payload is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+	process.exit(1);
+}
+let payload;
+try {
+	payload = await payloadModule.resolveDurableWorkerPayload(rawPayload, payloadPath);
+} catch (error) {
+	await failUnresolvedPayload(rawPayload, error);
+}
 const { input, cwd, runId, attemptId } = payload;
 const heartbeatMs = Math.max(
 	50,
@@ -56,7 +146,6 @@ let terminalWritePromise;
 let heartbeat;
 let preparedExecution;
 let terminalResult;
-const executionAbort = new AbortController();
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
@@ -173,18 +262,6 @@ function failureKindFromError(error) {
 	return constants.isFailureKind(kind) ? kind : "internal";
 }
 
-function requestCancel(signal) {
-	executionAbort.abort(
-		constants.userCancelledAbortReason(`durable worker received ${signal}`),
-	);
-	process.exitCode = 130;
-}
-
-// Keep handling repeated signals: an operator interrupt re-sends SIGTERM on
-// escalation, and a `once` handler would let the second delivery kill the
-// worker before it records a terminal result.
-process.on("SIGINT", () => requestCancel("SIGINT"));
-process.on("SIGTERM", () => requestCancel("SIGTERM"));
 
 const workerIdentity = await processIdentity.captureProcessIdentity(process.pid);
 const workerProcessMetadata = {
@@ -338,26 +415,11 @@ try {
 	if (heartbeat !== undefined) clearInterval(heartbeat);
 }
 if (terminalResult !== undefined) {
-	const finalizerPath = fileURLToPath(
-		new URL("./terminal-finalizer.mjs", import.meta.url),
-	);
-	const finalizerPayload = Buffer.from(
-		JSON.stringify({
-			ref: runRef,
-			attemptId,
-			status: terminalResult.status,
-			worker: workerIdentity,
-		}),
-	).toString("base64url");
-	const finalizer = spawn(process.execPath, [finalizerPath, finalizerPayload], {
+	spawnTerminalFinalizer({
+		ref: runRef,
+		attemptId,
+		status: terminalResult.status,
+		worker: workerIdentity,
 		cwd,
-		detached: true,
-		stdio: "ignore",
-		env: {
-			PATH: "/usr/bin:/bin",
-			LC_ALL: "C",
-			LANG: "C",
-		},
 	});
-	finalizer.unref();
 }
