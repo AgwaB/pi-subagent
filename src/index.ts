@@ -31,6 +31,10 @@ import {
 	startAsyncSubagentRun,
 } from "./orchestrate/async.ts";
 import { interruptRun } from "./orchestrate/interrupt.ts";
+import {
+	formatPruneSubagentRunsSummary,
+	pruneSubagentRuns,
+} from "./orchestrate/prune.ts";
 import { reconcileSubagentRun } from "./orchestrate/reconcile.ts";
 import { resolveRunRef } from "./orchestrate/run-ref.ts";
 import {
@@ -378,6 +382,37 @@ function optionalPositiveNumber(
 	return value;
 }
 
+function optionalBoolean(value: unknown, fieldName: string): boolean | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean")
+		throw new InputValidationError(`${fieldName} must be a boolean when provided.`);
+	return value;
+}
+
+function optionalNonNegativeInteger(
+	value: unknown,
+	fieldName: string,
+): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 0)
+		throw new InputValidationError(
+			`${fieldName} must be a non-negative integer when provided.`,
+		);
+	return value;
+}
+
+function optionalNonNegativeNumber(
+	value: unknown,
+	fieldName: string,
+): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+		throw new InputValidationError(
+			`${fieldName} must be a non-negative finite number when provided.`,
+		);
+	return value;
+}
+
 async function lifecycleAction(
 	raw: Record<string, unknown>,
 	cwd: string,
@@ -390,10 +425,33 @@ async function lifecycleAction(
 		action !== "wait" &&
 		action !== "interrupt" &&
 		action !== "mark-background" &&
-		action !== "reconcile"
+		action !== "reconcile" &&
+		action !== "prune"
 	) {
 		throw new InputValidationError(
-			'action must be one of "run", "status", "logs", "wait", "interrupt", "mark-background", or "reconcile" when provided.',
+			'action must be one of "run", "status", "logs", "wait", "interrupt", "mark-background", "reconcile", or "prune" when provided.',
+		);
+	}
+
+	if (action === "prune") {
+		const requestedCwd = optionalString(raw.cwd, "cwd");
+		const summary = await pruneSubagentRuns({
+			cwd: requestedCwd === undefined ? cwd : resolve(cwd, requestedCwd),
+			runsDir: optionalString(raw.runsDir, "runsDir"),
+			keep: optionalNonNegativeInteger(raw.keep, "keep"),
+			olderThanDays: optionalNonNegativeNumber(raw.olderThanDays, "olderThanDays"),
+			yes: optionalBoolean(raw.yes, "yes"),
+		});
+		return textResult(
+			{
+				tool: TOOL_NAME,
+				action,
+				status: summary.status,
+				summary,
+				text: formatPruneSubagentRunsSummary(summary),
+			},
+			summary.deleteErrors.length > 0,
+			{ summary },
 		);
 	}
 
@@ -759,17 +817,53 @@ function notifyCompletion(
 	return updatesSent;
 }
 
+export function parsePruneCommandArgs(
+	argText: string,
+): { keep?: number; olderThanDays?: number; yes?: boolean } {
+	const tokens = argText.trim().length === 0 ? [] : argText.trim().split(/\s+/u);
+	const options: { keep?: number; olderThanDays?: number; yes?: boolean } = {};
+	for (let index = 0; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (token === "--yes" || token === "-y") {
+			options.yes = true;
+			continue;
+		}
+		const [flag, inlineValue] = token.split("=", 2);
+		if (flag === "--keep" || flag === "--older-than") {
+			const rawValue = inlineValue ?? tokens[++index];
+			const value = Number(rawValue);
+			if (rawValue === undefined || !Number.isFinite(value) || value < 0)
+				throw new Error(`${flag} requires a non-negative number`);
+			if (flag === "--keep") {
+				if (!Number.isInteger(value)) throw new Error("--keep requires a non-negative integer");
+				options.keep = value;
+			} else options.olderThanDays = value;
+			continue;
+		}
+		throw new Error(
+			`unknown prune option ${token}; usage: /subagent prune [--yes] [--keep N] [--older-than DAYS]`,
+		);
+	}
+	return options;
+}
+
 export default function registerSubagentEngine(pi: ExtensionAPI) {
 	if (typeof pi.registerCommand === "function") {
 		pi.registerCommand("subagent", {
 			description:
-				"Subagent utilities. Use `/subagent panel` to open the live status panel.",
+				"Subagent utilities. `/subagent panel` opens the live status panel; `/subagent prune [--yes] [--keep N] [--older-than DAYS]` deletes old terminal runs (dry run without --yes).",
 			getArgumentCompletions(prefix) {
 				const items = [
 					{
 						value: "panel",
 						label: "panel",
 						description: "Open the live Subagents status panel",
+					},
+					{
+						value: "prune",
+						label: "prune",
+						description:
+							"Delete old terminal runs under the current cwd (dry run without --yes)",
 					},
 				];
 				const filtered = items.filter((item) =>
@@ -782,11 +876,30 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 				const normalizedArgs = commandArgs
 					.replace(/^\/?subagent\b\s*/, "")
 					.trim();
-				if (normalizedArgs !== "panel") {
-					ctx.ui.notify?.("Usage: /subagent panel", "warning");
+				if (normalizedArgs === "panel") {
+					await showSubagentPanel(ctx);
 					return;
 				}
-				await showSubagentPanel(ctx);
+				if (/^prune(\s|$)/u.test(normalizedArgs)) {
+					try {
+						const options = parsePruneCommandArgs(normalizedArgs.slice("prune".length));
+						const summary = await pruneSubagentRuns({ ...options, cwd: getCwd(ctx) });
+						ctx.ui.notify?.(
+							formatPruneSubagentRunsSummary(summary),
+							summary.deleteErrors.length > 0 ? "warning" : "info",
+						);
+					} catch (error) {
+						ctx.ui.notify?.(
+							error instanceof Error ? error.message : String(error),
+							"error",
+						);
+					}
+					return;
+				}
+				ctx.ui.notify?.(
+					"Usage: /subagent panel | /subagent prune [--yes] [--keep N] [--older-than DAYS]",
+					"warning",
+				);
 			},
 		});
 	}
@@ -941,13 +1054,31 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 						Type.Literal("interrupt"),
 						Type.Literal("mark-background"),
 						Type.Literal("reconcile"),
+						Type.Literal("prune"),
 					],
 					{
 						default: "run",
 						description:
-							'What to do. Default "run" starts a new subagent. status/logs/wait/interrupt/mark-background/reconcile operate on an existing runId.',
+							'What to do. Default "run" starts a new subagent. status/logs/wait/interrupt/mark-background/reconcile operate on an existing runId. prune deletes old terminal runs under cwd (dry run unless yes is true).',
 					},
 				),
+			),
+			keep: Type.Optional(
+				Type.Integer({
+					minimum: 0,
+					description: "prune: newest terminal runs to keep regardless of age (default 50).",
+				}),
+			),
+			olderThanDays: Type.Optional(
+				Type.Number({
+					minimum: 0,
+					description: "prune: only delete terminal runs whose last update is older than this many days.",
+				}),
+			),
+			yes: Type.Optional(
+				Type.Boolean({
+					description: "prune: actually delete. Without it the action only reports what would be deleted.",
+				}),
 			),
 			runId: Type.Optional(Type.String({ minLength: 1 })),
 			attemptId: Type.Optional(Type.String({ minLength: 1 })),

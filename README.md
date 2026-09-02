@@ -122,6 +122,8 @@ Existing run:
 
 Recent runs can be addressed by `runId` even when they were launched from another cwd; legacy records still resolve from the explicit or current cwd.
 
+Retention: run artifacts under `.pi/agent/runs/` are kept until you prune them. `{ "action": "prune" }` or `/subagent prune [--yes] [--keep N] [--older-than DAYS]` reports the terminal runs beyond the newest 50 (or older than `olderThanDays`) and deletes them only with `yes`; non-terminal runs are never touched.
+
 ### Panel
 
 Inspect runs, attempts, artifacts, and log tails in a live TUI. The panel defaults to the current Pi session, can switch to current cwd or all indexed runs, and includes status filters plus a scrollable detail pane. It shows active and recent terminal runs by default, with in-panel `m` to show more, and counts stale/malformed run pointers without exposing raw session ids.

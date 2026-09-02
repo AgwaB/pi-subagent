@@ -46,6 +46,14 @@ import {
 } from "./orchestrate/status.ts";
 
 export {
+	formatPruneSubagentRunsSummary,
+	pruneSubagentRuns,
+	type PruneSubagentRunCandidate,
+	type PruneSubagentRunsOptions,
+	type PruneSubagentRunsSummary,
+} from "./orchestrate/prune.ts";
+
+export {
 	assertDurableLaunchBarrierV2ExecutionAuthorized,
 	createDurableLaunchBarrier,
 	createDurableLaunchBarrierV2,

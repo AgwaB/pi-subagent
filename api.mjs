@@ -9,6 +9,8 @@ export const getSubagentLogs = api.getSubagentLogs;
 export const waitForSubagent = api.waitForSubagent;
 export const interruptSubagent = api.interruptSubagent;
 export const reconcileSubagentRun = api.reconcileSubagentRun;
+export const pruneSubagentRuns = api.pruneSubagentRuns;
+export const formatPruneSubagentRunsSummary = api.formatPruneSubagentRunsSummary;
 export const recordSubagentChildEvent = api.recordSubagentChildEvent;
 export const assertDurableLaunchBarrierV2ExecutionAuthorized =
 	api.assertDurableLaunchBarrierV2ExecutionAuthorized;

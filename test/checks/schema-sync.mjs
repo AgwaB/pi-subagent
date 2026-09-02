@@ -69,6 +69,9 @@ const lifecycleKeys = new Set([
 	"signal",
 	"escalateAfterMs",
 	"killAfterMs",
+	"keep",
+	"olderThanDays",
+	"yes",
 ]);
 
 for (const key of schemaKeys) {

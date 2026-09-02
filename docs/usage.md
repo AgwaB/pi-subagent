@@ -39,8 +39,9 @@ Every call has an `action`. The default is `run`, so omitting `action` starts a 
 | `interrupt` | Signal a process-backed run. | `runId`, optional `cwd`, `attemptId`, `signal`, `escalateAfterMs`, `killAfterMs`, `reason` |
 | `mark-background` | Mark a run as not needed before the final answer. | `runId`, optional `cwd` |
 | `reconcile` | Re-read durable artifacts and repair stale/orphaned state when possible. | `runId`, optional `cwd` |
+| `prune` | Delete old terminal runs under `<cwd>/<runsDir>`. Dry run unless `yes` is true. | optional `cwd`, `runsDir`, `keep` (default 50), `olderThanDays`, `yes` |
 
-State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
+State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Nothing deletes run directories automatically: `prune` (also `/subagent prune [--yes] [--keep N] [--older-than DAYS]` from the prompt, or `pruneSubagentRuns` from the code API) keeps the newest `keep` fully terminal runs, optionally restricted to runs older than `olderThanDays`, reports the selection with byte counts, and deletes only when `yes` is true. Runs with a non-terminal run, attempt, or task status are skipped even when stale (`reconcile` them first), unreadable run directories are skipped, each selected run is re-read immediately before deletion, and a deleted run's global locator is removed only when it points at the same cwd and runs dir. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
 
 Cancellation kinds: `interrupt` on an async (durable-worker) run records `failureKind: "user_cancelled"` whether the interrupt lands before or during model execution. `abort` means the caller dropped its own tool call (the parent `AbortSignal` fired), and `cancelled` means the child process died from an external signal that no interrupt or abort requested.
 
@@ -78,6 +79,8 @@ import {
   interruptSubagent,
   reconcileSubagentRun,
   recordSubagentChildEvent,
+  pruneSubagentRuns,
+  formatPruneSubagentRunsSummary,
 } from "@agwab/pi-subagent/api";
 
 const run = await runSubagent({
@@ -93,6 +96,9 @@ const logs = await getSubagentLogs({ cwd: process.cwd(), runId: run.runId });
 await waitForSubagent({ cwd: process.cwd(), runId: run.runId, timeoutMs: 300000 });
 await interruptSubagent({ cwd: process.cwd(), runId: run.runId, reason: "caller cancelled" });
 await reconcileSubagentRun({ cwd: process.cwd(), runId: run.runId });
+const prune = await pruneSubagentRuns({ cwd: process.cwd(), keep: 50, olderThanDays: 30 }); // dry run
+console.log(formatPruneSubagentRunsSummary(prune));
+await pruneSubagentRuns({ cwd: process.cwd(), keep: 50, olderThanDays: 30, yes: true });
 await recordSubagentChildEvent({
   cwd: process.cwd(),
   runId: run.runId,
