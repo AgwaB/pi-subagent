@@ -186,7 +186,7 @@ try {
 		withFileTypes: true,
 	}).catch(() => []);
 	assert.equal(
-		partialRunEntries.filter((entry) => entry.isDirectory()).length,
+		partialRunEntries.filter((entry) => entry.isDirectory() && !entry.name.startsWith(".")).length,
 		partialError.startedRunIds?.length,
 		"async mid-launch failure should not return before sibling spawns are accounted",
 	);
