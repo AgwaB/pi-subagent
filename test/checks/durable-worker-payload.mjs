@@ -4,6 +4,9 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
 import {
 	DURABLE_WORKER_SYSTEM_PROMPT_FILE,
 	DURABLE_WORKER_TASK_FILE,
@@ -11,11 +14,41 @@ import {
 	writeDurableWorkerPayload,
 } from "../../src/durable-worker-payload.ts";
 import { startAsyncSubagentRun } from "../../src/orchestrate/async.ts";
-import { readRunRecord } from "../../src/artifacts/index.ts";
+import {
+	beginRunRecord,
+	createAttemptArtifactStore,
+	readRunRecord,
+	upsertRunAttempt,
+} from "../../src/artifacts/index.ts";
 import { waitForSubagent } from "../../api.mjs";
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const root = await mkdtemp(join(tmpdir(), "pi-subagent-payload-"));
+// Model-backed scenarios honor the same overrides as an operator would pass to
+// the tool, so a check run can be pinned to a specific provider/model.
+const checkModel = process.env.PI_SUBAGENT_CHECK_MODEL;
+const checkThinking = process.env.PI_SUBAGENT_CHECK_THINKING;
+const modelInput = {
+	...(checkModel ? { model: checkModel } : {}),
+	...(checkThinking ? { thinking: checkThinking } : {}),
+};
+// Pinned runs use the headless backend (the durable path pi-workflow relies
+// on), which records provider/model in the result envelope; the default run
+// keeps the inline backend used by the other checks.
+const checkBackend = checkModel ? "headless" : "inline";
+const launchInput = { ...modelInput, backend: checkBackend };
+const workerScript = fileURLToPath(
+	new URL("../../src/workers/durable-worker.mjs", import.meta.url),
+);
+
+async function assertPinnedModel(resultPath) {
+	if (!checkModel) return;
+	const result = JSON.parse(await readFile(resultPath, "utf8"));
+	const [provider, ...rest] = checkModel.split("/");
+	const expectedModel = rest.length > 0 ? rest.join("/") : provider;
+	assert.equal(result.metadata?.model, expectedModel, `result must record the pinned model ${expectedModel}`);
+	if (rest.length > 0) assert.equal(result.metadata?.provider, provider);
+}
 
 try {
 	// 1. Writer externalizes string prompts and references them by name, size, and digest.
@@ -148,8 +181,8 @@ try {
 	await (await import("node:fs/promises")).mkdir(cwd, { recursive: true });
 	const launched = await startAsyncSubagentRun({
 		cwd,
-		backend: "inline",
-		input: { task: "Reply with the single word done.", onComplete: "detach", sandbox: false },
+		backend: checkBackend,
+		input: { ...launchInput, task: "Reply with the single word done.", onComplete: "detach", sandbox: false },
 	});
 	const wait = await waitForSubagent({
 		cwd,
@@ -173,6 +206,96 @@ try {
 		await readFile(join(workerPath, "..", DURABLE_WORKER_TASK_FILE), "utf8"),
 		"Reply with the single word done.",
 	);
+	await assertPinnedModel(join(workerPath, "..", "result.json"));
+
+	// 7. Compatibility: the current worker binary still launches from a payload
+	// written in the pre-reference inline format (as produced by earlier
+	// orchestrators), following the same record sequence as startAsyncSubagentRun.
+	const legacyRunId = "run_legacy_inline_payload";
+	const legacyAttemptId = "attempt_legacy_inline";
+	const legacyStartedAt = new Date();
+	const legacyStore = await createAttemptArtifactStore({
+		cwd,
+		runId: legacyRunId,
+		attemptId: legacyAttemptId,
+	});
+	const legacyPayloadPath = legacyStore.pathFor("worker");
+	const legacyPayloadText = `${JSON.stringify(
+		{
+			input: {
+				...launchInput,
+				task: "Reply with the single word legacy.",
+				onComplete: "detach",
+				sandbox: false,
+			},
+			cwd,
+			backend: checkBackend,
+			runId: legacyRunId,
+			attemptId: legacyAttemptId,
+			startedAt: legacyStartedAt.toISOString(),
+		},
+		null,
+		2,
+	)}\n`;
+	await writeFile(legacyPayloadPath, legacyPayloadText);
+	const legacyRunning = await legacyStore.writeResult({
+		backend: checkBackend,
+		status: "running",
+		failureKind: null,
+		cwd,
+		startedAt: legacyStartedAt,
+		completedAt: null,
+		workspace: { mode: "shared", cwd },
+		sandbox: { enabled: false },
+		exitCode: null,
+		signal: null,
+		artifacts: [legacyStore.refFor("worker", Buffer.byteLength(legacyPayloadText, "utf8"))],
+		metadata: { contextLengthExceeded: false },
+	});
+	await upsertRunAttempt({
+		cwd,
+		runId: legacyRunId,
+		attemptId: legacyAttemptId,
+		status: "running",
+		backend: checkBackend,
+		startedAt: legacyStartedAt,
+		artifactCwd: cwd,
+		resultPath: legacyRunning.artifacts.find((artifact) => artifact.type === "result")?.path,
+		createOnly: true,
+		requireNoActive: true,
+		activate: true,
+	});
+	await beginRunRecord({
+		cwd,
+		runId: legacyRunId,
+		mode: "single",
+		backend: checkBackend,
+		startedAt: legacyStartedAt,
+		dependency: "unclassified",
+		activeAttemptId: legacyAttemptId,
+		attempts: [],
+	});
+	const legacyWorker = spawn(
+		process.execPath,
+		[workerScript, legacyPayloadPath, "ownership-legacy-check"],
+		{ cwd, detached: process.platform !== "win32", stdio: "ignore" },
+	);
+	legacyWorker.unref();
+	const legacyWait = await waitForSubagent({
+		cwd,
+		runId: legacyRunId,
+		attemptId: legacyAttemptId,
+		timeoutMs: 120_000,
+		pollIntervalMs: 100,
+	});
+	assert.equal(legacyWait.status, "completed", JSON.stringify(legacyWait));
+	assert.equal(legacyWait.snapshot?.status, "completed", JSON.stringify(legacyWait.snapshot));
+	const legacyOutput = await readFile(join(legacyStore.attemptDir, "output.log"), "utf8");
+	assert.match(legacyOutput, /legacy/iu, `legacy worker output: ${legacyOutput}`);
+	const legacyStored = JSON.parse(await readFile(legacyPayloadPath, "utf8"));
+	assert.equal(legacyStored.input.task, "Reply with the single word legacy.", "inline payload must stay inline");
+	assert.equal(legacyStored.input.taskRef, undefined);
+	await assertPinnedModel(join(legacyStore.attemptDir, "result.json"));
 } finally {
 	await rm(root, { recursive: true, force: true });
 }
