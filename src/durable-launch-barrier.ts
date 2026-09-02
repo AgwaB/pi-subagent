@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, mkdir, open, readFile, readdir, rm } from "node:fs/promises";
+import { link, lstat, mkdir, open, readdir, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 
 const SHA256 = /^[a-f0-9]{64}$/u;
