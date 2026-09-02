@@ -22,4 +22,11 @@ assert.equal(overridden[0], resolve("/tmp/pi-agent-override/settings.json.lock")
 assert.equal(overridden[1], resolve("/tmp/pi-agent-override/auth.json.lock"));
 assert.deepEqual(piAgentDirLockPaths({ PI_CODING_AGENT_DIR: "   " }), defaults);
 
+// A relative override is resolved by the child against its own cwd (Pi's
+// getAgentDir accepts relative values), so the grant must follow the child's
+// cwd rather than the parent's.
+const relative = piAgentDirLockPaths({ PI_CODING_AGENT_DIR: "agent-state" }, "/srv/worktree-b");
+assert.equal(relative[0], resolve("/srv/worktree-b/agent-state/settings.json.lock"));
+assert.notEqual(relative[0], resolve(process.cwd(), "agent-state/settings.json.lock"), "must not resolve against the parent cwd");
+
 console.log("sandbox agent lock path checks passed");

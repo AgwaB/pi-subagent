@@ -212,7 +212,17 @@ async function createSdkModelContext(
 	};
 }
 
+let sdkImporterForTests: (() => Promise<SdkImportResult>) | undefined;
+
+/** Test seam: replace the Pi SDK import with a fake module for one check. */
+export function setInlineSdkImporterForTests(
+	importer: (() => Promise<SdkImportResult>) | undefined,
+): void {
+	sdkImporterForTests = importer;
+}
+
 async function importPiSdk(): Promise<SdkImportResult> {
+	if (sdkImporterForTests !== undefined) return await sdkImporterForTests();
 	try {
 		const require = createRequire(import.meta.url);
 		const packageJson = require.resolve(
@@ -577,8 +587,10 @@ export async function runInlineModel(
 			if (outputText.length === 0)
 				outputText = assistantTextFromMessages(session.messages);
 			if (outputText.length === 0) outputText = stdoutText;
-			assistantMetadata = assistantMetadataFromMessages(session.messages);
 		} finally {
+			// Capture accounting metadata even when prompt() rejected after the
+			// model had already produced assistant messages.
+			assistantMetadata = assistantMetadataFromMessages(session.messages);
 			if (typeof unsubscribe === "function") unsubscribe();
 			session.dispose?.();
 		}

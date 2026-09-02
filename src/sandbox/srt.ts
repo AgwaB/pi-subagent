@@ -78,14 +78,16 @@ async function importSandboxRuntime(): Promise<SandboxRuntimeModule> {
  * without settings or credentials and every model run fails. Grant write on
  * those exact lock paths only; the config files themselves stay read-only.
  */
-export function piAgentDirLockPaths(env: NodeJS.ProcessEnv = process.env): string[] {
+export function piAgentDirLockPaths(env: NodeJS.ProcessEnv = process.env, childCwd: string = process.cwd()): string[] {
   const override = env.PI_CODING_AGENT_DIR?.trim();
-  const agentDir = override ? resolve(override) : join(homedir(), ".pi", "agent");
+  // The child inherits the environment unchanged and resolves a relative
+  // override against its own cwd, so resolve it against the child's cwd here.
+  const agentDir = override ? resolve(childCwd, override) : join(homedir(), ".pi", "agent");
   return ["settings.json.lock", "auth.json.lock", "trust.json.lock"].map((name) => join(agentDir, name));
 }
 
 function defaultConfig(sandbox: SandboxInput, cwd: string, writablePaths: readonly string[], allowPty: boolean): SandboxRuntimeConfig {
-  const allowWrite = Array.from(new Set([cwd, ...writablePaths, ...piAgentDirLockPaths()]));
+  const allowWrite = Array.from(new Set([cwd, ...writablePaths, ...piAgentDirLockPaths(process.env, cwd)]));
   return {
     // Empty allowedDomains means deny-all network in @anthropic-ai/sandbox-runtime.
     // Callers opt into egress per run via sandbox.allowedDomains.
