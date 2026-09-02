@@ -328,6 +328,8 @@ try {
 		// Matching ids but bookkeeping redirected elsewhere: must bind to the payload location.
 		["wrong-cwd", (runId, attemptId) => JSON.stringify({ input: { task: "x" }, cwd: foreignCwd, backend: "headless", runId, attemptId, startedAt: new Date().toISOString() })],
 		["escaping-runs-dir", (runId, attemptId) => JSON.stringify({ input: { task: "x", runsDir: "../outside" }, cwd, backend: "headless", runId, attemptId, startedAt: new Date().toISOString() })],
+		// Coordinated cwd/runsDir that resolve to the same runs root must still fail: cwd is bound on its own.
+		["coordinated-cwd", (runId, attemptId) => JSON.stringify({ input: { task: "x", runsDir: "project/.pi/agent/runs" }, cwd: root, backend: "headless", runId, attemptId, startedAt: new Date().toISOString() })],
 	]) {
 		const shapeRunId = `run_payload_shape_${label}`;
 		const shapeAttemptId = `attempt_payload_shape_${label}`;
@@ -370,10 +372,72 @@ try {
 		assert.equal(shapeWait.status, "completed", `${label}: worker must terminalize: ${JSON.stringify(shapeWait)}`);
 		assert.equal(shapeWait.snapshot?.status, "failed", label);
 		assert.equal(shapeWait.snapshot?.failureKind, "guard_failure", label);
-		assert.equal((await readRunRecord({ cwd, runId: shapeRunId }))?.activeAttemptId, null, label);
+		const shapeRecord = await readRunRecord({ cwd, runId: shapeRunId });
+		assert.equal(shapeRecord?.activeAttemptId, null, label);
+		assert.equal(shapeRecord?.cwd, cwd, `${label}: the record keeps the run's own cwd`);
+		assert.equal(shapeRecord?.runsDir, ".pi/agent/runs", `${label}: the record keeps its runs dir`);
 	}
 	await assert.rejects(stat(join(foreignCwd, ".pi")), /ENOENT/u, "a redirected cwd must not receive any bookkeeping");
 	await assert.rejects(stat(join(root, "outside")), /ENOENT/u, "an escaping runsDir must not be created");
+
+	// 5e. A worker started for an attempt that is already terminal (cancelled
+	// before it launched) exits without touching that attempt's artifacts, so
+	// run.json and result.json never contradict each other.
+	{
+		const staleRunId = "run_payload_stale_attempt";
+		const staleAttemptId = "attempt_payload_stale";
+		const staleStartedAt = new Date();
+		const staleStore = await createAttemptArtifactStore({ cwd, runId: staleRunId, attemptId: staleAttemptId });
+		const stalePayloadPath = staleStore.pathFor("worker");
+		await writeDurableWorkerPayload({
+			payloadPath: stalePayloadPath,
+			input: { backend: "headless", task: "never runs", onComplete: "detach", sandbox: false },
+			cwd,
+			backend: "headless",
+			runId: staleRunId,
+			attemptId: staleAttemptId,
+			startedAt: staleStartedAt.toISOString(),
+		});
+		const staleResult = await staleStore.writeResult({
+			backend: "headless",
+			status: "cancelled",
+			failureKind: "user_cancelled",
+			cwd,
+			startedAt: staleStartedAt,
+			completedAt: new Date(),
+			workspace: { mode: "shared", cwd },
+			sandbox: { enabled: false },
+			exitCode: null,
+			signal: null,
+			artifacts: [],
+			metadata: { contextLengthExceeded: false },
+		});
+		await beginRunRecord({ cwd, runId: staleRunId, mode: "single", backend: "headless", startedAt: staleStartedAt, attempts: [] });
+		await upsertRunAttempt({
+			cwd,
+			runId: staleRunId,
+			attemptId: staleAttemptId,
+			status: "cancelled",
+			backend: "headless",
+			failureKind: "user_cancelled",
+			startedAt: staleStartedAt,
+			completedAt: new Date(),
+			artifactCwd: cwd,
+			resultPath: staleResult.artifacts.find((artifact) => artifact.type === "result")?.path,
+			activate: true,
+			onlyIfActive: false,
+		});
+		const resultPath = join(staleStore.attemptDir, "result.json");
+		const resultBefore = await readFile(resultPath, "utf8");
+		const recordBefore = JSON.stringify(await readRunRecord({ cwd, runId: staleRunId }));
+		const staleWorker = spawn(process.execPath, [workerScript, stalePayloadPath], { cwd, detached: process.platform !== "win32", stdio: "ignore" });
+		const staleExit = await new Promise((resolveExit) => staleWorker.once("exit", (code) => resolveExit(code)));
+		assert.equal(staleExit, 1, "worker exits without executing");
+		await new Promise((resolveSleep) => setTimeout(resolveSleep, 500));
+		assert.equal(await readFile(resultPath, "utf8"), resultBefore, "terminal result.json is left untouched");
+		assert.equal(JSON.stringify(await readRunRecord({ cwd, runId: staleRunId })), recordBefore, "run.json is left untouched");
+		assert.equal((await readFile(join(staleStore.attemptDir, "stderr.log"), "utf8").catch(() => "")).includes("guard_failure"), false);
+	}
 
 	// 6. End to end: a real detached durable worker launches from the reference payload.
 	const launched = await startAsyncSubagentRun({

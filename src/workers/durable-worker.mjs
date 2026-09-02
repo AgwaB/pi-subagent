@@ -97,6 +97,8 @@ async function referenceFromPayloadPath(path) {
 	return { cwd, runId, attemptId, runsDir: runsDirRelative };
 }
 
+const TERMINAL_STATUSES_EARLY = new Set(["completed", "failed", "cancelled"]);
+
 function spawnTerminalFinalizer({ ref, attemptId, status, worker, cwd }) {
 	const finalizerPath = fileURLToPath(
 		new URL("./terminal-finalizer.mjs", import.meta.url),
@@ -144,6 +146,21 @@ async function failUnresolvedPayload(raw, error) {
 	const runsDir =
 		fromPath?.runsDir ??
 		(typeof raw?.input?.runsDir === "string" && raw.input.runsDir.length > 0 ? raw.input.runsDir : undefined);
+	// Never replace the canonical artifacts of an attempt that is no longer
+	// current (already terminal, superseded, or cancelled before this worker
+	// started): the registry is authoritative and a later finalizer would only
+	// find contradictory state.
+	const record = await artifacts.readRunRecord({ cwd, runId, runsDir }).catch(() => null);
+	const attempt = record?.attempts?.find((candidate) => candidate.attemptId === attemptId);
+	if (
+		attempt !== undefined &&
+		(TERMINAL_STATUSES_EARLY.has(attempt.status) || record.activeAttemptId !== attemptId)
+	) {
+		console.error(
+			`durable worker attempt ${attemptId} is no longer active (${attempt.status}); exiting without writing artifacts`,
+		);
+		process.exit(1);
+	}
 	try {
 		const worker = await processIdentity.captureProcessIdentity(process.pid);
 		const store = await artifacts.createAttemptArtifactStore({ cwd, runId, attemptId, runsDir });
@@ -213,11 +230,17 @@ try {
 			return resolve(path);
 		}
 	};
+	const payloadCwd = await physical(payload.cwd);
+	const locatedCwd = await physical(located.cwd);
+	if (payloadCwd !== locatedCwd)
+		throw new Error(
+			`durable worker payload cwd (${payloadCwd}) does not match the run's cwd (${locatedCwd})`,
+		);
 	const payloadRunsDir = await physical(resolve(payload.cwd, payload.input.runsDir ?? ".pi/agent/runs"));
 	const locatedRunsDir = await physical(resolve(located.cwd, located.runsDir));
 	if (payloadRunsDir !== locatedRunsDir)
 		throw new Error(
-			`durable worker payload cwd/runsDir (${payloadRunsDir}) do not match the payload location (${locatedRunsDir})`,
+			`durable worker payload runsDir (${payloadRunsDir}) does not match the payload location (${locatedRunsDir})`,
 		);
 } catch (error) {
 	await failUnresolvedPayload(rawPayload, error);
@@ -358,8 +381,11 @@ const workerProcessMetadata = {
 	workerProcessGroupId: workerIdentity.processGroupId,
 	workerProcessBirthIdentity: workerIdentity.birthIdentity,
 };
-// Ownership bookkeeping runs before the guarded execution block; a failure
-// here must still end the attempt through the same terminal path.
+// Ownership bookkeeping runs before the guarded execution block. The registry
+// returns the record unchanged when this attempt is no longer active or is
+// already terminal; that is lost ownership, and the worker must exit without
+// touching the attempt's artifacts. Any other failure still ends the attempt
+// through the terminal path.
 try {
 	const workerRecord = await artifacts.updateAttemptWorkerProcess({
 		...runRef,
@@ -371,7 +397,16 @@ try {
 	);
 	if (
 		workerRecord.activeAttemptId !== attemptId ||
-		persistedWorker?.process?.workerPid !== workerIdentity.pid ||
+		persistedWorker === undefined ||
+		TERMINAL_STATUSES_EARLY.has(persistedWorker.status)
+	) {
+		console.error(
+			`durable worker attempt ${attemptId} is no longer active; exiting without writing artifacts`,
+		);
+		process.exit(1);
+	}
+	if (
+		persistedWorker.process?.workerPid !== workerIdentity.pid ||
 		persistedWorker.process.workerProcessGroupId !== workerIdentity.processGroupId ||
 		persistedWorker.process.workerProcessBirthIdentity !==
 			workerIdentity.birthIdentity
