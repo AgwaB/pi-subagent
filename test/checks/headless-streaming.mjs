@@ -448,6 +448,43 @@ setInterval(() => undefined, 1000);
 	});
 	assert.equal(interrupted.status, "cancelled");
 	assert.equal(interrupted.failureKind, "user_cancelled");
+
+	// A process-group kill that fails with EPERM (seen on macOS while the leader
+	// exits) must not escape the abort listener; the runner falls back to
+	// signalling the child directly and still settles as cancelled.
+	const originalKill = process.kill;
+	let groupKillAttempts = 0;
+	process.kill = (pid, signal) => {
+		// Fail real group signals only; signal 0 liveness probes keep working.
+		if (typeof pid === "number" && pid < 0 && signal !== 0) {
+			groupKillAttempts += 1;
+			const error = new Error("kill EPERM");
+			error.code = "EPERM";
+			throw error;
+		}
+		return originalKill.call(process, pid, signal);
+	};
+	try {
+		const epermController = new AbortController();
+		const epermAborted = await runHeadlessModel({
+			cwd,
+			runId: "run_check_headless_eperm",
+			attemptId: "attempt-eperm",
+			piCommand: abortPi,
+			agent: "stream-worker",
+			task: "stay alive until aborted despite EPERM",
+			timeoutMs: 30_000,
+			signal: epermController.signal,
+			onProcessStart: () => epermController.abort(),
+		});
+		assert.equal(epermAborted.status, "cancelled");
+		assert.equal(epermAborted.failureKind, "abort");
+		assert.ok(groupKillAttempts >= 1, "group kill was attempted");
+		const epermStderr = await readFile(join(cwd, artifactByType(epermAborted, "stderr").path), "utf8");
+		assert.match(epermStderr, /process-group kill failed: EPERM/u);
+	} finally {
+		process.kill = originalKill;
+	}
 	assert.equal(abortFailureKind(undefined), "abort");
 	assert.equal(abortFailureKind(interruptController.signal), "user_cancelled");
 

@@ -180,8 +180,11 @@ function requestCancel(signal) {
 	process.exitCode = 130;
 }
 
-process.once("SIGINT", () => requestCancel("SIGINT"));
-process.once("SIGTERM", () => requestCancel("SIGTERM"));
+// Keep handling repeated signals: an operator interrupt re-sends SIGTERM on
+// escalation, and a `once` handler would let the second delivery kill the
+// worker before it records a terminal result.
+process.on("SIGINT", () => requestCancel("SIGINT"));
+process.on("SIGTERM", () => requestCancel("SIGTERM"));
 
 const workerIdentity = await processIdentity.captureProcessIdentity(process.pid);
 const workerProcessMetadata = {

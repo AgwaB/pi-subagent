@@ -264,7 +264,10 @@ async function terminateOwnedProcesses(
 			try {
 				process.kill(-processGroupId, signal);
 			} catch (error) {
-				if (processErrorCode(error) !== "ESRCH") throw error;
+				// EPERM (macOS, zombie-only group) is not proof the group survived;
+				// the liveness loop that follows decides whether cleanup is blocked.
+				const code = processErrorCode(error);
+				if (code !== "ESRCH" && code !== "EPERM") throw error;
 			}
 		}
 	}

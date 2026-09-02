@@ -99,7 +99,11 @@ async function signalVerifiedTargets(
 			process.kill(target, signal);
 			signalled = true;
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
+			// ESRCH: already gone. EPERM: macOS refuses signals to a group that
+			// holds only an unreaped zombie; treat the target as not signalled so
+			// escalation and liveness checks decide instead of failing the call.
+			const code = (error as NodeJS.ErrnoException)?.code;
+			if (code !== "ESRCH" && code !== "EPERM") throw error;
 		}
 	}
 	return signalled;
@@ -163,7 +167,10 @@ function result(
 export async function interruptRun(
 	options: InterruptRunOptions,
 ): Promise<InterruptRunResult> {
-	const signal = options.signal ?? "SIGINT";
+	// SIGTERM is the graceful stop for a headless Pi child: it aborts the
+	// running tool, kills the tool's subprocesses, and exits. SIGINT makes Pi
+	// die immediately and orphans tool subprocesses (observed on Pi 0.84).
+	const signal = options.signal ?? "SIGTERM";
 	const ref = await resolveRunRef(options);
 	const record = await readRunRecord(ref);
 	if (record === null) {

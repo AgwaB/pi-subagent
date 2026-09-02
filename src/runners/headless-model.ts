@@ -778,17 +778,49 @@ async function runProcess(
 			abortSignal?.removeEventListener("abort", onAbort);
 		}
 
+		function noteRunnerDiagnostic(line: string): void {
+			const text = `${line}\n`;
+			stderrText = appendLimited(stderrText, text, STDERR_TEXT_LIMIT);
+			if (!stderrStream.writableEnded) stderrStream.write(text);
+		}
+
+		// Signalling must never throw: it runs from abort listeners and timers,
+		// and an escaped error there kills the worker before it can record a
+		// terminal result, leaving the run "running" forever. macOS answers a
+		// process-group kill with EPERM when the group holds only an unreaped
+		// zombie (the child died from the operator's direct signal microseconds
+		// earlier and libuv has not collected it yet); fall back to signalling
+		// the child directly and record what happened as evidence.
 		function signalChild(signal: NodeJS.Signals): void {
-			try {
-				if (
-					authorizedProcessGroupId !== undefined &&
-					process.platform !== "win32"
-				)
-					process.kill(-authorizedProcessGroupId, signal);
-				else child.kill(signal);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
+			const attempts: Array<() => void> = [];
+			if (
+				authorizedProcessGroupId !== undefined &&
+				process.platform !== "win32"
+			) {
+				const processGroupId = authorizedProcessGroupId;
+				attempts.push(() => process.kill(-processGroupId, signal));
 			}
+			attempts.push(() => {
+				child.kill(signal);
+			});
+			const failures: string[] = [];
+			for (const attempt of attempts) {
+				try {
+					attempt();
+					if (failures.length > 0)
+						noteRunnerDiagnostic(
+							`headless signal ${signal} delivered to the child directly after the process-group kill failed: ${failures.join(", ")}`,
+						);
+					return;
+				} catch (error) {
+					const code = (error as NodeJS.ErrnoException)?.code;
+					if (code === "ESRCH") return;
+					failures.push(code ?? (error instanceof Error ? error.message : String(error)));
+				}
+			}
+			noteRunnerDiagnostic(
+				`headless signal ${signal} could not be delivered: ${failures.join(", ")}`,
+			);
 		}
 
 		function requestStop(kind: "timeout" | "abort"): void {
@@ -843,11 +875,22 @@ async function runProcess(
 				throw new ProcessOwnershipError(
 					"headless process group drain could not be verified",
 				);
-			try {
-				process.kill(-processGroupId, "SIGTERM");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
-			}
+			// A group kill fails with EPERM on macOS when the group holds only an
+			// unreaped zombie. That is not proof the group survived: keep
+			// verifying liveness and let the final "remained populated" check
+			// decide once the zombie is reaped.
+			const signalGroup = (signal: NodeJS.Signals): void => {
+				try {
+					process.kill(-processGroupId, signal);
+				} catch (error) {
+					const code = (error as NodeJS.ErrnoException)?.code;
+					if (code === "ESRCH") return;
+					noteRunnerDiagnostic(
+						`headless process group ${signal} could not be delivered: ${code ?? String(error)}`,
+					);
+				}
+			};
+			signalGroup("SIGTERM");
 			for (let index = 0; index < 10; index += 1) {
 				status = inspectProcessGroup(processGroupId);
 				if (status === "dead") return;
@@ -857,11 +900,7 @@ async function runProcess(
 					);
 				await new Promise((resolveSleep) => setTimeout(resolveSleep, 50));
 			}
-			try {
-				process.kill(-processGroupId, "SIGKILL");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
-			}
+			signalGroup("SIGKILL");
 			for (let index = 0; index < 10; index += 1) {
 				status = inspectProcessGroup(processGroupId);
 				if (status === "dead") return;

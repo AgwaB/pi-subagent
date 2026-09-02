@@ -288,7 +288,7 @@ Interrupt a process-backed run:
 { "action": "interrupt", "runId": "run_..." }
 ```
 
-`interrupt` is conservative. It can signal runs with registered process metadata. Unsupported or already-terminal runs return explicit status rather than pretending cancellation succeeded.
+`interrupt` is conservative. It can signal runs with registered process metadata. Unsupported or already-terminal runs return explicit status rather than pretending cancellation succeeded. The default signal is `SIGTERM`, which a headless Pi child treats as a graceful stop (it aborts the running tool, terminates the tool's subprocesses, and exits); `SIGINT` makes Pi exit immediately and can leave tool subprocesses such as a running shell command behind, so pass it only when you want that. If the run is still active after `escalateAfterMs` (1 s) the signal is re-sent as `SIGTERM`, and after `killAfterMs` (3 s) as `SIGKILL`.
 
 ### Existing-run resolution
 

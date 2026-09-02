@@ -1097,8 +1097,18 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 					Type.Literal("SIGKILL"),
 				]),
 			),
-			escalateAfterMs: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
-			killAfterMs: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+			escalateAfterMs: Type.Optional(
+				Type.Number({
+					exclusiveMinimum: 0,
+					description: "interrupt: re-send SIGTERM after this many ms if the run is still active (default 1000).",
+				}),
+			),
+			killAfterMs: Type.Optional(
+				Type.Number({
+					exclusiveMinimum: 0,
+					description: "interrupt: send SIGKILL after this many ms if the run is still active (default 3000).",
+				}),
+			),
 		}),
 		renderCall(args, theme) {
 			const title = theme.fg("toolTitle", theme.bold("subagent"));

@@ -579,6 +579,11 @@ try {
 			killAfterMs: 3000,
 		});
 		assert.equal(interrupted.status, "interrupt-requested");
+		assert.equal(
+			interrupted.signal,
+			"SIGTERM",
+			"interrupt defaults to SIGTERM so a headless Pi child stops gracefully and terminates its tool subprocesses",
+		);
 		const interruptedWait = await waitForSubagent({
 			cwd,
 			runId: interruptible.runId,
@@ -641,14 +646,6 @@ try {
 	});
 	const realProcessKill = process.kill;
 	const postExitSignals = [];
-	process.kill = function trackedProcessKill(pid, signal) {
-		if (
-			pid === -shortIdentity.processGroupId &&
-			(signal === "SIGTERM" || signal === "SIGKILL")
-		)
-			postExitSignals.push(signal);
-		return realProcessKill.call(process, pid, signal);
-	};
 	try {
 		const shortInterrupted = await interruptSubagent({
 			cwd,
@@ -657,6 +654,16 @@ try {
 			reason: "short target escalation revalidation",
 		});
 		assert.equal(shortInterrupted.status, "interrupt-requested");
+		// The initial signal has been sent synchronously above; from here on
+		// only escalation timers may signal, and they must revalidate first.
+		process.kill = function trackedProcessKill(pid, signal) {
+			if (
+				pid === -shortIdentity.processGroupId &&
+				(signal === "SIGTERM" || signal === "SIGKILL")
+			)
+				postExitSignals.push(signal);
+			return realProcessKill.call(process, pid, signal);
+		};
 		for (let index = 0; index < 100 && pidAlive(shortTarget.pid); index += 1)
 			await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
 		assert.equal(pidAlive(shortTarget.pid), false);
