@@ -319,7 +319,7 @@ async function removeTransactionTempAliases(
 			info.dev === transactionInfo.dev &&
 			info.ino === transactionInfo.ino
 		)
-			await rm(candidate);
+			await rm(candidate, { force: true });
 	}
 }
 

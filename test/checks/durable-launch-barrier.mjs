@@ -28,6 +28,7 @@ import {
 	waitForDurableLaunchBarrierV2Ready,
 } from "../../src/durable-launch-barrier.ts";
 import { validateResolveInput } from "../../src/core/validation.ts";
+import { checkTransactionTempAliasRace } from "../fixtures/barrier-temp-alias-race.mjs";
 
 const canonical = (value) =>
 	Array.isArray(value)
@@ -524,6 +525,7 @@ try {
 		);
 		await assert.rejects(access(`${crashV2.decisionPath}.pending`));
 	}
+	await checkTransactionTempAliasRace(root);
 } finally {
 	await rm(root, { recursive: true, force: true });
 }
