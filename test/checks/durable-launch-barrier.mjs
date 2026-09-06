@@ -3,16 +3,21 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import {
 	access,
+	chmod,
 	link,
+	lstat,
 	mkdir,
 	mkdtemp,
 	readFile,
 	rename,
 	rm,
+	symlink,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { createJiti } from "jiti";
 import {
 	assertDurableLaunchBarrierV2ExecutionAuthorized,
 	createDurableLaunchBarrier,
@@ -61,6 +66,125 @@ try {
 		waitForDurableLaunchBarrierReady(replaced),
 		/directory was replaced/,
 	);
+
+	// TEST-ONLY dependency substitution: production code still imports the real
+	// lstat; Jiti replaces only that builtin dependency for both source variants.
+	let injectedLstat = lstat;
+	const lstatModulePath = join(root, "durable-barrier-fs-promises.mjs");
+	await writeFile(
+		lstatModulePath,
+		'export * from "node:fs/promises";\nexport const lstat = (...args) => globalThis.__durableBarrierTestLstat(...args);\n',
+	);
+	globalThis.__durableBarrierTestLstat = (...args) => injectedLstat(...args);
+	const instrumentedJiti = createJiti(import.meta.url, {
+		interopDefault: true,
+		moduleCache: false,
+	});
+	const instrumentedSourcePath = join(root, "durable-launch-barrier.instrumented.ts");
+	const instrumentedSource = (await readFile(
+		resolve("src/durable-launch-barrier.ts"),
+		"utf8",
+	)).replaceAll(
+		'from "node:fs/promises"',
+		`from "${pathToFileURL(lstatModulePath).href}"`,
+	);
+	await writeFile(instrumentedSourcePath, instrumentedSource);
+	const instrumentedBarrier = await instrumentedJiti.import(instrumentedSourcePath);
+	const {
+		createDurableLaunchBarrierV2: createInstrumentedBarrierV2,
+		readDurableLaunchBarrierV2State: readInstrumentedState,
+	} = instrumentedBarrier;
+	const interleaveBarrier = await createInstrumentedBarrierV2({
+		directory: join(root, "pending-interleave-barrier"),
+		subjectSha256: "6".repeat(64),
+		authorityBindingSha256: "7".repeat(64),
+		timeoutMs: 100,
+	});
+	const fixture = join(root, "pending-lstat-fixture");
+	await writeFile(fixture, "fixture\n", { mode: 0o600 });
+	const realPendingLstat = lstat;
+	let sequenceCalls = 0;
+	const runPendingSequence = async (first, second, third) => {
+		let calls = 0;
+		injectedLstat = async (path) => {
+			if (path !== `${interleaveBarrier.readyPath}.pending`)
+				return realPendingLstat(path);
+			calls += 1;
+			if (calls === 1) return first();
+			if (calls === 2) return second();
+			if (calls === 3 && third !== undefined) return third();
+			const error = new Error("injected missing pending");
+			error.code = "ENOENT";
+			throw error;
+		};
+		try {
+			return await readInstrumentedState(interleaveBarrier);
+		} finally {
+			sequenceCalls = calls;
+			injectedLstat = realPendingLstat;
+		}
+	};
+	const staleInfo = await realPendingLstat(fixture);
+	Object.defineProperty(staleInfo, "nlink", { value: 0 });
+	assert.deepEqual(await runPendingSequence(() => staleInfo, () => staleInfo), {});
+	await assert.rejects(
+		runPendingSequence(() => staleInfo, () => staleInfo, () => staleInfo),
+		/durable launch barrier pending fence identity mismatch/u,
+	);
+	const validInfo = await realPendingLstat(fixture);
+	assert.deepEqual(
+		await runPendingSequence(
+			() => staleInfo,
+			() => validInfo,
+			() => validInfo,
+		),
+		{},
+	);
+	await assert.rejects(
+		runPendingSequence(async () => {
+			const error = new Error("injected permission failure");
+			error.code = "EACCES";
+			throw error;
+		}, () => validInfo),
+		(error) => error?.code === "EACCES",
+	);
+	const invalidCases = [
+		["mode", async () => {
+			await chmod(fixture, 0o644);
+			return realPendingLstat(fixture);
+		}],
+		["nlink", async () => {
+			const alias = `${fixture}.alias`;
+			await link(fixture, alias);
+			const info = await realPendingLstat(fixture);
+			await rm(alias);
+			return info;
+		}],
+		["uid", async () => {
+			const info = await realPendingLstat(fixture);
+			Object.defineProperty(info, "uid", { value: (info.uid ?? 0) + 1 });
+			return info;
+		}],
+		["nonregular", async () => realPendingLstat(root)],
+		["symlink", async () => {
+			const alias = `${fixture}.symlink`;
+			await symlink(fixture, alias);
+			const info = await realPendingLstat(alias);
+			await rm(alias);
+			return info;
+		}],
+	];
+	for (const [label, makeInvalid] of invalidCases) {
+		await chmod(fixture, 0o600);
+		await assert.rejects(
+			runPendingSequence(makeInvalid, () => validInfo),
+			/durable launch barrier pending fence identity mismatch/u,
+			label,
+		);
+		assert.equal(sequenceCalls, 1, `${label} must reject before a later safe observation`);
+	}
+	delete globalThis.__durableBarrierTestLstat;
+	await rm(fixture);
 
 	const deletedBarrier = await createDurableLaunchBarrier({
 		directory: join(root, "deleted-barrier"),
