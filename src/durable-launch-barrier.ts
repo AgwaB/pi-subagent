@@ -450,24 +450,37 @@ async function writeDurableExclusive(
 }
 
 async function pendingCommitExists(path: string): Promise<boolean> {
-	try {
-		const info = await lstat(`${path}.pending`);
-		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-		if (
-			!info.isFile() ||
-			info.isSymbolicLink() ||
-			info.nlink !== 1 ||
-			(info.mode & 0o777) !== 0o600 ||
-			(uid !== undefined && info.uid !== uid)
-		)
+	const pendingPath = `${path}.pending`;
+	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		let info;
+		try {
+			info = await lstat(pendingPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+			throw error;
+		}
+		if (!info.isFile() || info.isSymbolicLink())
 			throw new DurableLaunchBarrierError(
 				"durable launch barrier pending fence identity mismatch",
 			);
-		return true;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return false;
-		throw error;
+		if ((info.mode & 0o777) !== 0o600 || (uid !== undefined && info.uid !== uid))
+			throw new DurableLaunchBarrierError(
+				"durable launch barrier pending fence identity mismatch",
+			);
+		if (info.nlink === 1) return true;
+		// Unlink can race lstat and leave an otherwise valid, unlinked inode
+		// snapshot. Reobserve only that case; never accept it as a live fence.
+		if (info.nlink !== 0)
+			throw new DurableLaunchBarrierError(
+				"durable launch barrier pending fence identity mismatch",
+			);
+		if (attempt < 2)
+			await new Promise<void>((resolveAttempt) => setImmediate(resolveAttempt));
 	}
+	throw new DurableLaunchBarrierError(
+		"durable launch barrier pending fence identity mismatch",
+	);
 }
 
 async function recoverCommittedExclusive(
