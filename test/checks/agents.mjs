@@ -6,8 +6,10 @@ import { join } from "node:path";
 import { buildAgentSystemPrompt, loadAgentByName } from "../../src/agents.ts";
 import { buildPiArgv } from "../../src/runners/headless-model.ts";
 import { runSubagent, SubagentValidationError } from "../../api.mjs";
+import { createJiti } from "jiti";
 
 const tempRoot = await mkdtemp(join(tmpdir(), "pi-subagent-agents-"));
+const originalPath = process.env.PATH;
 try {
 	const sharedAgentsDir = join(tempRoot, ".pi", "agents");
 	await mkdir(sharedAgentsDir, { recursive: true });
@@ -145,10 +147,7 @@ OPEN_AGENT_PROMPT_MARKER
 		tools: ["read"],
 	});
 	assert.deepEqual(
-		openArgv.slice(
-			openArgv.indexOf("--tools"),
-			openArgv.indexOf("--tools") + 2,
-		),
+		openArgv.slice(openArgv.indexOf("--tools"), openArgv.indexOf("--tools") + 2),
 		["--tools", "read"],
 	);
 
@@ -305,6 +304,148 @@ OPEN_AGENT_PROMPT_MARKER
 		"global scope should not load project agent",
 	);
 
+	// Exercise both entry points without provider calls. The fake CLI runs only
+	// after approval and task preparation have accepted the effective inputs.
+	const bin = join(tempRoot, "bin");
+	await mkdir(bin);
+	await writeFile(
+		join(bin, "pi"),
+		`#!${process.execPath}\nconsole.log(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:"approval-ok"}],stopReason:"stop"}}));\n`,
+		{ mode: 0o755 },
+	);
+	process.env.PATH = `${bin}:${originalPath}`;
+	const jiti = createJiti(import.meta.url, { interopDefault: true });
+	const extension = await jiti.import("../../src/index.ts");
+	let tool;
+	(extension.default ?? extension)({
+		registerCommand() {},
+		registerTool(value) {
+			tool = value;
+		},
+	});
+	const common = {
+		cwd,
+		backend: "headless",
+		agent: "review.security",
+		agentScope: "project",
+		tools: [],
+		extensions: [],
+		skills: [],
+	};
+	const approvalCases = [
+		{ name: "default inherited", tasks: [{ task: "check" }], denied: false },
+		{
+			name: "false inherited",
+			confirmProjectAgents: false,
+			tasks: [{ task: "check" }],
+			denied: false,
+		},
+		{
+			name: "true single",
+			confirmProjectAgents: true,
+			task: "check",
+			denied: true,
+		},
+		{
+			name: "true explicit",
+			confirmProjectAgents: true,
+			tasks: [{ agent: "review.security", task: "check" }],
+			denied: true,
+		},
+		{
+			name: "true inherited",
+			confirmProjectAgents: true,
+			tasks: [{ task: "check" }],
+			denied: true,
+		},
+		{
+			name: "child false",
+			confirmProjectAgents: true,
+			tasks: [{ confirmProjectAgents: false, task: "check" }],
+			denied: false,
+		},
+		{
+			name: "child true",
+			confirmProjectAgents: false,
+			tasks: [{ confirmProjectAgents: true, task: "check" }],
+			denied: true,
+		},
+		{
+			name: "child global",
+			confirmProjectAgents: true,
+			tasks: [{ agentScope: "global", task: "check" }],
+			denied: false,
+		},
+		{
+			name: "child project",
+			agent: "not-a-project-agent",
+			agentScope: "global",
+			confirmProjectAgents: true,
+			tasks: [{ agent: "review.security", agentScope: "project", task: "check" }],
+			denied: true,
+		},
+	];
+	for (const { name, denied, ...overrides } of approvalCases) {
+		const input = { ...common, ...overrides };
+		if (denied) {
+			await assert.rejects(
+				runSubagent(input),
+				/Project-local subagent definitions/u,
+				`API: ${name}`,
+			);
+		} else {
+			const result = await runSubagent(input);
+			for (const child of result.results ?? [result])
+				assert.equal(
+					child.status,
+					"completed",
+					`API: ${name}: ${JSON.stringify(result)}`,
+				);
+		}
+		const response = await tool.execute(
+			`approval-${name}`,
+			input,
+			undefined,
+			undefined,
+			{ cwd, hasUI: false },
+		);
+		if (denied)
+			assert.match(
+				JSON.stringify(response),
+				/Project-local subagent definitions/u,
+				`tool: ${name}`,
+			);
+		else
+			for (const child of response.details.results ?? [response.details])
+				assert.equal(
+					child.status,
+					"completed",
+					`tool: ${name}: ${JSON.stringify(response)}`,
+				);
+	}
+	for (const approved of [false, true]) {
+		let prompts = 0;
+		const response = await tool.execute(
+			"approval-ui",
+			{ ...common, confirmProjectAgents: true, tasks: [{ task: "check" }] },
+			undefined,
+			undefined,
+			{
+				cwd,
+				hasUI: true,
+				ui: {
+					confirm: async () => {
+						prompts++;
+						return approved;
+					},
+				},
+			},
+		);
+		assert.equal(prompts, 1, "inherited agent gets one interactive approval");
+		if (approved) assert.equal(response.details.results[0].status, "completed");
+		else assert.match(JSON.stringify(response), /were not approved/u);
+	}
+
 	console.log(
 		JSON.stringify(
 			{ name: "check-agents", status: "completed", agent: agent.displayName },
@@ -313,5 +454,7 @@ OPEN_AGENT_PROMPT_MARKER
 		),
 	);
 } finally {
+	if (originalPath === undefined) delete process.env.PATH;
+	else process.env.PATH = originalPath;
 	await rm(tempRoot, { recursive: true, force: true });
 }

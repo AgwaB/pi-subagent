@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+	access,
+	chmod,
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -80,7 +88,11 @@ assert.deepEqual(
 		[TOOL_RESULT_BUDGET_ENV.statePath]: "/tmp/state.json",
 		[TOOL_RESULT_BUDGET_ENV.forceEvictFraction]: "0.25",
 	}),
-	{ maxTotalChars: 2000, statePath: "/tmp/state.json", forceEvictFraction: 0.25 },
+	{
+		maxTotalChars: 2000,
+		statePath: "/tmp/state.json",
+		forceEvictFraction: 0.25,
+	},
 );
 
 // --- validation passthrough (never fails, top-level and task-level) ---
@@ -98,9 +110,19 @@ const invalidBudgetInput = validateResolveInput({
 	task: "inspect",
 	toolResultBudget: { maxTotalChars: "junk" },
 });
-assert.equal(invalidBudgetInput.ok, true, "invalid budget must not fail validation");
+assert.equal(
+	invalidBudgetInput.ok,
+	true,
+	"invalid budget must not fail validation",
+);
 const taskBudgetInput = validateResolveInput({
-	tasks: [{ agent: "worker", task: "inspect", toolResultBudget: { maxTotalChars: 512 } }],
+	tasks: [
+		{
+			agent: "worker",
+			task: "inspect",
+			toolResultBudget: { maxTotalChars: 512 },
+		},
+	],
 });
 assert.equal(taskBudgetInput.ok, true);
 assert.deepEqual(taskBudgetInput.input.tasks[0].toolResultBudget, {
@@ -178,9 +200,64 @@ assert.deepEqual(taskBudgetInput.input.tasks[0].toolResultBudget, {
 	);
 	const pairState = enforcer.enforce(pair);
 	assert.equal(textOf(pair[2]), evictionPlaceholder("fetch_content", 5000));
-	assert.equal(textOf(pair[3]), "x".repeat(9000), "newest kept although over budget");
+	assert.equal(
+		textOf(pair[3]),
+		"x".repeat(9000),
+		"newest kept although over budget",
+	);
 	assert.equal(pairState.evictedCount, 1);
 	assert.equal(pairState.evictableCount, 0);
+}
+
+// --- enforcer: forced eviction stays pending until an old result is eligible ---
+{
+	const enforcer = new ToolResultBudgetEnforcer({
+		maxTotalChars: 1_000_000,
+		forceEvictFraction: 0.25,
+	});
+	const empty = enforcer.enforce(transcript());
+	assert.equal(empty.evictedCount, 0);
+	assert.equal(
+		empty.forcedEvictionApplied,
+		false,
+		"force was not applied without an eligible result",
+	);
+	const newestOnly = enforcer.enforce(
+		transcript(toolResult("pending-1", "fetch_content", 1000)),
+	);
+	assert.equal(
+		newestOnly.evictedCount,
+		0,
+		"the only/newest result remains protected",
+	);
+	assert.equal(newestOnly.forcedEvictionApplied, false);
+
+	const eligible = transcript(
+		toolResult("pending-1", "fetch_content", 1000),
+		toolResult("pending-2", "read", 1000),
+	);
+	const eligibleState = enforcer.enforce(eligible);
+	assert.equal(
+		eligibleState.evictedCount,
+		1,
+		"pending force applies once an old result is eligible",
+	);
+	assert.equal(eligibleState.forcedEvictionApplied, true);
+	assert.equal(textOf(eligible[2]), evictionPlaceholder("fetch_content", 1000));
+	assert.equal(
+		textOf(eligible[3]),
+		"x".repeat(1000),
+		"newest result remains protected",
+	);
+
+	const after = transcript(
+		toolResult("pending-1", "fetch_content", 1000),
+		toolResult("pending-2", "read", 1000),
+		toolResult("pending-3", "web_search", 1000),
+	);
+	const afterState = enforcer.enforce(after);
+	assert.equal(afterState.evictedCount, 1, "force is consumed only once");
+	assert.equal(afterState.forcedEvictionApplied, true);
 }
 
 // --- enforcer: forced eviction (~25% of retained chars) for recovery ---
@@ -210,7 +287,9 @@ assert.deepEqual(taskBudgetInput.input.tasks[0].toolResultBudget, {
 	assert.equal(againState.evictedCount, 1);
 }
 
-const tempRoot = await mkdtemp(join(tmpdir(), "pi-subagent-tool-result-budget-"));
+const tempRoot = await mkdtemp(
+	join(tmpdir(), "pi-subagent-tool-result-budget-"),
+);
 try {
 	// --- real extension module end to end (env config + state file) ---
 	{
@@ -231,7 +310,10 @@ try {
 			);
 			const result = contextHandler({ type: "context", messages });
 			assert.equal(result.messages, messages);
-			assert.equal(textOf(messages[2]), evictionPlaceholder("fetch_content", 1500));
+			assert.equal(
+				textOf(messages[2]),
+				evictionPlaceholder("fetch_content", 1500),
+			);
 			assert.equal(textOf(messages[3]), "x".repeat(1500));
 			const state = JSON.parse(await readFile(statePath, "utf8"));
 			assert.equal(state.evictedCount, 1);
@@ -302,11 +384,17 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		"budget off: no eviction placeholder may ever appear",
 	);
 	const plainResultJson = await readFile(
-		join(cwd, plain.artifacts.find((artifact) => artifact.type === "result").path),
+		join(
+			cwd,
+			plain.artifacts.find((artifact) => artifact.type === "result").path,
+		),
 		"utf8",
 	);
 	assert.equal(plainResultJson.includes(EVICTION_MARKER), false);
-	await assert.rejects(access(envLeakMarker), "budget env must not be set when budget is off");
+	await assert.rejects(
+		access(envLeakMarker),
+		"budget env must not be set when budget is off",
+	);
 
 	// --- (d) invalid budget value: ignored with recorded warning ---
 	const invalidBudget = await runHeadlessModel({
@@ -326,7 +414,10 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		/toolResultBudget ignored/,
 	);
 	assert.equal(invalidBudget.metadata.contextRecovered, undefined);
-	await assert.rejects(access(envLeakMarker), "invalid budget must not enable budget env");
+	await assert.rejects(
+		access(envLeakMarker),
+		"invalid budget must not enable budget env",
+	);
 
 	// --- (c) context-length failure with budget on: one eviction + retry ---
 	const recoveryCounter = join(tempRoot, "recovery-counter");
@@ -372,7 +463,11 @@ if (first) {
 	assert.equal(recovered.failureKind, null);
 	assert.equal(recovered.metadata.contextRecovered, true);
 	assert.equal(recovered.metadata.contextLengthExceeded, false);
-	assert.equal(await readFile(recoveryCounter, "utf8"), "2", "exactly one retry");
+	assert.equal(
+		await readFile(recoveryCounter, "utf8"),
+		"2",
+		"exactly one retry",
+	);
 	assert.deepEqual(recovered.metadata.toolResultBudget, {
 		enabled: true,
 		maxTotalChars: 2000,
@@ -384,7 +479,10 @@ if (first) {
 		forcedEvictionApplied: true,
 	});
 	const recoveredOutput = await readFile(
-		join(cwd, recovered.artifacts.find((artifact) => artifact.type === "output").path),
+		join(
+			cwd,
+			recovered.artifacts.find((artifact) => artifact.type === "output").path,
+		),
 		"utf8",
 	);
 	assert.equal(recoveredOutput, "recovered-after-eviction");

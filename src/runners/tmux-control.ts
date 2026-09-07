@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { ResultTmuxMetadata } from "../artifacts/result.ts";
 import {
 	captureProcessIdentity,
+	inspectProcessIdentity,
 	inspectProcessGroup,
 	type ProcessIdentity,
 	verifyProcessIdentity,
@@ -266,16 +267,13 @@ async function runTmuxControl(
 				try {
 					process.kill(-processGroupId, signal);
 				} catch (error) {
-					if ((error as NodeJS.ErrnoException)?.code !== "ESRCH")
-						return false;
+					if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") return false;
 				}
 				for (let index = 0; index < 10; index += 1) {
 					const status = inspectProcessGroup(processGroupId);
 					if (status === "dead") return true;
 					if (status === "unknown") return false;
-					await new Promise((resolveSleep) =>
-						setTimeout(resolveSleep, 25),
-					);
+					await new Promise((resolveSleep) => setTimeout(resolveSleep, 25));
 				}
 			}
 			return inspectProcessGroup(processGroupId) === "dead";
@@ -347,41 +345,41 @@ async function runTmuxControl(
 					});
 					return;
 				}
-			if (timedOut) {
-				finish({
-					ok: false,
-					error: new TmuxOwnershipError("tmux control command timed out", {
-						terminalBlocked: true,
-					}),
-				});
-				return;
-			}
-			if (signal !== null) {
+				if (timedOut) {
+					finish({
+						ok: false,
+						error: new TmuxOwnershipError("tmux control command timed out", {
+							terminalBlocked: true,
+						}),
+					});
+					return;
+				}
+				if (signal !== null) {
+					finish({
+						ok: false,
+						error: new TmuxOwnershipError(
+							`tmux control command terminated by ${signal}`,
+							{ terminalBlocked: true },
+						),
+					});
+					return;
+				}
+				if (code === 0) {
+					finish({ ok: true, value: { state: "alive", stdout } });
+					return;
+				}
+				const diagnostic = stderr.trim().toLowerCase();
+				if (NO_SERVER_DIAGNOSTICS.some((text) => diagnostic.includes(text))) {
+					finish({ ok: true, value: { state: "dead", stdout } });
+					return;
+				}
 				finish({
 					ok: false,
 					error: new TmuxOwnershipError(
-						`tmux control command terminated by ${signal}`,
+						`tmux control command failed with exit code ${String(code)}: ${stderr.trim() || "no diagnostic"}`,
 						{ terminalBlocked: true },
 					),
 				});
-				return;
-			}
-			if (code === 0) {
-				finish({ ok: true, value: { state: "alive", stdout } });
-				return;
-			}
-			const diagnostic = stderr.trim().toLowerCase();
-			if (NO_SERVER_DIAGNOSTICS.some((text) => diagnostic.includes(text))) {
-				finish({ ok: true, value: { state: "dead", stdout } });
-				return;
-			}
-			finish({
-				ok: false,
-				error: new TmuxOwnershipError(
-					`tmux control command failed with exit code ${String(code)}: ${stderr.trim() || "no diagnostic"}`,
-					{ terminalBlocked: true },
-				),
-			});
 			})().catch((error) =>
 				finish({
 					ok: false,
@@ -469,15 +467,19 @@ async function queryPrivateTmuxRuntime(
 		"-p",
 		"-t",
 		tmux.sessionName ?? "run",
-		`#{pid}\t#{pane_pid}\t#{E:${TMUX_OWNERSHIP_ENV}}`,
+		`#{pid}|#{pane_pid}|#{E:${TMUX_OWNERSHIP_ENV}}`,
 	]);
 	if (displayed.state === "dead") return { state: "dead" };
-	const [rawServerPid, rawPanePid, ownershipToken] = displayed.stdout
-		.trim()
-		.split("\t");
+	// tmux rewrites tabs in non-UTF-8 locales; printable ASCII preserves one
+	// atomic sample. Accept exactly three fields and at most one line ending.
+	const proof = /^([1-9][0-9]*)\|([1-9][0-9]*)\|([^|\r\n]+)\r?\n?$/u.exec(
+		displayed.stdout,
+	);
+	const [, rawServerPid, rawPanePid, ownershipToken] = proof ?? [];
 	const serverPid = Number(rawServerPid);
 	const panePid = Number(rawPanePid);
 	if (
+		proof?.[0] !== displayed.stdout ||
 		!Number.isSafeInteger(serverPid) ||
 		serverPid <= 0 ||
 		!Number.isSafeInteger(panePid) ||
@@ -512,15 +514,17 @@ export async function privateTmuxServerAlive(
 
 export async function readPrivateTmuxRuntimeIdentity(
 	tmux: ResultTmuxMetadata,
-): Promise<Pick<
-	ResultTmuxMetadata,
-	| "serverPid"
-	| "serverProcessGroupId"
-	| "serverProcessBirthIdentity"
-	| "panePid"
-	| "paneProcessGroupId"
-	| "paneProcessBirthIdentity"
->> {
+): Promise<
+	Pick<
+		ResultTmuxMetadata,
+		| "serverPid"
+		| "serverProcessGroupId"
+		| "serverProcessBirthIdentity"
+		| "panePid"
+		| "paneProcessGroupId"
+		| "paneProcessBirthIdentity"
+	>
+> {
 	const first = await queryPrivateTmuxRuntime(tmux);
 	if (first.state !== "alive")
 		throw new TmuxOwnershipError(
@@ -528,21 +532,40 @@ export async function readPrivateTmuxRuntimeIdentity(
 		);
 	const serverPid = first.serverPid!;
 	const panePid = first.panePid!;
-	const [server, pane] = await Promise.all([
-		captureProcessIdentity(serverPid),
-		captureProcessIdentity(panePid),
+	const [serverStatus, paneStatus] = await Promise.all([
+		inspectProcessIdentity(serverPid),
+		inspectProcessIdentity(panePid),
 	]);
+	// A proven exit may fall back to persisted cleanup authority. Unknown
+	// ownership must still block, even when the other process is already dead.
+	if (serverStatus.state === "unknown" || paneStatus.state === "unknown")
+		throw new TmuxOwnershipError(
+			"tmux runtime process ownership could not be verified",
+			{ terminalBlocked: true },
+		);
+	if (serverStatus.state === "dead" || paneStatus.state === "dead")
+		throw new TmuxOwnershipError(
+			"tmux server exited before runtime ownership could be recorded",
+		);
+	const server = serverStatus.identity;
+	const pane = paneStatus.identity;
 	const second = await queryPrivateTmuxRuntime(tmux);
+	const verified = await Promise.all([
+		verifyProcessIdentity(server),
+		verifyProcessIdentity(pane),
+	]);
 	if (
-		second.state !== "alive" ||
-		second.serverPid !== serverPid ||
-		second.panePid !== panePid ||
-		(await verifyProcessIdentity(server)) !== "alive" ||
-		(await verifyProcessIdentity(pane)) !== "alive"
+		(second.state === "alive" &&
+			(second.serverPid !== serverPid || second.panePid !== panePid)) ||
+		verified.some((state) => state === "mismatch" || state === "unknown")
 	)
 		throw new TmuxOwnershipError(
 			"tmux runtime ownership changed while it was being recorded",
 			{ terminalBlocked: true },
+		);
+	if (second.state === "dead" || verified.includes("dead"))
+		throw new TmuxOwnershipError(
+			"tmux server exited before runtime ownership could be recorded",
 		);
 	return {
 		serverPid: server.pid,
@@ -577,10 +600,7 @@ export async function terminatePrivateTmuxServer(
 	const identitySet = runtimeIdentities(completeTmux);
 	const { identities } = identitySet;
 	let unsafe = identitySet.incomplete;
-	if (
-		identities.length === 0 &&
-		completeTmux.launchState !== "planned"
-	)
+	if (identities.length === 0 && completeTmux.launchState !== "planned")
 		unsafe = true;
 	if (
 		completeTmux.launchState === "launching" &&
@@ -605,10 +625,7 @@ export async function terminatePrivateTmuxServer(
 			}
 			if (status !== "alive") continue;
 			alive.push(identity);
-			if (
-				process.platform !== "win32" &&
-				identity.pid === identity.processGroupId
-			)
+			if (process.platform !== "win32" && identity.pid === identity.processGroupId)
 				authorizedGroups.add(identity.processGroupId);
 		}
 		return alive;
@@ -642,10 +659,7 @@ export async function terminatePrivateTmuxServer(
 				continue;
 			}
 			drained = false;
-			if (
-				status === "unknown" ||
-				!authorizedGroups.has(processGroupId)
-			)
+			if (status === "unknown" || !authorizedGroups.has(processGroupId))
 				unsafe = true;
 		}
 		return drained;
@@ -672,28 +686,17 @@ export async function terminatePrivateTmuxServer(
 					!identities.some(
 						(candidate) =>
 							candidate.pid === identity.identity.pid &&
-							candidate.processGroupId ===
-								identity.identity.processGroupId &&
-							candidate.birthIdentity ===
-								identity.identity.birthIdentity,
+							candidate.processGroupId === identity.identity.processGroupId &&
+							candidate.birthIdentity === identity.identity.birthIdentity,
 					)
-				)
-				{
+				) {
 					identities.push(identity.identity);
-					if (
-						identity.identity.pid ===
-						identity.identity.processGroupId
-					)
-						recordedLeaderGroups.add(
-							identity.identity.processGroupId,
-						);
+					if (identity.identity.pid === identity.identity.processGroupId)
+						recordedLeaderGroups.add(identity.identity.processGroupId);
 				}
 			socketOwnershipCaptured = true;
 		} catch (error) {
-			if (
-				error instanceof TmuxOwnershipError &&
-				error.terminalBlocked === true
-			)
+			if (error instanceof TmuxOwnershipError && error.terminalBlocked === true)
 				unsafe = true;
 			else if (
 				error instanceof TmuxOwnershipError &&
@@ -701,8 +704,7 @@ export async function terminatePrivateTmuxServer(
 					"tmux server exited before runtime ownership could be recorded"
 			) {
 				// Persisted identities below still prove whether cleanup is complete.
-			}
-			else throw error;
+			} else throw error;
 		}
 	}
 
@@ -729,10 +731,7 @@ export async function terminatePrivateTmuxServer(
 		try {
 			socketAlive = await privateTmuxServerAlive(tmux);
 		} catch (error) {
-			if (
-				error instanceof TmuxOwnershipError &&
-				error.terminalBlocked === true
-			)
+			if (error instanceof TmuxOwnershipError && error.terminalBlocked === true)
 				unsafe = true;
 			else throw error;
 		}

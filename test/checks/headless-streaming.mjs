@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import childProcess, { spawn } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import {
 	access,
 	chmod,
@@ -26,15 +27,41 @@ import {
 } from "../../src/process-identity.ts";
 
 function artifactByType(result, type) {
-	const artifact = result.artifacts.find(
-		(candidate) => candidate.type === type,
-	);
+	const artifact = result.artifacts.find((candidate) => candidate.type === type);
 	assert.ok(artifact, `missing ${type} artifact`);
 	return artifact;
 }
 
 function maybeArtifactByType(result, type) {
 	return result.artifacts.find((candidate) => candidate.type === type);
+}
+
+// Exercise the real child, ownership capture and group drain, but make a gate
+// write deterministically report the disconnected-pipe error seen on macOS.
+async function withDisconnectedGate(check) {
+	const originalSpawn = childProcess.spawn;
+	const probe = {
+		writes: 0,
+		error: Object.assign(new Error("write ENOTCONN"), { code: "ENOTCONN" }),
+	};
+	childProcess.spawn = (...args) => {
+		const child = originalSpawn(...args);
+		if (args[1]?.[0]?.endsWith("/process-gate.mjs")) {
+			child.stdin.end = () => {
+				probe.writes += 1;
+				queueMicrotask(() => child.stdin.emit("error", probe.error));
+				return child.stdin;
+			};
+		}
+		return child;
+	};
+	syncBuiltinESMExports();
+	try {
+		await check(probe);
+	} finally {
+		childProcess.spawn = originalSpawn;
+		syncBuiltinESMExports();
+	}
 }
 
 const argvWithSession = buildPiArgv({
@@ -67,7 +94,7 @@ try {
 	await mkdir(cwd, { recursive: true });
 	const execProbe = spawn(
 		"/bin/bash",
-		["-c", 'IFS= read -r gate; exec /bin/sleep 30', "identity-exec-probe"],
+		["-c", "IFS= read -r gate; exec /bin/sleep 30", "identity-exec-probe"],
 		{ detached: true, stdio: ["pipe", "ignore", "ignore"] },
 	);
 	assert.equal(typeof execProbe.pid, "number");
@@ -126,7 +153,10 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		task: "inspect env",
 	});
 	assert.equal(
-		await readFile(join(cwd, artifactByType(unsetBinding, "output").path), "utf8"),
+		await readFile(
+			join(cwd, artifactByType(unsetBinding, "output").path),
+			"utf8",
+		),
 		"unset",
 	);
 	const explicitBinding = await runHeadlessModel({
@@ -139,7 +169,10 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 		childEnv: { PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON: "current-binding" },
 	});
 	assert.equal(
-		await readFile(join(cwd, artifactByType(explicitBinding, "output").path), "utf8"),
+		await readFile(
+			join(cwd, artifactByType(explicitBinding, "output").path),
+			"utf8",
+		),
 		"current-binding",
 	);
 	delete process.env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
@@ -299,9 +332,7 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
 	});
 	assert.equal(nonFatal.status, "completed");
 	assert.equal(nonFatal.failureKind, null);
-	assert.deepEqual(nonFatal.metadata.streamErrors, [
-		"transient stream warning",
-	]);
+	assert.deepEqual(nonFatal.metadata.streamErrors, ["transient stream warning"]);
 	assert.deepEqual(nonFatal.metadata.nonFatalStreamErrors, [
 		"transient stream warning",
 	]);
@@ -449,6 +480,47 @@ setInterval(() => undefined, 1000);
 	assert.equal(interrupted.status, "cancelled");
 	assert.equal(interrupted.failureKind, "user_cancelled");
 
+	for (const reason of [
+		undefined,
+		userCancelledAbortReason("operator interrupt"),
+	]) {
+		await withDisconnectedGate(async (probe) => {
+			const controller = new AbortController();
+			const result = await runHeadlessModel({
+				cwd,
+				piCommand: abortPi,
+				agent: "stream-worker",
+				task: "never release an aborted ownership gate",
+				timeoutMs: 30_000,
+				signal: controller.signal,
+				onProcessStart: async () => {
+					controller.abort(reason);
+					await Promise.resolve();
+				},
+			});
+			assert.equal(result.status, "cancelled");
+			assert.equal(result.failureKind, abortFailureKind(controller.signal));
+			assert.equal(
+				probe.writes,
+				0,
+				"an aborted gate must receive no launch payload",
+			);
+		});
+	}
+	await withDisconnectedGate(async (probe) => {
+		await assert.rejects(
+			runHeadlessModel({
+				cwd,
+				piCommand: abortPi,
+				agent: "stream-worker",
+				task: "unexpected pipe errors must still fail closed",
+				timeoutMs: 30_000,
+			}),
+			(error) => error === probe.error,
+		);
+		assert.equal(probe.writes, 1);
+	});
+
 	// A process-group kill that fails with EPERM (seen on macOS while the leader
 	// exits) must not escape the abort listener; the runner falls back to
 	// signalling the child directly and still settles as cancelled.
@@ -480,7 +552,10 @@ setInterval(() => undefined, 1000);
 		assert.equal(epermAborted.status, "cancelled");
 		assert.equal(epermAborted.failureKind, "abort");
 		assert.ok(groupKillAttempts >= 1, "group kill was attempted");
-		const epermStderr = await readFile(join(cwd, artifactByType(epermAborted, "stderr").path), "utf8");
+		const epermStderr = await readFile(
+			join(cwd, artifactByType(epermAborted, "stderr").path),
+			"utf8",
+		);
 		assert.match(epermStderr, /process-group kill failed: EPERM/u);
 	} finally {
 		process.kill = originalKill;

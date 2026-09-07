@@ -149,8 +149,7 @@ export function resolveContextLengthState(
 		rawContextLengthExceeded && finalAssistantSucceeded(parsed);
 	return {
 		rawContextLengthExceeded,
-		contextLengthExceeded:
-			rawContextLengthExceeded && !contextOverflowRecovered,
+		contextLengthExceeded: rawContextLengthExceeded && !contextOverflowRecovered,
 		contextOverflowRecovered,
 		recoveredStreamErrors: contextOverflowRecovered
 			? parsed.errors.filter((error) =>
@@ -162,17 +161,14 @@ export function resolveContextLengthState(
 
 function finalAssistantSucceeded(parsed: PiJsonParseResult): boolean {
 	return (
-		parsed.finalAssistantText.length > 0 &&
-		parsed.metadata.stopReason !== "error"
+		parsed.finalAssistantText.length > 0 && parsed.metadata.stopReason !== "error"
 	);
 }
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
 	if (timeoutMs === undefined) return undefined;
 	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-		throw new Error(
-			"timeoutMs must be a positive finite number when provided.",
-		);
+		throw new Error("timeoutMs must be a positive finite number when provided.");
 	}
 	return timeoutMs;
 }
@@ -300,9 +296,7 @@ function accumulateAssistantUsage(
 		turnEnd: { count: 0, total: undefined },
 	});
 	const slot =
-		eventType === "message_end"
-			? accumulation.messageEnd
-			: accumulation.turnEnd;
+		eventType === "message_end" ? accumulation.messageEnd : accumulation.turnEnd;
 	slot.count += 1;
 	slot.total = sumUsageValues(slot.total, usage);
 	// Pi emits both message_end and turn_end for the same assistant message, so
@@ -408,9 +402,7 @@ function parsePiJsonLine(
 					message !== null &&
 					(message as Record<string, unknown>).role === "assistant"
 				) {
-					const text = textFromContent(
-						(message as Record<string, unknown>).content,
-					);
+					const text = textFromContent((message as Record<string, unknown>).content);
 					if (text.length > 0) parsed.finalAssistantText = text;
 				}
 			}
@@ -716,10 +708,7 @@ async function runProcess(
 		return {
 			outcome,
 			stderrRef: store.refFor("stderr", await fileBytes(stderrPath)),
-			toolCallArtifactRefs: await flushToolCallTelemetry(
-				toolCallTelemetry,
-				store,
-			),
+			toolCallArtifactRefs: await flushToolCallTelemetry(toolCallTelemetry, store),
 			parsed,
 			stderrText,
 			stderrContextLengthExceeded,
@@ -739,17 +728,13 @@ async function runProcess(
 		const gatePath = fileURLToPath(
 			new URL("../workers/process-gate.mjs", import.meta.url),
 		);
-		const child = spawn(
-			process.execPath,
-			[gatePath],
-			{
+		const child = spawn(process.execPath, [gatePath], {
 			cwd,
 			shell: false,
 			detached: process.platform !== "win32",
 			stdio: ["pipe", "pipe", "pipe"],
 			env: processGateEnvironment(process.env),
-			},
-		);
+		});
 
 		let settled = false;
 		let gateReleased = false;
@@ -793,10 +778,7 @@ async function runProcess(
 		// the child directly and record what happened as evidence.
 		function signalChild(signal: NodeJS.Signals): void {
 			const attempts: Array<() => void> = [];
-			if (
-				authorizedProcessGroupId !== undefined &&
-				process.platform !== "win32"
-			) {
+			if (authorizedProcessGroupId !== undefined && process.platform !== "win32") {
 				const processGroupId = authorizedProcessGroupId;
 				attempts.push(() => process.kill(-processGroupId, signal));
 			}
@@ -815,7 +797,9 @@ async function runProcess(
 				} catch (error) {
 					const code = (error as NodeJS.ErrnoException)?.code;
 					if (code === "ESRCH") return;
-					failures.push(code ?? (error instanceof Error ? error.message : String(error)));
+					failures.push(
+						code ?? (error instanceof Error ? error.message : String(error)),
+					);
 				}
 			}
 			noteRunnerDiagnostic(
@@ -915,11 +899,12 @@ async function runProcess(
 			);
 		}
 
-		function startGroupDrain(): Promise<ProcessOwnershipError | Error | undefined> {
+		function startGroupDrain(): Promise<
+			ProcessOwnershipError | Error | undefined
+		> {
 			groupDrainResult ??= drainAuthorizedProcessGroup().then(
 				() => undefined,
-				(error) =>
-					error instanceof Error ? error : new Error(String(error)),
+				(error) => (error instanceof Error ? error : new Error(String(error))),
 			);
 			return groupDrainResult;
 		}
@@ -1028,16 +1013,12 @@ async function runProcess(
 		child.once("spawn", () => {
 			const pid = child.pid;
 			if (pid === undefined) {
-				rejectOwnership(
-					new Error("headless gated launcher did not expose a pid"),
-				);
+				rejectOwnership(new Error("headless gated launcher did not expose a pid"));
 				return;
 			}
 			ownershipTimer = setTimeout(() => {
 				rejectOwnership(
-					new Error(
-						"headless gated launch timed out before ownership was recorded",
-					),
+					new Error("headless gated launch timed out before ownership was recorded"),
 				);
 			}, PROCESS_OWNERSHIP_TIMEOUT_MS);
 			void captureProcessIdentity(pid)
@@ -1053,7 +1034,9 @@ async function runProcess(
 						processBirthIdentity: identity.birthIdentity,
 						command: argv[0],
 					});
-					if (settled || ownershipError !== undefined) return;
+					// Cancellation can kill the gate while ownership persistence is
+					// pending. Do not write a launch payload to that closed stdin.
+					if (settled || ownershipError !== undefined || stopKind !== null) return;
 					if (ownershipTimer) clearTimeout(ownershipTimer);
 					ownershipTimer = null;
 					gateReleased = true;
@@ -1161,8 +1144,7 @@ export async function runHeadlessModel(
 									};
 									delete env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
 									if (explicitBinding !== undefined)
-										env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON =
-											explicitBinding;
+										env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = explicitBinding;
 									return env;
 								})(),
 								options.onProcessStart,

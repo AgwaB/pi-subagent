@@ -728,7 +728,7 @@ export async function runPreparedSubagentExecution(
 				: backend === "inline"
 					? await runInlineModel(modelOptions)
 					: await runHeadlessModel(modelOptions);
-		result = await finalizeWorktreeResult(workspace, result);
+		result = await finalizeWorktreeResult(workspace, result, input.runsDir);
 		prepared.ownership.state = "finalized";
 		const terminalCleanupStatus = result.workspace.worktreeCleanupStatus;
 		prepared.ownership.cleanupStatus =

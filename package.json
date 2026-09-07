@@ -74,6 +74,7 @@
     "check:model:inline": "node ./test/integration/inline-model.mjs",
     "check:model:headless": "node ./test/integration/headless-model.mjs",
     "check:model:tmux": "node ./test/integration/tmux-model.mjs",
+    "check:model:confirmed-fixes": "node ./test/integration/confirmed-fixes.mjs",
     "check:all": "npm run check:static && npm run check:integration",
     "validate": "npm run check:scripts && npm run check:static",
     "release:check": "node ./scripts/release-check.mjs",

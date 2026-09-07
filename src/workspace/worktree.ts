@@ -1,8 +1,12 @@
-import { execFile } from "node:child_process";
-import { mkdir } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { appendFile, mkdir, open, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { createAttemptArtifactStore, type ArtifactRef, type ResultEnvelope } from "../artifacts/index.ts";
+import {
+  createAttemptArtifactStore,
+  type ArtifactRef,
+  type ResultEnvelope,
+} from "../artifacts/index.ts";
 import type { ResolveInput, WorkspaceMode } from "../core/constants.ts";
 import { resolveWorktreeIntent } from "./intent.ts";
 
@@ -28,14 +32,20 @@ export class WorkspacePolicyError extends Error {
 
 function explicitWorkspacePath(input: ResolveInput): string | undefined {
   const workspace = input.workspace;
-  if (typeof workspace === "object" && workspace !== null) return workspace.path;
+  if (typeof workspace === "object" && workspace !== null)
+    return workspace.path;
   if (typeof input.worktree === "string") return input.worktree;
   return undefined;
 }
 
-
-async function gitOutput(cwd: string, args: readonly string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf8" });
+async function gitOutput(
+  cwd: string,
+  args: readonly string[],
+): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd,
+    encoding: "utf8",
+  });
   return stdout.trim();
 }
 
@@ -46,17 +56,32 @@ async function gitRoot(cwd: string): Promise<string> {
     return await gitOutput(cwd, ["rev-parse", "--show-toplevel"]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new WorkspacePolicyError(`worktree isolation was requested but requires a git checkout cwd; use workspace:"shared" (or omit worktree options) to run without isolation. ${message}`);
+    throw new WorkspacePolicyError(
+      `worktree isolation was requested but requires a git checkout cwd; use workspace:"shared" (or omit worktree options) to run without isolation. ${message}`,
+    );
   }
 }
 
-function defaultWorktreePath(root: string, runId: string | undefined, taskIndex: number | undefined): string {
-  const safeRunId = (runId ?? `run-${Date.now().toString(36)}`).replace(/[^A-Za-z0-9._-]/g, "-");
+function defaultWorktreePath(
+  root: string,
+  runId: string | undefined,
+  taskIndex: number | undefined,
+): string {
+  const safeRunId = (runId ?? `run-${Date.now().toString(36)}`).replace(
+    /[^A-Za-z0-9._-]/g,
+    "-",
+  );
   const safeSlot = `slot-${(taskIndex ?? 0) + 1}`;
-  return join(dirname(root), ".pi-subagent-worktrees", `${root.split(/[\\/]/).pop() ?? "repo"}-${safeRunId}-${safeSlot}`);
+  return join(
+    dirname(root),
+    ".pi-subagent-worktrees",
+    `${root.split(/[\\/]/).pop() ?? "repo"}-${safeRunId}-${safeSlot}`,
+  );
 }
 
-export async function resolveWorkspace(options: WorkspaceResolutionInput): Promise<ResolvedWorkspace> {
+export async function resolveWorkspace(
+  options: WorkspaceResolutionInput,
+): Promise<ResolvedWorkspace> {
   const baseCwd = resolve(options.cwd);
   const intent = resolveWorktreeIntent(options.input);
 
@@ -66,22 +91,55 @@ export async function resolveWorkspace(options: WorkspaceResolutionInput): Promi
 
   const root = await gitRoot(baseCwd);
   const requestedPath = explicitWorkspacePath(options.input);
-  const worktreePath = resolve(requestedPath && !isAbsolute(requestedPath) ? join(baseCwd, requestedPath) : (requestedPath ?? defaultWorktreePath(root, options.runId, options.taskIndex)));
+  const worktreePath = resolve(
+    requestedPath && !isAbsolute(requestedPath)
+      ? join(baseCwd, requestedPath)
+      : (requestedPath ??
+          defaultWorktreePath(root, options.runId, options.taskIndex)),
+  );
   await mkdir(dirname(worktreePath), { recursive: true });
-  await execFileAsync("git", ["-C", root, "worktree", "add", "--detach", worktreePath, "HEAD"]);
+  await execFileAsync("git", [
+    "-C",
+    root,
+    "worktree",
+    "add",
+    "--detach",
+    worktreePath,
+    "HEAD",
+  ]);
   return { mode: "worktree", baseCwd, cwd: worktreePath, worktreePath };
 }
 
-async function gitOutputAllowFailure(cwd: string, args: readonly string[]): Promise<string> {
+/** Write Git output directly to disk, without an in-memory patch size limit. */
+async function appendGitFile(
+  cwd: string,
+  args: readonly string[],
+  destination: string,
+): Promise<void> {
+  const output = await open(destination, "a");
   try {
-    const { stdout, stderr } = await execFileAsync("git", args, { cwd, encoding: "utf8" });
-    return `${stdout}${stderr}`;
-  } catch (error) {
-    const anyError = error as { stdout?: unknown; stderr?: unknown; message?: unknown };
-    const stdout = typeof anyError.stdout === "string" ? anyError.stdout : "";
-    const stderr = typeof anyError.stderr === "string" ? anyError.stderr : "";
-    const message = typeof anyError.message === "string" ? anyError.message : String(error);
-    return `${stdout}${stderr}${stdout || stderr ? "" : message}`;
+    await new Promise<void>((resolvePromise, reject) => {
+      const child = spawn("git", args, {
+        cwd,
+        stdio: ["ignore", output.fd, "pipe"],
+      });
+      let stderr = "";
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr = `${stderr}${chunk.toString()}`.slice(-64 * 1024);
+      });
+      child.once("error", reject);
+      child.once("close", (code, signal) => {
+        if (code === 0) resolvePromise();
+        else
+          reject(
+            new Error(
+              `git ${args.join(" ")} failed (${signal ?? code}): ${stderr.trim()}`,
+            ),
+          );
+      });
+    });
+  } finally {
+    await output.close();
   }
 }
 
@@ -96,16 +154,47 @@ const WORKTREE_DIFF_EXCLUDES = [
   ":(glob,exclude)**/.pi/workflows/index.lock",
 ];
 
-async function captureWorktreeArtifacts(result: ResultEnvelope, worktreePath: string): Promise<ArtifactRef[]> {
-  const store = await createAttemptArtifactStore({ cwd: result.cwd, runId: result.runId, attemptId: result.attemptId });
+async function captureWorktreeArtifacts(
+  result: ResultEnvelope,
+  worktreePath: string,
+  runsDir?: string,
+): Promise<ArtifactRef[]> {
+  const store = await createAttemptArtifactStore({
+    cwd: result.cwd,
+    runId: result.runId,
+    attemptId: result.attemptId,
+    runsDir,
+  });
   const pathspec = [".", ...WORKTREE_DIFF_EXCLUDES];
-  await gitOutputAllowFailure(worktreePath, ["add", "-N", "--", ...pathspec]);
-  const status = await gitOutputAllowFailure(worktreePath, ["status", "--short", "--", ...pathspec]);
-  const diffStat = await gitOutputAllowFailure(worktreePath, ["diff", "--stat", "--", ...pathspec]);
-  const diff = await gitOutputAllowFailure(worktreePath, ["diff", "--binary", "--", ...pathspec]);
+  // Intent-to-add makes untracked files visible to diff HEAD, while HEAD makes
+  // both staged and unstaged tracked changes part of the same complete patch.
+  await gitOutput(worktreePath, ["add", "-N", "--", ...pathspec]);
+  const statusPath = store.pathFor("worktree-status");
+  await writeFile(statusPath, "");
+  await appendGitFile(
+    worktreePath,
+    ["status", "--short", "--", ...pathspec],
+    statusPath,
+  );
+  if ((await stat(statusPath)).size === 0)
+    await writeFile(statusPath, "(clean)\n");
+  const diffArgs = ["diff", "--no-ext-diff", "--no-textconv"];
+  const diffPath = store.pathFor("worktree-diff");
+  await writeFile(diffPath, "");
+  await appendGitFile(
+    worktreePath,
+    [...diffArgs, "--stat", "HEAD", "--", ...pathspec],
+    diffPath,
+  );
+  if ((await stat(diffPath)).size > 0) await appendFile(diffPath, "\n");
+  await appendGitFile(
+    worktreePath,
+    [...diffArgs, "--binary", "HEAD", "--", ...pathspec],
+    diffPath,
+  );
   return [
-    await store.writeTextArtifact("worktree-status", status.length > 0 ? status : "(clean)\n"),
-    await store.writeTextArtifact("worktree-diff", `${diffStat.trimEnd()}${diffStat.trim() && diff.trim() ? "\n\n" : ""}${diff}`),
+    store.refFor("worktree-status", (await stat(statusPath)).size),
+    store.refFor("worktree-diff", (await stat(diffPath)).size),
   ];
 }
 
@@ -128,23 +217,36 @@ export async function retainOwnedWorkspace(
   workspace: ResolvedWorkspace,
 ): Promise<void> {
   if (workspace.mode !== "worktree" || workspace.worktreePath === null) return;
-  await gitOutput(workspace.baseCwd, [
-    "worktree",
-    "list",
-    "--porcelain",
-  ]);
+  await gitOutput(workspace.baseCwd, ["worktree", "list", "--porcelain"]);
 }
 
-export async function finalizeWorktreeResult(workspace: ResolvedWorkspace, result: ResultEnvelope): Promise<ResultEnvelope> {
-  if (workspace.mode !== "worktree" || workspace.worktreePath === null) return result;
+export async function finalizeWorktreeResult(
+  workspace: ResolvedWorkspace,
+  result: ResultEnvelope,
+  runsDir?: string,
+): Promise<ResultEnvelope> {
+  if (workspace.mode !== "worktree" || workspace.worktreePath === null)
+    return result;
 
-  const store = await createAttemptArtifactStore({ cwd: result.cwd, runId: result.runId, attemptId: result.attemptId });
+  const store = await createAttemptArtifactStore({
+    cwd: result.cwd,
+    runId: result.runId,
+    attemptId: result.attemptId,
+    runsDir,
+  });
   const artifacts = [...result.artifacts];
-  let cleanupStatus: "removed" | "kept" | "failed" = result.status === "completed" ? "removed" : "kept";
+  let cleanupStatus: "removed" | "kept" | "failed" =
+    result.status === "completed" ? "removed" : "kept";
   let cleanupError: string | undefined;
 
   try {
-    artifacts.push(...await captureWorktreeArtifacts(result, workspace.worktreePath));
+    artifacts.push(
+      ...(await captureWorktreeArtifacts(
+        result,
+        workspace.worktreePath,
+        runsDir,
+      )),
+    );
   } catch (error) {
     cleanupStatus = "failed";
     cleanupError = `failed to capture worktree artifacts: ${error instanceof Error ? error.message : String(error)}`;
@@ -153,15 +255,26 @@ export async function finalizeWorktreeResult(workspace: ResolvedWorkspace, resul
   if (result.status === "completed" && cleanupError === undefined) {
     try {
       const root = await gitRoot(workspace.baseCwd);
-      await execFileAsync("git", ["-C", root, "worktree", "remove", "--force", workspace.worktreePath]);
+      await execFileAsync("git", [
+        "-C",
+        root,
+        "worktree",
+        "remove",
+        "--force",
+        workspace.worktreePath,
+      ]);
     } catch (error) {
       cleanupStatus = "failed";
       cleanupError = `failed to remove worktree: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
 
-  const statusRef = artifacts.find((artifact) => artifact.type === "worktree-status");
-  const diffRef = artifacts.find((artifact) => artifact.type === "worktree-diff");
+  const statusRef = artifacts.find(
+    (artifact) => artifact.type === "worktree-status",
+  );
+  const diffRef = artifacts.find(
+    (artifact) => artifact.type === "worktree-diff",
+  );
 
   return await store.writeResult({
     backend: result.backend,
@@ -174,9 +287,13 @@ export async function finalizeWorktreeResult(workspace: ResolvedWorkspace, resul
     workspace: {
       ...result.workspace,
       worktreeCleanupStatus: cleanupStatus,
-      ...(statusRef === undefined ? {} : { worktreeStatusPath: statusRef.path }),
+      ...(statusRef === undefined
+        ? {}
+        : { worktreeStatusPath: statusRef.path }),
       ...(diffRef === undefined ? {} : { worktreeDiffPath: diffRef.path }),
-      ...(cleanupError === undefined ? {} : { worktreeCleanupError: cleanupError }),
+      ...(cleanupError === undefined
+        ? {}
+        : { worktreeCleanupError: cleanupError }),
     },
     sandbox: result.sandbox,
     exitCode: result.exitCode,

@@ -194,16 +194,21 @@ export class ToolResultBudgetEnforcer {
 
 		if (this.pendingForceEvictFraction > 0) {
 			const fraction = this.pendingForceEvictFraction;
-			this.pendingForceEvictFraction = 0;
 			const target = retainedChars() * (1 - fraction);
+			let evictedForForce = false;
 			while (
 				retained.length > 1 &&
 				retained[0]!.key !== newestKey &&
 				retainedChars() > target
 			) {
 				evictOldest();
+				evictedForForce = true;
 				this.forcedEvictionApplied = true;
 			}
+			// A context may contain no tool results (or only the protected newest
+			// result) on the first recovery attempt. Keep the request pending until
+			// it can actually evict something.
+			if (evictedForForce) this.pendingForceEvictFraction = 0;
 		}
 
 		while (
