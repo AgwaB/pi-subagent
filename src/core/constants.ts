@@ -148,6 +148,8 @@ export interface SubagentTaskInput {
 	systemPrompt?: string;
 	skills?: string[];
 	extensions?: string[];
+	/** Disable ambient extension discovery while retaining explicit extension paths. */
+	noExtensions?: boolean;
 	captureToolCalls?: boolean;
 	/** Opt-in transcript hygiene for child tool results (headless backend). */
 	toolResultBudget?: ToolResultBudgetInput;
@@ -183,6 +185,8 @@ export interface ResolveInput {
 	systemPrompt?: string;
 	skills?: string[];
 	extensions?: string[];
+	/** Disable ambient extension discovery while retaining explicit extension paths. */
+	noExtensions?: boolean;
 	captureToolCalls?: boolean;
 	/** Opt-in transcript hygiene for child tool results (headless backend). */
 	toolResultBudget?: ToolResultBudgetInput;

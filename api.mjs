@@ -10,8 +10,11 @@ export const waitForSubagent = api.waitForSubagent;
 export const interruptSubagent = api.interruptSubagent;
 export const reconcileSubagentRun = api.reconcileSubagentRun;
 export const pruneSubagentRuns = api.pruneSubagentRuns;
-export const formatPruneSubagentRunsSummary = api.formatPruneSubagentRunsSummary;
+export const formatPruneSubagentRunsSummary =
+	api.formatPruneSubagentRunsSummary;
 export const recordSubagentChildEvent = api.recordSubagentChildEvent;
+export const supportsExplicitExtensionIsolation =
+	api.supportsExplicitExtensionIsolation;
 export const assertDurableLaunchBarrierV2ExecutionAuthorized =
 	api.assertDurableLaunchBarrierV2ExecutionAuthorized;
 export const createDurableLaunchBarrier = api.createDurableLaunchBarrier;
@@ -29,8 +32,10 @@ export const releaseDurableLaunchBarrier = api.releaseDurableLaunchBarrier;
 export const resolveDurableLaunchBarrierV2Release =
 	api.resolveDurableLaunchBarrierV2Release;
 export const revokeDurableLaunchBarrierV2 = api.revokeDurableLaunchBarrierV2;
-export const waitForDurableLaunchBarrierAck = api.waitForDurableLaunchBarrierAck;
-export const waitForDurableLaunchBarrierReady = api.waitForDurableLaunchBarrierReady;
+export const waitForDurableLaunchBarrierAck =
+	api.waitForDurableLaunchBarrierAck;
+export const waitForDurableLaunchBarrierReady =
+	api.waitForDurableLaunchBarrierReady;
 export const waitForDurableLaunchBarrierV2Ack =
 	api.waitForDurableLaunchBarrierV2Ack;
 export const waitForDurableLaunchBarrierV2Ready =

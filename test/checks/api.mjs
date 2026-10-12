@@ -23,6 +23,7 @@ import {
 	revokeDurableLaunchBarrierV2,
 	runSubagent,
 	SubagentValidationError,
+	supportsExplicitExtensionIsolation,
 	waitForDurableLaunchBarrierAck,
 	waitForDurableLaunchBarrierReady,
 	waitForDurableLaunchBarrierV2Ack,
@@ -41,6 +42,8 @@ assert.equal(typeof waitForSubagent, "function");
 assert.equal(typeof interruptSubagent, "function");
 assert.equal(typeof reconcileSubagentRun, "function");
 assert.equal(typeof recordSubagentChildEvent, "function");
+assert.equal(typeof supportsExplicitExtensionIsolation, "function");
+assert.equal(supportsExplicitExtensionIsolation(), true);
 assert.equal(typeof createDurableLaunchBarrier, "function");
 assert.equal(typeof durableLaunchBarrierDigest, "function");
 assert.equal(typeof DurableLaunchBarrierError, "function");
@@ -57,7 +60,10 @@ assert.equal(typeof revokeDurableLaunchBarrierV2, "function");
 assert.equal(typeof waitForDurableLaunchBarrierV2Ready, "function");
 assert.equal(typeof waitForDurableLaunchBarrierV2Ack, "function");
 assert.equal(typeof readDurableLaunchBarrierV2State, "function");
-assert.equal(typeof assertDurableLaunchBarrierV2ExecutionAuthorized, "function");
+assert.equal(
+	typeof assertDurableLaunchBarrierV2ExecutionAuthorized,
+	"function",
+);
 assert.equal(typeof DurableLaunchBarrierRevokedError, "function");
 assert.equal(typeof isDurableLaunchBarrierRevokedError, "function");
 
@@ -121,10 +127,7 @@ try {
 		result.artifacts.find((artifact) => artifact.type === "result")?.path,
 	);
 	assert.equal(status?.childSummary?.failed, 1);
-	assert.equal(
-		status?.childSummary?.latestFailure?.childRunId,
-		"run_child_api",
-	);
+	assert.equal(status?.childSummary?.latestFailure?.childRunId, "run_child_api");
 
 	const logs = await getSubagentLogs({ cwd, runId, attemptId });
 	assert.equal(logs?.logText.output, "api-ok\n");

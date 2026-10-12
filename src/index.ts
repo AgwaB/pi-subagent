@@ -74,6 +74,7 @@ const SUPPORTED_KEYS = new Set([
 	"systemPrompt",
 	"skills",
 	"extensions",
+	"noExtensions",
 	"runsDir",
 	"correlationId",
 	"captureToolCalls",
@@ -135,6 +136,12 @@ const SUBAGENT_TASK_SCHEMA = Type.Object({
 	systemPrompt: Type.Optional(Type.String({ minLength: 1 })),
 	skills: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
 	extensions: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+	noExtensions: Type.Optional(
+		Type.Boolean({
+			description:
+				"Disable ambient extension discovery while retaining paths listed in extensions.",
+		}),
+	),
 	captureToolCalls: Type.Optional(
 		Type.Boolean({
 			description:
@@ -998,6 +1005,12 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 				Type.Array(Type.String({ minLength: 1 }), {
 					description:
 						"Additional Pi extension paths to load. Omit to use ambient discovery; pass [] to disable child extensions.",
+				}),
+			),
+			noExtensions: Type.Optional(
+				Type.Boolean({
+					description:
+						"Disable ambient extension discovery while retaining paths listed in extensions.",
 				}),
 			),
 			runsDir: Type.Optional(

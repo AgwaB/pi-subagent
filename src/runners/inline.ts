@@ -47,6 +47,7 @@ export interface RunInlineModelOptions {
 	systemPrompt?: string;
 	skills?: string[];
 	extensions?: string[];
+	noExtensions?: boolean;
 	captureToolCalls?: boolean;
 	agentDefinition?: AgentDefinition;
 }
@@ -464,7 +465,8 @@ function createChildResourceLoader(
 			: undefined,
 		additionalSkillPaths: options.skills?.length ? options.skills : undefined,
 		noExtensions:
-			options.extensions !== undefined && options.extensions.length === 0,
+			options.noExtensions === true ||
+			(options.extensions !== undefined && options.extensions.length === 0),
 		noSkills: options.skills !== undefined && options.skills.length === 0,
 		noPromptTemplates: true,
 		noThemes: true,

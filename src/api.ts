@@ -90,6 +90,11 @@ export interface RunSubagentOptions extends ResolveInput {
 
 export type RunSubagentResult = ResultEnvelope | ParallelRunResult;
 
+/** Whether this engine honors noExtensions while retaining explicit extensions. */
+export function supportsExplicitExtensionIsolation(): true {
+	return true;
+}
+
 export type GetSubagentStatusOptions = RunStatusRef;
 export type GetSubagentLogsOptions = RunStatusRef;
 export type WaitForSubagentOptions = WaitForRunOptions;
@@ -378,6 +383,7 @@ export type {
 	FailureKind,
 	ResolvedBackend,
 	Status,
+	SubagentTaskInput,
 } from "./core/constants.ts";
 export type { InterruptRunResult } from "./orchestrate/interrupt.ts";
 export type { ReconcileSubagentRunResult } from "./orchestrate/reconcile.ts";

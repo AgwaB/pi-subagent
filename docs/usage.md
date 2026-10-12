@@ -319,6 +319,7 @@ The locator index is only a pointer for finding runs across cwd boundaries. `run
 | `systemPrompt` | Full system prompt override. When provided, it wins over any agent file prompt; named-agent frontmatter such as `tools`, `model`, and `thinking` may still apply. |
 | `skills` | Additional Pi skill paths to load in the child. Omit to use normal ambient discovery; pass `[]` to disable child skills. |
 | `extensions` | Additional Pi extension paths to load in the child. Omit to use normal ambient discovery; pass `[]` to disable child extensions. |
+| `noExtensions` | Set `true` to disable ambient extension discovery while still loading every path in `extensions`. Omitted/`false` keeps additive discovery; `extensions: []` still disables child extensions. May be set top-level or per task. |
 | `runsDir` | Safe relative artifact root under `cwd`; default `.pi/agent/runs`. |
 | `correlationId` | Optional external trace label, e.g. a workflow run id. It has no scheduling or aggregation semantics. |
 | `captureToolCalls` | Optional redacted debug telemetry for child tool calls. Defaults to `false`; when `true`, supported live event backends write completed tool call summaries as artifacts without full args/results or update streams. |
@@ -431,7 +432,7 @@ Supported explicit backend values are `auto`, `inline`, `headless`, and `tmux`. 
 
 `inline` runs the child session inside the parent Pi process and inherits the parent's ambient extensions. An extension that re-registers a built-in tool (for example a `bash` wrapper) binds that tool to the parent's process cwd, so inline cannot guarantee that tools operate inside a managed worktree or in another `cwd`. Auto-selection therefore uses `headless` for those requests, and an explicit `backend: "inline"` combined with a worktree request is rejected as a validation error instead of silently running against the shared checkout.
 
-Child sessions load Pi's normal ambient extensions and skills by default, so package tools such as web access are available when enabled in Pi settings. Pass `extensions: []` or `skills: []` for a hermetic child. Recursive subagent spawning is blocked by excluding the `subagent` tool from child sessions.
+Child sessions load Pi's normal ambient extensions and skills by default, so package tools such as web access are available when enabled in Pi settings. Pass `noExtensions: true` with a non-empty `extensions` list for explicit-only extension loading, or pass `extensions: []` to disable all child extensions. Pass `skills: []` to disable child skills. Recursive subagent spawning is blocked by excluding the `subagent` tool from child sessions.
 
 ## Agent definitions
 
