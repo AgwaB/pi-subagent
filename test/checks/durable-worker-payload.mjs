@@ -100,6 +100,8 @@ try {
 			task,
 			systemPrompt,
 			tools: ["read"],
+			extensions: ["/tmp/explicit-extension.ts"],
+			noExtensions: true,
 			runsDir: ".pi/agent/runs",
 			async: true,
 		},
@@ -121,6 +123,8 @@ try {
 		"systemPrompt must not be inlined",
 	);
 	assert.deepEqual(stored.input.tools, ["read"]);
+	assert.deepEqual(stored.input.extensions, ["/tmp/explicit-extension.ts"]);
+	assert.equal(stored.input.noExtensions, true);
 	assert.deepEqual(stored.input.taskRef, {
 		path: DURABLE_WORKER_TASK_FILE,
 		bytes: Buffer.byteLength(task, "utf8"),
@@ -155,6 +159,8 @@ try {
 	assert.equal(resolved.input.taskRef, undefined);
 	assert.equal(resolved.input.systemPromptRef, undefined);
 	assert.deepEqual(resolved.input.tools, ["read"]);
+	assert.deepEqual(resolved.input.extensions, ["/tmp/explicit-extension.ts"]);
+	assert.equal(resolved.input.noExtensions, true);
 	assert.equal(resolved.runId, "run_payload_1");
 	assert.equal(
 		stored.input.taskRef.path,

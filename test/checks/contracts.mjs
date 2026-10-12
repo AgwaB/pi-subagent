@@ -28,7 +28,12 @@ const plannedInput = {
 			task: "review schemas",
 			roleContext: "contract checker",
 		},
-		{ agent: "contract-reader", task: "review schemas", timeoutMs: 1000 },
+		{
+			agent: "contract-reader",
+			task: "review schemas",
+			timeoutMs: 1000,
+			noExtensions: false,
+		},
 	],
 	concurrency: 2,
 	failFast: true,
@@ -48,6 +53,7 @@ const plannedInput = {
 	systemPrompt: "Compiled system prompt",
 	skills: ["/tmp/skill"],
 	extensions: ["/tmp/extension.ts"],
+	noExtensions: true,
 	captureToolCalls: true,
 	runsDir: ".pi/custom-runs",
 	correlationId: "corr_contracts",
@@ -69,6 +75,8 @@ assert.equal(validation.input.thinking, "xhigh");
 assert.equal(validation.input.systemPrompt, "Compiled system prompt");
 assert.deepEqual(validation.input.skills, ["/tmp/skill"]);
 assert.deepEqual(validation.input.extensions, ["/tmp/extension.ts"]);
+assert.equal(validation.input.noExtensions, true);
+assert.equal(validation.input.tasks[1].noExtensions, false);
 assert.equal(validation.input.captureToolCalls, true);
 assert.equal(validation.input.runsDir, ".pi/custom-runs");
 assert.equal(validation.input.correlationId, "corr_contracts");
@@ -164,6 +172,24 @@ assert.equal(
 assert.equal(taskModelValidation.input.tasks[0].thinking, "high");
 assert.deepEqual(taskModelValidation.input.tasks[0].tools, []);
 assert.equal(taskModelValidation.input.tasks[0].captureToolCalls, true);
+
+for (const [input, pattern] of [
+	[
+		{ agent: "worker", task: "inspect", noExtensions: "yes" },
+		/noExtensions must be a boolean/,
+	],
+	[
+		{
+			mode: "parallel",
+			tasks: [{ agent: "worker", task: "inspect", noExtensions: 1 }],
+		},
+		/tasks\[0\]\.noExtensions must be a boolean/,
+	],
+]) {
+	const invalidNoExtensions = validateResolveInput(input);
+	assert.equal(invalidNoExtensions.ok, false);
+	assert.match(invalidNoExtensions.failure.error, pattern);
+}
 
 const benignContextWindowOutput = parsePiJsonLines(
 	[
@@ -365,7 +391,8 @@ const result = createResultEnvelope({
 	artifacts: [
 		{
 			type: "result",
-			path: ".pi/agent/runs/run_contracts_001/attempts/attempt-contracts-001/result.json",
+			path:
+				".pi/agent/runs/run_contracts_001/attempts/attempt-contracts-001/result.json",
 		},
 	],
 	metadata: { contextLengthExceeded: false },

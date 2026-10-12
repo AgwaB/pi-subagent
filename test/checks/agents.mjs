@@ -229,6 +229,27 @@ OPEN_AGENT_PROMPT_MARKER
 	assert.equal(explicitPromptArgv.includes("--no-extensions"), false);
 	assert.match(explicitPromptArgv.at(-1), /^raw task prompt$/);
 
+	const isolatedArgv = buildPiArgv({
+		agent: "review.security",
+		task: "explicit-only child",
+		cwd,
+		agentDefinition: agent,
+		noExtensions: true,
+		extensions: ["/tmp/first.ts", "/tmp/second.ts"],
+	});
+	assert.equal(
+		isolatedArgv.includes("--no-extensions"),
+		true,
+		"noExtensions should disable ambient discovery",
+	);
+	assert.deepEqual(
+		isolatedArgv.flatMap((value, index) =>
+			value === "--extension" ? [isolatedArgv[index + 1]] : [],
+		),
+		["/tmp/first.ts", "/tmp/second.ts"],
+		"noExtensions should retain every explicit extension path",
+	);
+
 	const hermeticArgv = buildPiArgv({
 		agent: "review.security",
 		task: "hermetic child",

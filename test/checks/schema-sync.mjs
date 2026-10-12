@@ -52,6 +52,7 @@ const probeValues = {
 	systemPrompt: "prompt",
 	skills: ["skill"],
 	extensions: ["ext"],
+	noExtensions: true,
 	runsDir: ".pi/agent/runs",
 	correlationId: "corr",
 	captureToolCalls: true,
@@ -104,11 +105,27 @@ assert.ok(
 	taskSchemaKeys.includes("captureToolCalls"),
 	"task schema exposes captureToolCalls",
 );
+assert.ok(
+	schemaKeys.includes("noExtensions"),
+	"tool schema exposes noExtensions",
+);
+assert.ok(
+	taskSchemaKeys.includes("noExtensions"),
+	"task schema exposes noExtensions",
+);
 const taskLevel = validateResolveInput({
-	tasks: [{ agent: "worker", task: "inspect", captureToolCalls: true }],
+	tasks: [
+		{
+			agent: "worker",
+			task: "inspect",
+			captureToolCalls: true,
+			noExtensions: true,
+		},
+	],
 });
 assert.equal(taskLevel.ok, true);
 assert.equal(taskLevel.input.tasks[0].captureToolCalls, true);
+assert.equal(taskLevel.input.tasks[0].noExtensions, true);
 
 console.log(
 	JSON.stringify(

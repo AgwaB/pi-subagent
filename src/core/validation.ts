@@ -391,6 +391,16 @@ function validateTaskItem(
 		task.extensions = extensions;
 	}
 
+	if (value.noExtensions !== undefined) {
+		const noExtensions = validateBoolean(
+			value.noExtensions,
+			`${fieldName}.noExtensions`,
+			backend,
+		);
+		if (typeof noExtensions !== "boolean") return noExtensions;
+		task.noExtensions = noExtensions;
+	}
+
 	if (value.captureToolCalls !== undefined) {
 		const captureToolCalls = validateBoolean(
 			value.captureToolCalls,
@@ -610,11 +620,7 @@ export function validateResolveInput(
 
 	if (raw.workspace !== undefined) {
 		const workspace = validateWorkspace(raw.workspace, backendForKnownFailure);
-		if (
-			typeof workspace === "object" &&
-			workspace !== null &&
-			"ok" in workspace
-		)
+		if (typeof workspace === "object" && workspace !== null && "ok" in workspace)
 			return workspace;
 		input.workspace = workspace;
 	}
@@ -775,6 +781,16 @@ export function validateResolveInput(
 		input.extensions = extensions;
 	}
 
+	if (raw.noExtensions !== undefined) {
+		const noExtensions = validateBoolean(
+			raw.noExtensions,
+			"noExtensions",
+			backendForKnownFailure,
+		);
+		if (typeof noExtensions !== "boolean") return noExtensions;
+		input.noExtensions = noExtensions;
+	}
+
 	if (raw.captureToolCalls !== undefined) {
 		const captureToolCalls = validateBoolean(
 			raw.captureToolCalls,
@@ -791,11 +807,7 @@ export function validateResolveInput(
 		input.toolResultBudget = raw.toolResultBudget as ToolResultBudgetInput;
 	}
 
-	const thinking = validateThinkingAliases(
-		raw,
-		"input",
-		backendForKnownFailure,
-	);
+	const thinking = validateThinkingAliases(raw, "input", backendForKnownFailure);
 	if (thinking && typeof thinking !== "string") return thinking;
 	if (thinking !== undefined) input.thinking = thinking;
 

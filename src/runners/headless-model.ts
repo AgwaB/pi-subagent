@@ -71,6 +71,7 @@ export interface RunHeadlessModelOptions {
 	systemPrompt?: string;
 	skills?: string[];
 	extensions?: string[];
+	noExtensions?: boolean;
 	agentDefinition?: AgentDefinition;
 	captureToolCalls?: boolean;
 	/**
@@ -609,11 +610,13 @@ export function buildPiArgv(
 	if (options.skills !== undefined && options.skills.length === 0)
 		argv.push("--no-skills");
 	else for (const skill of options.skills ?? []) argv.push("--skill", skill);
-	if (options.extensions !== undefined && options.extensions.length === 0)
+	if (
+		options.noExtensions === true ||
+		(options.extensions !== undefined && options.extensions.length === 0)
+	)
 		argv.push("--no-extensions");
-	else
-		for (const extension of options.extensions ?? [])
-			argv.push("--extension", extension);
+	for (const extension of options.extensions ?? [])
+		argv.push("--extension", extension);
 	if (normalizeToolResultBudget(options.toolResultBudget).budget !== undefined)
 		argv.push("--extension", toolResultBudgetExtensionPath());
 	argv.push(buildPrompt(options));

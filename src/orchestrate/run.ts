@@ -200,7 +200,8 @@ function tmuxMetadataMatches(
 			expected.launchProcessBirthIdentity &&
 		persisted.serverPid === expected.serverPid &&
 		persisted.serverProcessGroupId === expected.serverProcessGroupId &&
-		persisted.serverProcessBirthIdentity === expected.serverProcessBirthIdentity &&
+		persisted.serverProcessBirthIdentity ===
+			expected.serverProcessBirthIdentity &&
 		persisted.panePid === expected.panePid &&
 		persisted.paneProcessGroupId === expected.paneProcessGroupId &&
 		persisted.paneProcessBirthIdentity === expected.paneProcessBirthIdentity &&
@@ -377,16 +378,11 @@ export async function prepareSubagentExecution(
 				(existingAttempt.status !== "pending" &&
 					existingAttempt.status !== "running"))
 		)
+			throw new Error(`attempt id ${attemptId} cannot be resumed by this worker`);
+		if (options.resumeExistingAttempt !== true && existingAttempt !== undefined)
 			throw new Error(
-				`attempt id ${attemptId} cannot be resumed by this worker`,
+				`attempt id ${attemptId} is already present in run ${runId}`,
 			);
-		if (
-			options.resumeExistingAttempt !== true &&
-			existingAttempt !== undefined
-		)
-				throw new Error(
-					`attempt id ${attemptId} is already present in run ${runId}`,
-				);
 		const reservation = await upsertRunAttempt({
 			cwd: baseCwd,
 			runId,
@@ -625,8 +621,7 @@ export async function runPreparedSubagentExecution(
 					: {
 							workerPid: existingProcess.workerPid,
 							workerProcessGroupId: existingProcess.workerProcessGroupId,
-							workerProcessBirthIdentity:
-								existingProcess.workerProcessBirthIdentity,
+							workerProcessBirthIdentity: existingProcess.workerProcessBirthIdentity,
 						}),
 			};
 			await updateAttemptProcess({
@@ -719,6 +714,7 @@ export async function runPreparedSubagentExecution(
 			systemPrompt: input.systemPrompt,
 			skills: input.skills,
 			extensions: input.extensions,
+			noExtensions: input.noExtensions,
 			sessionId: input.sessionId,
 			agentDefinition,
 		};
@@ -826,9 +822,7 @@ export async function runParallelSubagentTasks(
 	const tasks = input.tasks;
 	const runCwd = resolve(input.cwd ?? cwd);
 	const concurrency = Math.min(parallelConcurrency(input), tasks.length);
-	const resultSlots: Array<ResultEnvelope | undefined> = new Array(
-		tasks.length,
-	);
+	const resultSlots: Array<ResultEnvelope | undefined> = new Array(tasks.length);
 	const failFast =
 		input.failFast === true || input.cancelSiblingsOnFailure === true;
 	const cancelSiblings = input.cancelSiblingsOnFailure === true;
@@ -903,8 +897,7 @@ export async function runParallelSubagentTasks(
 				const parentCancelled =
 					parentIsAborted() &&
 					(result.status === "cancelled" || result.failureKind === "abort");
-				if (result.status !== "completed" && !parentCancelled)
-					triggerFailFast();
+				if (result.status !== "completed" && !parentCancelled) triggerFailFast();
 			} catch (error) {
 				if (parentIsAborted()) throw error;
 				const siblingAbort =
@@ -935,8 +928,7 @@ export async function runParallelSubagentTasks(
 		);
 		if (rejected !== undefined) throw rejected.reason;
 	} finally {
-		if (signal !== undefined)
-			signal.removeEventListener("abort", onParentAbort);
+		if (signal !== undefined) signal.removeEventListener("abort", onParentAbort);
 	}
 
 	const results = resultSlots.filter(
