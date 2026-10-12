@@ -41,6 +41,7 @@ import {
 	withoutShellStartupAuthority,
 } from "../shell-environment.ts";
 import {
+	assistantOutputFromParse,
 	buildPiArgv,
 	detectContextLengthExceeded,
 	parsePiJsonFile,
@@ -823,7 +824,7 @@ export async function runTmuxModel(
 
 	const outputRef = await store.writeTextArtifact(
 		"output",
-		parsed.finalAssistantText,
+		assistantOutputFromParse(parsed, meta).text,
 	);
 	return await store.writeResult({
 		backend: "tmux",

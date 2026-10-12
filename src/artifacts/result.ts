@@ -117,6 +117,8 @@ export interface ToolResultBudgetMetadata {
 
 export interface ResultMetadata {
 	contextLengthExceeded: boolean;
+	/** Output is recovery text from a failed/cancelled run, not a completed answer. */
+	outputPartial?: boolean;
 	contextOverflowRecovered?: boolean;
 	/** True when a context-length failure was recovered by budget eviction + one retry. */
 	contextRecovered?: boolean;
@@ -241,6 +243,7 @@ function normalizeMetadata(input: ResultEnvelopeInput): ResultMetadata {
 	const metadata = input.metadata ?? {};
 	return {
 		contextLengthExceeded: metadata.contextLengthExceeded ?? false,
+		...(metadata.outputPartial === undefined ? {} : { outputPartial: metadata.outputPartial }),
 		...(metadata.contextOverflowRecovered === undefined
 			? {}
 			: { contextOverflowRecovered: metadata.contextOverflowRecovered }),

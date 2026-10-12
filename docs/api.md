@@ -20,6 +20,10 @@ Shared reference shape (`RunStatusRef`): `{ runId, cwd?, runsDir?, attemptId? }`
 | `formatPruneSubagentRunsSummary` | `(summary) => string` | Human-readable rendering used by `/subagent prune`. |
 | `SubagentValidationError` | `class extends Error { failureKind: "validation"; backend? }` | Thrown by `runSubagent` for invalid input or fail-closed backend resolution. |
 
+`ResultEnvelope.metadata.outputPartial: true` marks retained assistant text from a failed/cancelled run. It is unverified recovery output, not proof of task completion; inspect `status` and `failureKind` before consuming `output.log`. Code API results and status/wait snapshots remain artifact-backed and do not include the model tool's bounded `answerPreview`. See [partial output and previews](./usage.md#partial-output-and-answer-previews).
+
+Headless context-overflow recovery shares the original process execution deadline rather than receiving a fresh timeout; timed-out/cancelled execution is not retried. Run timeouts, caller wait deadlines, and best-effort parent completion monitoring have [separate scopes](./usage.md#model-controls).
+
 ## Durable launch barrier (v2)
 
 Use v2 when a caller must decide, after the worker is ready, whether to release or revoke exactly once. All descriptors are plain JSON objects safe to persist. Directories must be absolute, owner-only, and private to one attempt.

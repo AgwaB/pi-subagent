@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadAgentByName, type AgentDefinition } from "./agents.ts";
+import { readAnswerPreview } from "./artifacts/preview.ts";
 import {
 	appendRunEvent,
 	createAttemptArtifactStore,
@@ -42,7 +43,12 @@ import {
 	runParallelSubagentTasks,
 	runSubagentTask,
 } from "./orchestrate/run.ts";
-import { getRunLogs, getRunStatus, waitForRun } from "./orchestrate/status.ts";
+import {
+	getRunLogs,
+	getRunStatus,
+	readRunResult,
+	waitForRun,
+} from "./orchestrate/status.ts";
 import { showSubagentPanel } from "./panel.ts";
 import { WorkspacePolicyError } from "./workspace/worktree.ts";
 
@@ -280,8 +286,14 @@ function artifactSummary(artifacts: readonly ArtifactRef[]) {
 	}));
 }
 
-function compactResult(result: ResultEnvelope, error?: string) {
+async function compactResult(
+	result: ResultEnvelope,
+	error?: string,
+	previewBytes?: number,
+) {
+	const answerPreview = await readAnswerPreview(result, previewBytes);
 	return {
+		...(answerPreview === undefined ? {} : { answerPreview }),
 		tool: TOOL_NAME,
 		backend: result.backend,
 		status: result.status,
@@ -594,6 +606,12 @@ async function lifecycleAction(
 	});
 	const isError =
 		waited.status !== "completed" || waited.snapshot?.status !== "completed";
+	const completed =
+		waited.status === "completed" && waited.snapshot !== null
+			? await readRunResult({ ...ref, attemptId: waited.snapshot.attemptId }).catch(() => null)
+			: null;
+	const answerPreview =
+		completed === null ? undefined : await readAnswerPreview(completed);
 	return textResult(
 		{
 			tool: TOOL_NAME,
@@ -601,6 +619,7 @@ async function lifecycleAction(
 			status: waited.status,
 			outcome: waited.outcome,
 			snapshot: waited.snapshot,
+			...(answerPreview === undefined ? {} : { answerPreview }),
 		},
 		isError,
 		{ waited },
@@ -768,8 +787,10 @@ async function maybeConfirmProjectAgents(
 	);
 }
 
-function completionPayload(result: ResultEnvelope, mode: ExecutionMode) {
+async function completionPayload(result: ResultEnvelope, mode: ExecutionMode) {
+	const answerPreview = await readAnswerPreview(result);
 	return {
+		...(answerPreview === undefined ? {} : { answerPreview }),
 		tool: TOOL_NAME,
 		event: "complete",
 		mode,
@@ -782,15 +803,15 @@ function completionPayload(result: ResultEnvelope, mode: ExecutionMode) {
 	};
 }
 
-function notifyCompletion(
+async function notifyCompletion(
 	input: ResolveInput,
 	result: ResultEnvelope,
 	mode: ExecutionMode,
 	onUpdate?: ToolUpdateCallback,
 	ctx?: NotificationContext,
-): number {
+): Promise<number> {
 	if (input.onComplete !== "notify") return 0;
-	const payload = completionPayload(result, mode);
+	const payload = await completionPayload(result, mode);
 	let updatesSent = 0;
 	try {
 		onUpdate?.({
@@ -1168,7 +1189,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 						resolved.backend,
 						validation.input,
 					);
-					return textResult(compactResult(result, unsupportedError), true, {
+					return textResult(await compactResult(result, unsupportedError), true, {
 						result,
 						resolved,
 					});
@@ -1201,7 +1222,12 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 									),
 							)
 						: await runParallelSubagentTasks(validation.input, runCwd, signal);
-					const runs = parallel.results.map((result) => compactResult(result));
+					const previewBytes = Math.floor(
+						8192 / Math.max(1, parallel.results.length),
+					);
+					const runs = await Promise.all(
+						parallel.results.map((result) => compactResult(result, undefined, previewBytes)),
+					);
 					const failed =
 						!asyncRequested &&
 						(parallel.failFastTriggered ||
@@ -1239,7 +1265,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 								ctx as NotificationContext,
 							),
 					});
-					return textResult(compactResult(result), false, { result, resolved });
+					return textResult(await compactResult(result), false, { result, resolved });
 				}
 
 				const result = await runSubagentTask({
@@ -1247,7 +1273,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 					cwd: runCwd,
 					signal,
 				});
-				return textResult(compactResult(result), result.status !== "completed", {
+				return textResult(await compactResult(result), result.status !== "completed", {
 					result,
 					resolved,
 				});

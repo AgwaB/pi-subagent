@@ -593,12 +593,11 @@ export async function runInlineModel(
 				options.signal,
 			);
 			if (stopKind !== null) failureKind = stopKind;
+		} finally {
+			// Preserve emitted text and accounting even when prompt() rejects.
 			if (outputText.length === 0)
 				outputText = assistantTextFromMessages(session.messages);
 			if (outputText.length === 0) outputText = stdoutText;
-		} finally {
-			// Capture accounting metadata even when prompt() rejected after the
-			// model had already produced assistant messages.
 			assistantMetadata = assistantMetadataFromMessages(session.messages);
 			if (typeof unsubscribe === "function") unsubscribe();
 			session.dispose?.();
@@ -657,6 +656,7 @@ export async function runInlineModel(
 		metadata: {
 			contextLengthExceeded: detectContextLengthExceeded({ stderrText }),
 			...assistantMetadata,
+			...(status !== "completed" && outputText.length > 0 ? { outputPartial: true } : {}),
 		},
 	});
 }

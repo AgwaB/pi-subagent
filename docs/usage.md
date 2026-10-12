@@ -497,9 +497,9 @@ These options may also be set per task in `tasks[]`.
 
 Timeout notes:
 
-- `timeoutMs` on a run is the worker execution deadline. If omitted, pi-subagent does not impose a run timeout.
+- `timeoutMs` on a run is the worker execution deadline, not an end-to-end launch/cleanup SLA. If omitted, pi-subagent does not impose a run timeout. Headless execution starts its clock at the first process launch (including the ownership gate) and shares that deadline with its optional context-overflow recovery; a timeout or cancellation is not retried. Workspace/initial sandbox preparation and terminal cleanup/persistence can take additional time.
 - `action:"wait"` uses `timeoutMs` as a polling deadline and defaults to 60 seconds. Its `status:"completed"` means polling reached a terminal run; check `snapshot.status` for run success/failure/cancellation.
-- `onComplete:"notify"` uses an internal completion monitor with a long safety window (up to 24h when no `timeoutMs` is set); it does not kill the worker. The monitor polls in the parent process and has no cancellation handle, so long-lived SDK embeddings should prefer `onComplete:"detach"` plus explicit `action:"status"`/`"wait"` polling. Orchestrators that need a 4h or other SLA should pass `timeoutMs` explicitly on the run.
+- `onComplete:"notify"` observes terminal persistence using the requested execution timeout **plus a separate 24h observation allowance** (24h total when no runtime timeout is set). It must not stop at the worker's own timeout before startup/cleanup finishes. This parent-process monitor is best-effort: it does not kill the worker, survive parent exit, or offer a cancellation handle. Long-lived SDK embeddings should prefer `onComplete:"detach"` plus explicit status/wait polling.
 
 ## Artifacts
 
@@ -534,7 +534,17 @@ Recent runs also write a small locator file under Pi's global subagent-run index
 
 Older `schemaVersion: 1` artifacts under `<run-id>/<task-id>/` are still readable for compatibility.
 
-Tool responses return compact status and artifact references rather than raw logs.
+### Partial output and answer previews
+
+Failed/cancelled runs keep already received assistant text in `output.log` when available and mark it with `metadata.outputPartial: true`. A headless/tmux tool-only message cannot erase the last nonblank assistant message used for failure recovery. Inline prompt rejection also preserves received text. This is **unverified partial output**, not a successful answer: `status` and `failureKind` stay failed/cancelled. Nothing is synthesized, no checkpoint/resume mechanism is introduced, and a run that emitted no assistant text may still have empty output. Text that never reached the engine is not recoverable.
+
+Tool responses retain compact status and artifact references rather than raw logs. Terminal `run` results, terminal `wait` responses, and completion notification payloads can additionally contain:
+
+```json
+{ "answerPreview": { "text": "First part of the child answer…", "partial": false, "truncated": true } }
+```
+
+The preview is an on-demand UTF-8 prefix of that attempt's `output.log`, not a model-generated summary or a separately stored result. Reads are capped at 2 KiB of source text per preview, with an 8 KiB total source-text budget for synchronous parallel responses (JSON encoding adds overhead). `partial: true` identifies failed/cancelled or explicitly partial output; `truncated: true` means the artifact has more text. Read the referenced artifact for the full result. Missing/empty/unreadable, symlinked, or out-of-scope output is omitted without changing the outcome. Running responses, polling timeouts, and `status` polling do not include previews. The code API and persisted envelopes remain artifact-first; they do not add `answerPreview`.
 
 ## TUI monitor
 

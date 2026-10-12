@@ -104,6 +104,8 @@ interface ProcessResult {
 
 export interface PiJsonParseResult {
 	finalAssistantText: string;
+	/** Recovery only: never used to decide whether execution succeeded. */
+	lastAssistantText?: string;
 	errors: string[];
 	parseErrors: string[];
 	metadata: Partial<ResultMetadata>;
@@ -374,6 +376,8 @@ function parsePiJsonLine(
 		) {
 			const assistant = message as Record<string, unknown>;
 			parsed.finalAssistantText = textFromContent(assistant.content);
+			if (parsed.finalAssistantText.trim().length > 0)
+				parsed.lastAssistantText = parsed.finalAssistantText;
 			if (typeof assistant.provider === "string")
 				parsed.metadata.provider = assistant.provider;
 			if (typeof assistant.model === "string")
@@ -404,7 +408,10 @@ function parsePiJsonLine(
 					(message as Record<string, unknown>).role === "assistant"
 				) {
 					const text = textFromContent((message as Record<string, unknown>).content);
-					if (text.length > 0) parsed.finalAssistantText = text;
+					if (text.length > 0) {
+						parsed.finalAssistantText = text;
+						if (text.trim().length > 0) parsed.lastAssistantText = text;
+					}
 				}
 			}
 		}
@@ -509,6 +516,18 @@ export function resolvePiJsonOutcome(
 	return processOutcome;
 }
 
+/** Only failed/cancelled runs may fall back to an earlier assistant message. */
+export function assistantOutputFromParse(
+	parsed: PiJsonParseResult,
+	outcome: ProcessOutcome,
+): { text: string; partial: boolean } {
+	const failed = outcome.status === "failed" || outcome.status === "cancelled";
+	const text = failed && parsed.finalAssistantText.trim().length === 0
+		? parsed.lastAssistantText ?? ""
+		: parsed.finalAssistantText;
+	return { text, partial: failed && text.length > 0 };
+}
+
 export function resultMetadataFromParse(
 	parsed: PiJsonParseResult,
 	contextLength: ContextLengthResolution,
@@ -516,6 +535,7 @@ export function resultMetadataFromParse(
 ): Partial<ResultMetadata> {
 	return {
 		...parsed.metadata,
+		...(assistantOutputFromParse(parsed, outcome).partial ? { outputPartial: true } : {}),
 		contextLengthExceeded: contextLength.contextLengthExceeded,
 		...(contextLength.contextOverflowRecovered
 			? { contextOverflowRecovered: true }
@@ -685,7 +705,7 @@ function appendLimited(base: string, chunk: string, limit: number): string {
 async function runProcess(
 	argv: readonly [string, ...string[]],
 	cwd: string,
-	timeoutMs: number | undefined,
+	deadline: number | undefined,
 	store: Awaited<ReturnType<typeof createAttemptArtifactStore>>,
 	captureToolCalls?: boolean,
 	abortSignal?: AbortSignal,
@@ -716,6 +736,10 @@ async function runProcess(
 			stderrText,
 			stderrContextLengthExceeded,
 		};
+	}
+
+	if (deadline !== undefined && performance.now() >= deadline && !abortSignal?.aborted) {
+		return await finishWith({ status: "failed", failureKind: "timeout", exitCode: null, signal: null });
 	}
 
 	if (abortSignal?.aborted) {
@@ -1050,15 +1074,13 @@ async function runProcess(
 							env: env ?? process.env,
 						})}\n`,
 					);
-					if (timeoutMs !== undefined) {
-						timeoutTimer = setTimeout(() => {
-							requestStop("timeout");
-						}, timeoutMs);
-					}
 				})
 				.catch(rejectOwnership);
 		});
 
+		if (deadline !== undefined) {
+			timeoutTimer = setTimeout(() => requestStop("timeout"), Math.max(0, deadline - performance.now()));
+		}
 		abortSignal?.addEventListener("abort", onAbort, { once: true });
 		if (abortSignal?.aborted) requestStop("abort");
 	});
@@ -1101,6 +1123,14 @@ export async function runHeadlessModel(
 					[TOOL_RESULT_BUDGET_ENV.statePath]: budgetStatePath,
 				};
 
+	// One execution budget across the original process and its optional recovery.
+	// Starts at the first process launch, not workspace/sandbox preparation.
+	let executionDeadline: number | undefined;
+	function processDeadline(): number | undefined {
+		if (timeoutMs !== undefined) executionDeadline ??= performance.now() + timeoutMs;
+		return executionDeadline;
+	}
+
 	async function executeAttempt(
 		forceEvictFraction?: number,
 	): Promise<ProcessResult> {
@@ -1135,7 +1165,7 @@ export async function runHeadlessModel(
 							runProcess(
 								launch.argv,
 								cwd,
-								timeoutMs,
+								processDeadline(),
 								store,
 								options.captureToolCalls,
 								options.signal,
@@ -1156,7 +1186,7 @@ export async function runHeadlessModel(
 				: await runProcess(
 						argv,
 						cwd,
-						timeoutMs,
+						processDeadline(),
 						store,
 						options.captureToolCalls,
 						options.signal,
@@ -1217,6 +1247,8 @@ export async function runHeadlessModel(
 	if (
 		budget.budget !== undefined &&
 		outcome.status === "failed" &&
+		outcome.failureKind !== "timeout" &&
+		!options.signal?.aborted &&
 		contextLength.contextLengthExceeded
 	) {
 		const budgetState = await readToolResultBudgetState(budgetStatePath);
@@ -1224,9 +1256,15 @@ export async function runHeadlessModel(
 			// Single-recovery guard: exactly one evict-and-retry per run. The
 			// retry instructs the child extension to evict the oldest ~25% of
 			// retained tool-result chars before its first model call.
-			processResult = await executeAttempt(CONTEXT_RECOVERY_EVICT_FRACTION);
-			({ contextLength, outcome } = analyzeAttempt(processResult));
-			contextRecovered = outcome.status === "completed";
+			if (executionDeadline !== undefined && performance.now() >= executionDeadline) {
+				outcome = { ...outcome, status: "failed", failureKind: "timeout" };
+			} else {
+				const previousText = processResult.parsed.lastAssistantText;
+				processResult = await executeAttempt(CONTEXT_RECOVERY_EVICT_FRACTION);
+				processResult.parsed.lastAssistantText ??= previousText;
+				({ contextLength, outcome } = analyzeAttempt(processResult));
+				contextRecovered = outcome.status === "completed";
+			}
 		}
 	}
 
@@ -1237,7 +1275,7 @@ export async function runHeadlessModel(
 	);
 
 	const completedAt = new Date();
-	const outputText = parsed.finalAssistantText;
+	const outputText = assistantOutputFromParse(parsed, outcome).text;
 	const artifacts: ArtifactRef[] = [
 		stderrRef,
 		await store.writeTextArtifact("output", outputText),

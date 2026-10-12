@@ -98,7 +98,9 @@ function armCompletionMonitor(
 			runsDir: options.input.runsDir,
 			runId: options.runId,
 			attemptId: options.attemptId,
-			timeoutMs: options.input.timeoutMs ?? 86_400_000,
+			// Observation includes worker startup and terminal artifact/cleanup writes.
+			// Keep the existing one-day observer allowance separate from execution.
+			timeoutMs: (options.input.timeoutMs ?? 0) + 86_400_000,
 			pollIntervalMs: 500,
 		});
 		if (waited.status !== "completed") return;

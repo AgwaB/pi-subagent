@@ -561,6 +561,43 @@ process.stdout.write(JSON.stringify({ type: "error", error: { message: "context_
 		"no evictable tool results: never retried",
 	);
 
+	// Recovery shares the original deadline; a timed-out first process is never retried.
+	for (const scenario of ["shared-deadline", "already-timed-out"]) {
+		const counter = join(tempRoot, `${scenario}-counter`);
+		const fakePi = join(tempRoot, `${scenario}.mjs`);
+		await writeFile(fakePi, `#!${process.execPath}
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+const counter = ${JSON.stringify(counter)};
+const count = existsSync(counter) ? Number(readFileSync(counter, "utf8")) + 1 : 1;
+writeFileSync(counter, String(count));
+const state = process.env[${JSON.stringify(TOOL_RESULT_BUDGET_ENV.statePath)}];
+if (state) writeFileSync(state, JSON.stringify({ evictableCount: 1, evictedCount: 0 }));
+if (${JSON.stringify(scenario)} === "already-timed-out") {
+  console.log(JSON.stringify({ type: "error", error: { message: "context_length_exceeded" } }));
+  setInterval(() => {}, 1000);
+} else {
+  if (count === 1) {
+    console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "finding before recovery" }], stopReason: "toolUse" } }));
+    console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: {} }], stopReason: "toolUse" } }));
+  }
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  console.log(JSON.stringify(count === 1
+    ? { type: "error", error: { message: "context_length_exceeded" } }
+    : { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "too late" }], stopReason: "stop" } }));
+}
+`, "utf8");
+		await chmod(fakePi, 0o700);
+		const deadlineResult = await runHeadlessModel({ cwd, piCommand: fakePi, agent: "budget-worker", task: scenario, timeoutMs: scenario === "shared-deadline" ? 5000 : 1000, toolResultBudget: { maxTotalChars: 2000 } });
+		assert.equal(deadlineResult.status, "failed", scenario);
+		assert.equal(deadlineResult.failureKind, "timeout", scenario);
+		assert.equal(deadlineResult.metadata.contextRecovered, undefined);
+		assert.equal(await readFile(counter, "utf8"), scenario === "shared-deadline" ? "2" : "1");
+		if (scenario === "shared-deadline") {
+			assert.equal(deadlineResult.metadata.outputPartial, true);
+			assert.equal(await readFile(join(cwd, deadlineResult.artifacts.find(a => a.type === "output").path), "utf8"), "finding before recovery");
+		}
+	}
+
 	console.log(
 		JSON.stringify(
 			{ name: "check-tool-result-budget", status: "completed" },

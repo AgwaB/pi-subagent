@@ -101,6 +101,7 @@ try {
 	assert.equal(completed.metadata.model, "fake/model");
 	assert.deepEqual(completed.metadata.usage, { input: 15, output: 3, cost: { total: 0.015 } });
 	assert.equal(completed.metadata.stopReason, "stop");
+	assert.equal(completed.metadata.outputPartial, undefined);
 
 	const finalError = await run("final-error");
 	assert.equal(finalError.status, "failed", JSON.stringify(finalError));
@@ -120,6 +121,8 @@ try {
 	assert.equal(rejected.metadata.provider, "fake", "metadata survives a prompt rejection");
 	assert.deepEqual(rejected.metadata.usage, { input: 10, output: 2, cost: { total: 0.01 } });
 	assert.equal(rejected.metadata.stopReason, "toolUse");
+	assert.equal(rejected.metadata.outputPartial, true);
+	assert.equal(await readFile(join(cwd, rejected.artifacts.find(a => a.type === "output").path), "utf8"), "partial", "prompt rejection retains already produced text");
 	const rejectedStderr = await readFile(join(cwd, rejected.artifacts.find((artifact) => artifact.type === "stderr").path), "utf8");
 	assert.match(rejectedStderr, /provider stream failed mid-turn/u);
 
@@ -149,6 +152,13 @@ try {
 	assert.equal(aborted.status, "cancelled");
 	assert.deepEqual(abortedSignal.counts(), { added: 1, removed: 1 }, "listener is cleaned up after abort");
 	assert.equal(aborted.failureKind, "abort");
+	assert.equal(aborted.metadata.outputPartial, true);
+	assert.equal(await readFile(join(cwd, aborted.artifacts.find(a => a.type === "output").path), "utf8"), "partial");
+	const timedOut = await run("hang", { timeoutMs: 50 });
+	assert.equal(timedOut.status, "failed");
+	assert.equal(timedOut.failureKind, "timeout");
+	assert.equal(timedOut.metadata.outputPartial, true);
+	assert.equal(await readFile(join(cwd, timedOut.artifacts.find(a => a.type === "output").path), "utf8"), "partial");
 	assert.equal(aborted.metadata.provider, "fake", "metadata survives an abort");
 	assert.deepEqual(aborted.metadata.usage, { input: 10, output: 2, cost: { total: 0.01 } });
 } finally {
