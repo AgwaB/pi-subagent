@@ -31,6 +31,7 @@ import { writeRunLocator } from "./run-ref.ts";
 import { readRunResult, waitForRun } from "./status.ts";
 import { captureProcessIdentity } from "../process-identity.ts";
 import { writeDurableWorkerPayload } from "../durable-worker-payload.ts";
+import { hostPiPackageRoot, PI_PACKAGE_ROOT_ENV } from "../runners/inline.ts";
 
 export interface StartAsyncSubagentRunOptions {
 	input: ResolveInput;
@@ -315,6 +316,8 @@ export async function startAsyncSubagentRun(
 	const workerLogFd = openSync(join(store.attemptDir, "worker.log"), "a");
 	const workerEnv = { ...process.env };
 	delete workerEnv.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
+	const piPackageRoot = hostPiPackageRoot();
+	if (piPackageRoot !== undefined) workerEnv[PI_PACKAGE_ROOT_ENV] = piPackageRoot;
 	let child;
 	try {
 		child = spawn(

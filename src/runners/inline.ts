@@ -91,6 +91,10 @@ interface PiSdkModule {
 	): Promise<{ session: AgentSessionLike; diagnostics?: unknown[] }>;
 }
 
+/** Set for detached workers, whose own entry point is not the Pi host. */
+export const PI_PACKAGE_ROOT_ENV = "PI_SUBAGENT_PI_PACKAGE_ROOT";
+const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+
 interface ModelLike {
 	provider?: string;
 	id?: string;
@@ -226,6 +230,41 @@ export function setInlineSdkImporterForTests(
 	sdkImporterForTests = importer;
 }
 
+/**
+ * Pi package root of the running host. A detached worker is not the host, so
+ * it uses the root its parent host passed through PI_PACKAGE_ROOT_ENV. Both
+ * stay correct when `pi` on PATH is a wrapper script or a pnpm shim.
+ */
+export function hostPiPackageRoot(): string | undefined {
+	const entry = process.argv[1];
+	if (typeof entry === "string" && entry.length > 0) {
+		try {
+			const root = findPackageRoot(fs.realpathSync(entry), PI_PACKAGE_NAME);
+			if (root !== undefined) return root;
+		} catch {
+			// Not a file path; try the inherited root.
+		}
+	}
+	const inherited = process.env[PI_PACKAGE_ROOT_ENV];
+	if (inherited === undefined || inherited.length === 0) return undefined;
+	try {
+		return findPackageRoot(inherited, PI_PACKAGE_NAME);
+	} catch {
+		return undefined;
+	}
+}
+
+async function importFromPackageRoot(
+	packageRoot: string,
+): Promise<SdkImportResult> {
+	return {
+		module: assertPiSdkModule(
+			await import(pathToFileURL(join(packageRoot, "dist/index.js")).href),
+		),
+		source: packageRoot,
+	};
+}
+
 async function importPiSdk(): Promise<SdkImportResult> {
 	if (sdkImporterForTests !== undefined) return await sdkImporterForTests();
 	try {
@@ -238,6 +277,8 @@ async function importPiSdk(): Promise<SdkImportResult> {
 			source: dirname(packageJson),
 		};
 	} catch (projectError) {
+		const hostRoot = hostPiPackageRoot();
+		if (hostRoot !== undefined) return await importFromPackageRoot(hostRoot);
 		let piBin: string;
 		try {
 			piBin = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
@@ -250,20 +291,12 @@ async function importPiSdk(): Promise<SdkImportResult> {
 		}
 
 		const realPiBin = fs.realpathSync(piBin);
-		const packageRoot = findPackageRoot(
-			realPiBin,
-			"@earendil-works/pi-coding-agent",
-		);
+		const packageRoot = findPackageRoot(realPiBin, PI_PACKAGE_NAME);
 		if (!packageRoot)
 			throw new Error(
 				`Found pi at ${realPiBin}, but could not locate @earendil-works/pi-coding-agent.`,
 			);
-		return {
-			module: assertPiSdkModule(
-				await import(pathToFileURL(join(packageRoot, "dist/index.js")).href),
-			),
-			source: packageRoot,
-		};
+		return await importFromPackageRoot(packageRoot);
 	}
 }
 
