@@ -581,6 +581,7 @@ Internal (set by the engine for its own child processes; do not set by hand):
 | Variable | Set by | Purpose |
 |---|---|---|
 | `PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON` | async launcher | Binds a durable worker to its run/attempt; stripped from tmux child environments. |
+| `PI_SUBAGENT_PI_PACKAGE_ROOT` | async launcher | Pi package root of the launching host, so an inline run in the durable worker loads the host's Pi SDK even when `pi` on `PATH` is a wrapper script. |
 | `PI_SUBAGENT_TMUX_OWNERSHIP_TOKEN` | tmux runner | Ownership token verified before a tmux session is signalled. |
 | `PI_SUBAGENT_TOOL_RESULT_BUDGET_MAX_CHARS`, `…_STATE_PATH`, `…_FORCE_EVICT_FRACTION` | headless runner | Carries the `toolResultBudget` option and context-recovery state into the headless child. |
 
