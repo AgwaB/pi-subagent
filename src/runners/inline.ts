@@ -75,6 +75,17 @@ interface ModelRegistryFactoryLike {
 	create?: (authStorage: unknown) => ModelRegistryLike;
 }
 
+interface AgentSessionServicesLike {
+	modelRuntime?: unknown;
+	modelRegistry?: ModelRegistryLike;
+	diagnostics?: unknown[];
+}
+
+type CreateSessionResult = {
+	session: AgentSessionLike;
+	diagnostics?: unknown[];
+};
+
 interface PiSdkModule {
 	AuthStorage?: { create(): unknown };
 	ModelRuntime?: {
@@ -88,7 +99,13 @@ interface PiSdkModule {
 	getAgentDir: () => string;
 	createAgentSession(
 		options: Record<string, unknown>,
-	): Promise<{ session: AgentSessionLike; diagnostics?: unknown[] }>;
+	): Promise<CreateSessionResult>;
+	createAgentSessionServices?: (
+		options: Record<string, unknown>,
+	) => Promise<AgentSessionServicesLike>;
+	createAgentSessionFromServices?: (
+		options: Record<string, unknown>,
+	) => Promise<CreateSessionResult>;
 }
 
 /** Set for detached workers, whose own entry point is not the Pi host. */
@@ -464,11 +481,9 @@ function buildPrompt(options: RunInlineModelOptions): string {
 		.join("\n\n");
 }
 
-function createChildResourceLoader(
-	piSdk: PiSdkModule,
+function childResourceLoaderOptions(
 	options: RunInlineModelOptions,
-	cwd: string,
-): ResourceLoaderLike {
+): Omit<DefaultResourceLoaderOptionsLike, "cwd" | "agentDir"> {
 	const baseSystemPrompt = [
 		`You are the Pi subagent named ${JSON.stringify(options.agent)}.`,
 		"Child profile: inline SDK worker. Recursive subagent spawning is disabled. Use only the explicitly enabled local tools if needed.",
@@ -490,9 +505,7 @@ function createChildResourceLoader(
 				? agentSystemPrompt
 				: `${baseSystemPrompt}\n\n${agentSystemPrompt}`;
 
-	return new piSdk.DefaultResourceLoader({
-		cwd,
-		agentDir: piSdk.getAgentDir(),
+	return {
 		additionalExtensionPaths: options.extensions?.length
 			? options.extensions
 			: undefined,
@@ -506,7 +519,74 @@ function createChildResourceLoader(
 		noContextFiles: true,
 		systemPromptOverride: () => systemPrompt,
 		appendSystemPromptOverride: () => [],
+	};
+}
+
+interface ChildSessionContext {
+	modelRegistry: ModelRegistryLike;
+	diagnostics: unknown[];
+	createSession(options: Record<string, unknown>): Promise<CreateSessionResult>;
+}
+
+/**
+ * Pi's own two-step assembly: services first (resource loader, extension
+ * provider and virtual-model registration), then the model is resolved
+ * against them, then the session is created from them.
+ */
+async function prepareChildSession(
+	piSdk: PiSdkModule,
+	options: RunInlineModelOptions,
+	cwd: string,
+): Promise<ChildSessionContext> {
+	const createServices = piSdk.createAgentSessionServices;
+	const createFromServices = piSdk.createAgentSessionFromServices;
+	if (
+		typeof createServices === "function" &&
+		typeof createFromServices === "function"
+	) {
+		const modelRuntime =
+			piSdk.ModelRuntime === undefined
+				? undefined
+				: await piSdk.ModelRuntime.create({ allowModelNetwork: false });
+		const services = await createServices({
+			cwd,
+			agentDir: piSdk.getAgentDir(),
+			...(modelRuntime === undefined ? {} : { modelRuntime }),
+			resourceLoaderOptions: childResourceLoaderOptions(options),
+		});
+		const modelRegistry =
+			services.modelRuntime === undefined
+				? services.modelRegistry
+				: new piSdk.ModelRegistry(services.modelRuntime);
+		if (modelRegistry === undefined)
+			throw new Error("Pi SDK services did not expose a model registry.");
+		return {
+			modelRegistry,
+			diagnostics: services.diagnostics ?? [],
+			createSession: (sessionOptions) =>
+				createFromServices({ services, ...sessionOptions }),
+		};
+	}
+	// SDK modules without the two-step API (test fakes) keep the direct path.
+	const { modelRegistry, sessionOptions: runtimeOptions } =
+		await createSdkModelContext(piSdk);
+	const resourceLoader = new piSdk.DefaultResourceLoader({
+		cwd,
+		agentDir: piSdk.getAgentDir(),
+		...childResourceLoaderOptions(options),
 	});
+	await resourceLoader.reload();
+	return {
+		modelRegistry,
+		diagnostics: [],
+		createSession: (sessionOptions) =>
+			piSdk.createAgentSession({
+				cwd,
+				...runtimeOptions,
+				resourceLoader,
+				...sessionOptions,
+			}),
+	};
 }
 
 async function promptWithStops(
@@ -581,10 +661,9 @@ export async function runInlineModel(
 
 	try {
 		const { module: piSdk, source } = await importPiSdk();
-		const { modelRegistry, sessionOptions } = await createSdkModelContext(piSdk);
 		const sessionManager = piSdk.SessionManager.inMemory(cwd);
-		const resourceLoader = createChildResourceLoader(piSdk, options, cwd);
-		await resourceLoader.reload();
+		const child = await prepareChildSession(piSdk, options, cwd);
+		const { modelRegistry } = child;
 		const requestedModel = options.model ?? options.agentDefinition?.model;
 		const requestedThinking =
 			options.thinking ?? options.agentDefinition?.thinking;
@@ -598,11 +677,8 @@ export async function runInlineModel(
 				: splitThinkingSuffix(requestedModel).thinking;
 		const tools = options.tools ?? options.agentDefinition?.tools;
 
-		const { session, diagnostics = [] } = await piSdk.createAgentSession({
-			cwd,
-			...sessionOptions,
+		const created = await child.createSession({
 			sessionManager,
-			resourceLoader,
 			excludeTools: ["subagent"],
 			...(tools === undefined ? {} : { tools }),
 			...(model === undefined ? {} : { model }),
@@ -610,6 +686,8 @@ export async function runInlineModel(
 				? {}
 				: { thinkingLevel: requestedThinking ?? modelThinking }),
 		});
+		const { session } = created;
+		const diagnostics = [...child.diagnostics, ...(created.diagnostics ?? [])];
 
 		const unsubscribe = session.subscribe?.((event) => {
 			toolCallTelemetry?.processEvent(event);
