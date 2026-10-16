@@ -490,8 +490,10 @@ thinking | thinkingLevel | reasoningLevel
 Supported thinking levels:
 
 ```text
-off | minimal | low | medium | high | xhigh
+off | minimal | low | medium | high | xhigh | max
 ```
+
+`max` requires Pi 0.80.6 or newer. Pi clamps a level the selected model does not offer to the nearest supported one; for `max` that is the model's highest level.
 
 These options may also be set per task in `tasks[]`.
 
