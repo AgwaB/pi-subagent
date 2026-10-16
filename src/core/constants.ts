@@ -49,6 +49,7 @@ export const THINKING_LEVELS = [
 	"medium",
 	"high",
 	"xhigh",
+	"max",
 ] as const;
 
 export type Backend = (typeof BACKENDS)[number];
