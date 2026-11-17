@@ -4,11 +4,14 @@ import type { Component } from "@earendil-works/pi-tui";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ResultEnvelope, RunEvent } from "./artifacts/index.ts";
 import type { Status } from "./core/constants.ts";
+import { mapWithConcurrency } from "./core/concurrency.ts";
+import { fingerprintFiles } from "./core/file-fingerprint.ts";
 import { clip, stripAnsi, visibleLength } from "./core/text-width.ts";
 import {
 	listRunLocators,
 	locatorOlderThanPruneThreshold,
 	removeRunLocator,
+	type RunLocatorCache,
 	type RunRefLocator,
 } from "./orchestrate/run-ref.ts";
 import {
@@ -25,6 +28,10 @@ const PANEL_MAX_LINES = 30;
 const PANEL_RESERVED_TUI_LINES = 8;
 const DEFAULT_RECENT_TERMINAL_LIMIT = 20;
 const ALL_SCOPE_RECENT_TERMINAL_LIMIT = 50;
+const INDEX_LOAD_CONCURRENCY = 32;
+const BACKGROUND_BACKOFF_FACTOR = 2;
+/** Background loads bypass the file caches at least this often per scope. */
+const CACHE_REVALIDATE_MS = 30_000;
 
 type ScopeFilter = "session" | "cwd" | "all";
 type StatusFilter = "all" | "running" | "completed" | "failed";
@@ -90,6 +97,25 @@ interface LoadOptions {
 	statusFilter: StatusFilter;
 	currentSessionId?: string;
 	showMorePages: number;
+	/** Per-panel caches for indexed (global) runs; omitted = always re-read. */
+	cache?: PanelLoadCache;
+	/** Ignore cache hits for this load (manual refresh). */
+	fresh?: boolean;
+}
+
+/** A finished indexed run, reusable while its files are unchanged. */
+interface CachedRunRow {
+	fingerprint: string;
+	resultPaths: string[];
+	parentSessionId?: string;
+	row: RunRow;
+}
+
+interface PanelLoadCache {
+	locators: RunLocatorCache;
+	runs: Map<string, CachedRunRow>;
+	/** Test seam: finished runs served from the cache without re-reading. */
+	runHits: number;
 }
 
 function isInsideOrEqual(parent: string, child: string): boolean {
@@ -485,6 +511,24 @@ function registryTaskStale(task: RegistryTaskRecord): boolean {
 	return true;
 }
 
+/** The result.json a registry attempt points at, when it is safely inside its artifact cwd. */
+function registryResultPath(task: RegistryTaskRecord): string | undefined {
+	if (
+		task.artifactCwd === undefined ||
+		task.resultPath === undefined ||
+		isAbsolute(task.resultPath) ||
+		task.resultPath.split("/").includes("..")
+	)
+		return undefined;
+	const absolute = resolve(
+		task.artifactCwd,
+		task.resultPath.split("/").join(sep),
+	);
+	return isInsideOrEqual(resolve(task.artifactCwd), absolute)
+		? absolute
+		: undefined;
+}
+
 async function readTaskFromRegistry(
 	cwd: string,
 	task: RegistryTaskRecord,
@@ -492,29 +536,19 @@ async function readTaskFromRegistry(
 	currentSessionId?: string,
 ): Promise<TaskRow> {
 	const registryStale = registryTaskStale(task);
-	if (
-		task.artifactCwd !== undefined &&
-		task.resultPath !== undefined &&
-		!isAbsolute(task.resultPath) &&
-		!task.resultPath.split("/").includes("..")
-	) {
-		const absolute = resolve(
-			task.artifactCwd,
-			task.resultPath.split("/").join(sep),
-		);
-		if (isInsideOrEqual(resolve(task.artifactCwd), absolute)) {
-			const statInfo = await stat(absolute).catch(() => null);
-			if (statInfo !== null) {
-				const parsed = await readTask(
-					task.artifactCwd,
-					absolute,
-					statInfo.mtimeMs,
-					loadTails,
-					currentSessionId,
-					isActive(task.status) ? { staleOverride: registryStale } : undefined,
-				);
-				if (parsed !== null) return parsed;
-			}
+	const absolute = registryResultPath(task);
+	if (task.artifactCwd !== undefined && absolute !== undefined) {
+		const statInfo = await stat(absolute).catch(() => null);
+		if (statInfo !== null) {
+			const parsed = await readTask(
+				task.artifactCwd,
+				absolute,
+				statInfo.mtimeMs,
+				loadTails,
+				currentSessionId,
+				isActive(task.status) ? { staleOverride: registryStale } : undefined,
+			);
+			if (parsed !== null) return parsed;
 		}
 	}
 	const log = await readTailFromRegistryPath(task, loadTails, currentSessionId);
@@ -708,9 +742,33 @@ async function loadRunsFromCwd(
 	return { runs, stale: 0, invalid, skipped: 0 };
 }
 
+/**
+ * Files a registry-backed row is built from when tails are not loaded:
+ * run.json, events.jsonl, and every attempt's result.json.
+ */
+async function runFilesFingerprint(
+	runDir: string,
+	resultPaths: readonly string[],
+): Promise<string> {
+	return await fingerprintFiles([
+		join(runDir, "run.json"),
+		join(runDir, "events.jsonl"),
+		...resultPaths,
+	]);
+}
+
+/** Only settled runs are cached: active rows depend on the clock (staleness). */
+function isCacheableRun(row: RunRow, registry: RegistryRunRecord): boolean {
+	return (
+		!isActive(row.status) &&
+		row.tasks.every((task) => !isActive(task.status)) &&
+		Number.isFinite(Date.parse(registry.updatedAt))
+	);
+}
+
 async function loadRunFromLocator(
 	locator: RunRefLocator,
-	options: Pick<LoadOptions, "scope" | "currentSessionId">,
+	options: Pick<LoadOptions, "scope" | "currentSessionId" | "cache" | "fresh">,
 ): Promise<{
 	row: RunRow | null;
 	stale: boolean;
@@ -724,8 +782,10 @@ async function loadRunFromLocator(
 		if (!isInsideOrEqual(cwd, absoluteRunsDir))
 			return { row: null, stale: false, invalid: true, pruned: false };
 		const runDir = join(absoluteRunsDir, locator.runId);
+		const cacheKey = runKey(cwd, runsDir, locator.runId);
 		const runDirStat = await stat(runDir).catch(() => null);
 		if (runDirStat === null || !runDirStat.isDirectory()) {
+			options.cache?.runs.delete(cacheKey);
 			if (
 				locatorOlderThanPruneThreshold(locator) &&
 				(await removeRunLocator(locator.runId))
@@ -734,16 +794,43 @@ async function loadRunFromLocator(
 			}
 			return { row: null, stale: true, invalid: false, pruned: false };
 		}
-		const registry = await readJson(join(runDir, "run.json"));
-		if (!isRegistryRunRecord(registry))
-			return { row: null, stale: false, invalid: true, pruned: false };
-		if (options.scope === "session") {
-			if (
-				options.currentSessionId === undefined ||
-				registry.parentSessionId !== options.currentSessionId
-			)
+		const outsideSession = (parentSessionId: string | undefined): boolean =>
+			options.scope === "session" &&
+			(options.currentSessionId === undefined ||
+				parentSessionId !== options.currentSessionId);
+		const cached = options.fresh
+			? undefined
+			: options.cache?.runs.get(cacheKey);
+		if (
+			cached !== undefined &&
+			(await runFilesFingerprint(runDir, cached.resultPaths)) ===
+				cached.fingerprint
+		) {
+			if (outsideSession(cached.parentSessionId))
 				return { row: null, stale: false, invalid: false, pruned: false };
+			if (options.cache !== undefined) options.cache.runHits += 1;
+			return { row: cached.row, stale: false, invalid: false, pruned: false };
 		}
+		// Fingerprint run.json/events.jsonl before reading them: a write racing
+		// the read then leaves a stale fingerprint, so the next load re-reads.
+		const headFingerprint =
+			options.cache === undefined
+				? undefined
+				: await runFilesFingerprint(runDir, []);
+		const registry = await readJson(join(runDir, "run.json"));
+		if (!isRegistryRunRecord(registry)) {
+			options.cache?.runs.delete(cacheKey);
+			return { row: null, stale: false, invalid: true, pruned: false };
+		}
+		if (outsideSession(registry.parentSessionId))
+			return { row: null, stale: false, invalid: false, pruned: false };
+		const resultPaths = (registry.attempts ?? registry.tasks ?? [])
+			.map(registryResultPath)
+			.filter((path): path is string => path !== undefined);
+		const resultFingerprint =
+			options.cache === undefined
+				? undefined
+				: await fingerprintFiles(resultPaths);
 		const row = await readRunFromRegistry(
 			cwd,
 			runsDir,
@@ -752,6 +839,25 @@ async function loadRunFromLocator(
 			false,
 			options.currentSessionId,
 		);
+		if (options.cache !== undefined) {
+			if (
+				row !== null &&
+				headFingerprint !== undefined &&
+				resultFingerprint !== undefined &&
+				isCacheableRun(row, registry)
+			) {
+				options.cache.runs.set(cacheKey, {
+					fingerprint: [headFingerprint, resultFingerprint]
+						.filter((part) => part.length > 0)
+						.join(","),
+					resultPaths,
+					...(registry.parentSessionId === undefined
+						? {}
+						: { parentSessionId: registry.parentSessionId }),
+					row,
+				});
+			} else options.cache.runs.delete(cacheKey);
+		}
 		return { row, stale: row === null, invalid: false, pruned: false };
 	} catch {
 		return { row: null, stale: false, invalid: true, pruned: false };
@@ -825,7 +931,10 @@ interface LoadedScope {
 }
 
 async function loadScope(
-	options: Pick<LoadOptions, "cwd" | "scope" | "currentSessionId">,
+	options: Pick<
+		LoadOptions,
+		"cwd" | "scope" | "currentSessionId" | "cache" | "fresh"
+	>,
 ): Promise<LoadedScope> {
 	const effectiveScope =
 		options.scope === "session" && options.currentSessionId === undefined
@@ -922,7 +1031,10 @@ async function loadRunsFromIndex(options: LoadOptions): Promise<{
 	invalid: number;
 	skipped: number;
 }> {
-	const listed = await listRunLocators();
+	const listed = await listRunLocators({
+		...(options.cache === undefined ? {} : { cache: options.cache.locators }),
+		...(options.fresh === true ? { fresh: true } : {}),
+	});
 	const locators =
 		options.scope === "session" && options.currentSessionId !== undefined
 			? listed.locators.filter(
@@ -933,8 +1045,14 @@ async function loadRunsFromIndex(options: LoadOptions): Promise<{
 	let stale = 0;
 	let invalid = listed.invalidCount;
 	let pruned = listed.prunedCount;
-	for (const locator of locators) {
-		const loaded = await loadRunFromLocator(locator, options);
+	// Each locator costs several small reads; loading them one by one made the
+	// `all` scope take seconds per refresh.
+	const results = await mapWithConcurrency(
+		locators,
+		INDEX_LOAD_CONCURRENCY,
+		(locator) => loadRunFromLocator(locator, options),
+	);
+	for (const loaded of results) {
 		if (loaded.row !== null) runs.push(loaded.row);
 		if (loaded.stale) stale += 1;
 		if (loaded.invalid) invalid += 1;
@@ -982,6 +1100,11 @@ function currentSessionIdFromCtx(
 	}
 }
 
+interface RefreshRequest {
+	preserveSelection: boolean;
+	fresh: boolean;
+}
+
 function emptySnapshot(): PanelSnapshot {
 	return {
 		runs: [],
@@ -999,7 +1122,18 @@ export class SubagentPanel implements Component {
 	/** Latest unfiltered load per scope; filter and paging are projected from it. */
 	private readonly loadedByScope = new Map<ScopeFilter, LoadedScope>();
 	/** A user-requested refresh that arrived while a load was in flight. */
-	private pendingRefresh: { preserveSelection: boolean } | undefined;
+	private pendingRefresh: RefreshRequest | undefined;
+	/** Finished indexed runs and parsed locators, valid while files are unchanged. */
+	private readonly loadCache: PanelLoadCache = {
+		locators: new Map(),
+		runs: new Map(),
+		runHits: 0,
+	};
+	/** Duration and end (performance.now) of the latest load, for timer backoff. */
+	private lastLoadMs = 0;
+	private lastLoadEndedAt = 0;
+	/** performance.now() of each scope's latest cache-bypassing load. */
+	private readonly lastFreshLoadAt = new Map<ScopeFilter, number>();
 	private selectedRun = 0;
 	private showMorePages = 0;
 	private scope: ScopeFilter;
@@ -1041,7 +1175,8 @@ export class SubagentPanel implements Component {
 			return;
 		}
 		if (data === "r") {
-			void this.refresh();
+			// Manual refresh re-reads everything, bypassing the file caches.
+			void this.refresh({ fresh: true });
 			return;
 		}
 		if (data === "m") {
@@ -1183,10 +1318,23 @@ export class SubagentPanel implements Component {
 	}
 
 	private async refresh(
-		options: { preserveSelection?: boolean; background?: boolean } = {},
+		options: {
+			preserveSelection?: boolean;
+			background?: boolean;
+			fresh?: boolean;
+		} = {},
 	): Promise<void> {
 		if (this.disposed) return;
 		const preserveSelection = options.preserveSelection !== false;
+		// Caches are validated by file stats; as a backstop against changes a
+		// stat cannot reveal (coarse timestamps), the timer periodically
+		// re-reads everything so a missed change heals within the interval.
+		const fresh =
+			options.fresh === true ||
+			(options.background === true &&
+				performance.now() -
+					(this.lastFreshLoadAt.get(this.scope) ?? Number.NEGATIVE_INFINITY) >=
+					CACHE_REVALIDATE_MS);
 		if (this.loading) {
 			// Timer ticks may be skipped, but a user request (scope change, `r`)
 			// must not be dropped: run it right after the in-flight load.
@@ -1195,22 +1343,41 @@ export class SubagentPanel implements Component {
 					preserveSelection:
 						(this.pendingRefresh?.preserveSelection ?? true) &&
 						preserveSelection,
+					fresh: (this.pendingRefresh?.fresh ?? false) || fresh,
 				};
 			return;
 		}
+		// Back off timer ticks when loads are slow (busy machine, huge index):
+		// stay idle at least BACKGROUND_BACKOFF_FACTOR x the last load time, so
+		// background loading uses at most ~1/(factor+1) of wall time.
+		if (
+			options.background === true &&
+			performance.now() - this.lastLoadEndedAt <
+				this.lastLoadMs * BACKGROUND_BACKOFF_FACTOR
+		)
+			return;
 		this.loading = true;
-		let request: { preserveSelection: boolean } | undefined = {
-			preserveSelection,
-		};
+		let request: RefreshRequest | undefined = { preserveSelection, fresh };
 		try {
 			while (request !== undefined && !this.disposed) {
-				const current = request;
 				const scope = this.scope;
+				// A scope's first load reads everything, which also starts its
+				// revalidation clock.
+				const current: RefreshRequest = {
+					...request,
+					fresh: request.fresh || !this.lastFreshLoadAt.has(scope),
+				};
+				const startedAt = performance.now();
 				const loaded = await loadScope({
 					cwd: this.cwd,
 					scope,
 					currentSessionId: this.currentSessionId,
+					cache: this.loadCache,
+					fresh: current.fresh,
 				});
+				this.lastLoadEndedAt = performance.now();
+				this.lastLoadMs = this.lastLoadEndedAt - startedAt;
+				if (current.fresh) this.lastFreshLoadAt.set(scope, startedAt);
 				request = this.pendingRefresh;
 				this.pendingRefresh = undefined;
 				if (this.disposed) return;
@@ -1218,7 +1385,7 @@ export class SubagentPanel implements Component {
 				// The scope changed mid-load: keep the result cached but do not show
 				// it; load the scope the user is looking at next.
 				if (scope !== this.scope) {
-					request ??= { preserveSelection: false };
+					request ??= { preserveSelection: false, fresh: false };
 					continue;
 				}
 				this.applySnapshot(current.preserveSelection);

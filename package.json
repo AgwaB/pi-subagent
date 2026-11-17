@@ -49,6 +49,7 @@
     "check:agents": "node ./test/checks/agents.mjs",
     "check:no-chain": "node ./test/checks/no-chain.mjs",
     "check:panel": "node ./test/checks/panel.mjs",
+    "check:panel-cache": "node ./test/checks/panel-cache.mjs",
     "check:worktree-cleanup": "node ./test/checks/worktree-cleanup.mjs",
     "check:workspace-policy": "node ./test/checks/workspace-policy.mjs",
     "check:lifecycle": "node ./test/checks/lifecycle.mjs",
@@ -86,7 +87,7 @@
     "release:check": "node ./scripts/release-check.mjs",
     "check": "npm run check:static",
     "check:types": "tsc -p tsconfig.json",
-    "check:static": "npm run check:types && npm run check:host-peers && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:parent-session && npm run check:panel-session-scope && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:lifecycle && npm run check:fail-fast && npm run check:schema-sync && npm run check:run-lock && npm run check:darwin-process-identity && npm run check:release-workflow && npm run check:release-version && npm run check:reconcile && npm run check:tmux-ownership && npm run check:inline-sdk-compat && npm run check:headless-streaming && npm run check:output-recovery && npm run check:answer-preview && npm run check:usage-accumulation && npm run check:tool-result-budget && npm run check:durable-launch-barrier && npm run check:durable-worker-binding && npm run check:durable-worker-preflight && npm run check:durable-worker-payload && npm run check:sandbox-agent-locks && npm run check:run-locator-sweep && npm run check:prune && npm run check:inline-metadata && npm run check:inline-host-sdk && npm run check:inline-extension-providers && npm run check:thinking-levels",
+    "check:static": "npm run check:types && npm run check:host-peers && npm run check:api && npm run check:resolver && npm run check:artifacts && npm run check:parent-session && npm run check:panel-session-scope && npm run check:contracts && npm run check:agents && npm run check:no-chain && npm run check:panel && npm run check:panel-cache && npm run check:worktree-cleanup && npm run check:workspace-policy && npm run check:lifecycle && npm run check:fail-fast && npm run check:schema-sync && npm run check:run-lock && npm run check:darwin-process-identity && npm run check:release-workflow && npm run check:release-version && npm run check:reconcile && npm run check:tmux-ownership && npm run check:inline-sdk-compat && npm run check:headless-streaming && npm run check:output-recovery && npm run check:answer-preview && npm run check:usage-accumulation && npm run check:tool-result-budget && npm run check:durable-launch-barrier && npm run check:durable-worker-binding && npm run check:durable-worker-preflight && npm run check:durable-worker-payload && npm run check:sandbox-agent-locks && npm run check:run-locator-sweep && npm run check:prune && npm run check:inline-metadata && npm run check:inline-host-sdk && npm run check:inline-extension-providers && npm run check:thinking-levels",
     "check:integration": "npm run check:model:inline && npm run check:model:headless && npm run check:model:tmux"
   },
   "dependencies": {
