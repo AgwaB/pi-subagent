@@ -1145,6 +1145,32 @@ async function main() {
 		);
 		dead.component.handleInput("q");
 
+		// Regression: runs kept under a custom runsDir (e.g. a dispatch batch at
+		// `.pi/agent/runs/<batch>/<task>/<runId>`) are invisible to the direct
+		// cwd scan; the cwd scope must find them through the index.
+		const nestedCwd = join(tempRoot, "nested-workspace");
+		const nestedRunsDir = ".pi/agent/runs/dispatch-batch/task-a";
+		const nestedRunDir = join(nestedCwd, nestedRunsDir, "run_nested_dispatch");
+		await mkdir(nestedRunDir, { recursive: true });
+		const nestedAt = new Date(fixedPanelNow - 60_000).toISOString();
+		await writeFile(
+			join(nestedRunDir, "run.json"),
+			`${JSON.stringify({ schemaVersion: 2, runId: "run_nested_dispatch", mode: "single", status: "completed", backend: "headless", cwd: nestedCwd, runsDir: nestedRunsDir, startedAt: nestedAt, updatedAt: nestedAt, completedAt: nestedAt, attempts: [{ attemptId: "attempt-1", status: "completed", backend: "headless", startedAt: nestedAt, updatedAt: nestedAt, completedAt: nestedAt }] }, null, 2)}\n`,
+		);
+		await writeFile(
+			join(indexDir, "run_nested_dispatch.json"),
+			`${JSON.stringify({ schemaVersion: 1, runId: "run_nested_dispatch", cwd: nestedCwd, runsDir: nestedRunsDir, updatedAt: nestedAt }, null, 2)}\n`,
+		);
+		const nested = await runCommand("panel", { cwd: nestedCwd });
+		await waitFor(
+			() => /run_nested_dispatch/.test(renderText(nested.component)),
+			"cwd scope should include indexed runs under a custom runsDir",
+		);
+		text = renderText(nested.component);
+		assert.match(text, /\[cwd\]/, "no session id defaults to the cwd scope");
+		assert.match(text, /1\/1 shown/, "other workspaces' indexed runs stay out");
+		nested.component.handleInput("q");
+
 		const executeCwd = join(tempRoot, "execute-workspace");
 		await mkdir(executeCwd, { recursive: true });
 		await writeIndexedRun(

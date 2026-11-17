@@ -557,7 +557,7 @@ The preview is an on-demand UTF-8 prefix of that attempt's `output.log`, not a m
 The panel shows run/attempt details, workspace/artifact paths, dependency metadata, event tail, and log tail. It has three scopes:
 
 - `session`: runs whose `run.json.parentSessionId` matches the current Pi session. This is the default when a session id is available.
-- `cwd`: runs under the current workspace's `.pi/agent/runs`, including legacy records that lack `parentSessionId`.
+- `cwd`: runs under the current workspace's `.pi/agent/runs`, including legacy records that lack `parentSessionId`, plus runs the global index records for this workspace under a custom `runsDir` (for example `.pi/agent/runs/<batch>/<task>/`).
 - `all`: the global locator index plus current-cwd legacy records.
 
 Status filters are `all`, `running`, `completed`, and `failed`. In the `all` status view, the default list shows all active runs plus recent terminal runs only: 20 for `session`/`cwd`, 50 for `all`. The `completed` and `failed` filters use the same recent terminal cap; `running` is uncapped. The header reports `shown/total`, and when older matching runs are hidden, press `m` in the panel to show more; no separate command is needed. The panel keeps a fixed-height layout, uses an internally scrollable detail pane, and never renders raw `parentSessionId` values.

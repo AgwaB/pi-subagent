@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Component } from "@earendil-works/pi-tui";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -1033,7 +1033,14 @@ async function loadRunsForScope(options: LoadOptions): Promise<{
 	invalid: number;
 	skipped: number;
 }> {
-	if (options.scope === "cwd") return loadRunsFromCwd(options.cwd, options);
+	if (options.scope === "cwd") {
+		// Indexed runs recorded for this workspace include runs kept under a
+		// custom runsDir (e.g. `.pi/agent/runs/<batch>/<task>/`), which the
+		// direct scan below cannot find.
+		const indexed = await loadRunsFromIndex(options);
+		const local = await loadRunsFromCwd(options.cwd, options);
+		return mergeLoadedRuns(indexed, local);
+	}
 	if (options.scope === "session") {
 		const indexed = await loadRunsFromIndex(options);
 		if (options.currentSessionId === undefined) return indexed;
@@ -1048,6 +1055,13 @@ async function loadRunsForScope(options: LoadOptions): Promise<{
 	return mergeLoadedRuns(indexed, local);
 }
 
+/** A workspace path and its symlink-resolved form; locators may record either. */
+async function workspaceKeys(cwd: string): Promise<Set<string>> {
+	const resolved = resolve(cwd);
+	const real = await realpath(resolved).catch(() => resolved);
+	return new Set([resolved, real]);
+}
+
 async function loadRunsFromIndex(options: LoadOptions): Promise<{
 	runs: RunRow[];
 	stale: number;
@@ -1058,12 +1072,14 @@ async function loadRunsFromIndex(options: LoadOptions): Promise<{
 		...(options.cache === undefined ? {} : { cache: options.cache.locators }),
 		...(options.fresh === true ? { fresh: true } : {}),
 	});
-	const locators =
-		options.scope === "session" && options.currentSessionId !== undefined
-			? listed.locators.filter(
-					(locator) => locator.parentSessionId === options.currentSessionId,
-				)
-			: listed.locators;
+	const cwdKeys =
+		options.scope === "cwd" ? await workspaceKeys(options.cwd) : undefined;
+	const locators = listed.locators.filter((locator) => {
+		if (options.scope === "session" && options.currentSessionId !== undefined)
+			return locator.parentSessionId === options.currentSessionId;
+		if (cwdKeys !== undefined) return cwdKeys.has(locator.cwd);
+		return true;
+	});
 	const runs: RunRow[] = [];
 	let stale = 0;
 	let invalid = listed.invalidCount;
