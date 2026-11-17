@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	utimes,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createJiti } from "jiti";
@@ -1079,6 +1086,64 @@ async function main() {
 		}, "all scope show more should reveal all hidden terminal rows");
 		scoped.component.handleInput("q");
 		assert.equal(scoped.closeCount(), 1, "q should close session-scoped panel");
+
+		// Regression: run.json can keep saying "running" after its worker died
+		// without finalizing the run (seen in the wild when a launch crashed
+		// before any process existed). Once every attempt recorded as active is
+		// found dead, the run must stop counting as active forever.
+		const deadSessionId = "session-dead-789";
+		const deadCwd = join(tempRoot, "dead-workspace");
+		await mkdir(deadCwd, { recursive: true });
+		await writeIndexedRun(indexDir, deadCwd, "run_dead_active", "attempt-1", {
+			status: "running",
+			backend: "headless",
+			parentSessionId: deadSessionId,
+			updatedAt: new Date(fixedPanelNow - 3_600_000).toISOString(),
+			resultMtime: new Date(fixedPanelNow - 3_600_000),
+			log: "worker died without finalizing",
+		});
+		// Between retries a run stays running while its only recorded attempt
+		// failed normally; nothing shows it died, so it must stay running.
+		await writeIndexedRun(indexDir, deadCwd, "run_retry_pending", "attempt-1", {
+			status: "failed",
+			failureKind: "model",
+			backend: "headless",
+			parentSessionId: deadSessionId,
+			log: "first attempt failed; retry pending",
+		});
+		const retryRunJson = join(
+			deadCwd,
+			".pi/agent/runs/run_retry_pending/run.json",
+		);
+		const retryRecord = JSON.parse(await readFile(retryRunJson, "utf8"));
+		await writeFile(
+			retryRunJson,
+			`${JSON.stringify({ ...retryRecord, status: "running", completedAt: null }, null, 2)}\n`,
+		);
+		const dead = await runCommand("panel", {
+			sessionManager: { getSessionId: () => deadSessionId },
+		});
+		await waitFor(
+			() => /run_retry_pending/.test(renderText(dead.component)),
+			"dead-run session render",
+		);
+		text = renderText(dead.component);
+		assert.match(
+			text,
+			/run_dead_active\s+failed/,
+			"a run whose recorded-active attempts all died should render failed",
+		);
+		assert.match(
+			text,
+			/run_retry_pending\s+running/,
+			"a running run without dead attempts should stay running",
+		);
+		assert.match(
+			text,
+			/live · 1 active · 1 failed/,
+			"a dead run must not count as active",
+		);
+		dead.component.handleInput("q");
 
 		const executeCwd = join(tempRoot, "execute-workspace");
 		await mkdir(executeCwd, { recursive: true });

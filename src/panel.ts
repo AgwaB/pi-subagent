@@ -597,6 +597,7 @@ async function readRunFromRegistry(
 		: [];
 	const childSummary = summarizeChildEvents(parseRunEvents(eventsText));
 	const records = registry.attempts ?? registry.tasks ?? [];
+	const recordedActive = records.some((record) => isActive(record.status));
 	const tasks = await Promise.all(
 		records.map((task) =>
 			readTaskFromRegistry(cwd, task, loadTails, currentSessionId),
@@ -605,12 +606,22 @@ async function readRunFromRegistry(
 	tasks.sort((a, b) =>
 		a.attemptId.localeCompare(b.attemptId, undefined, { numeric: true }),
 	);
+	const registryStatus = registry.status ?? aggregateRunStatus(tasks);
+	// run.json keeps saying "running" when its worker died (or finished)
+	// without finalizing the run. Attempts recorded as active were already
+	// checked against their process, heartbeat, and result file; when none of
+	// them is still active, neither is the run.
+	const settled =
+		isActive(registryStatus) &&
+		recordedActive &&
+		tasks.length > 0 &&
+		!tasks.some((task) => isActive(task.status));
 	return {
 		key: runKey(cwd, runsDir, registry.runId),
 		runId: registry.runId,
 		sourceCwd: cwd,
 		runsDir,
-		status: registry.status ?? aggregateRunStatus(tasks),
+		status: settled ? aggregateRunStatus(tasks) : registryStatus,
 		backend:
 			registry.backend ??
 			tasks.at(-1)?.backend ??
@@ -620,7 +631,14 @@ async function readRunFromRegistry(
 			? Date.parse(registry.updatedAt)
 			: nowMs(),
 		startedAt: registry.startedAt,
-		completedAt: registry.completedAt,
+		completedAt:
+			settled && registry.completedAt === null
+				? (tasks
+						.map((task) => task.completedAt)
+						.filter((value): value is string => value !== null)
+						.sort()
+						.at(-1) ?? null)
+				: registry.completedAt,
 		dependency: registry.dependency ?? null,
 		eventTail,
 		...(childSummary === undefined ? {} : { childSummary }),
@@ -757,9 +775,14 @@ async function runFilesFingerprint(
 	]);
 }
 
-/** Only settled runs are cached: active rows depend on the clock (staleness). */
+/**
+ * Only settled runs are cached: active rows depend on the clock (staleness),
+ * and so does a run whose run.json still says active but whose attempts were
+ * found dead.
+ */
 function isCacheableRun(row: RunRow, registry: RegistryRunRecord): boolean {
 	return (
+		!isActive(registry.status) &&
 		!isActive(row.status) &&
 		row.tasks.every((task) => !isActive(task.status)) &&
 		Number.isFinite(Date.parse(registry.updatedAt))
