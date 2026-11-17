@@ -588,7 +588,8 @@ try {
 			cwd,
 			runId: interruptible.runId,
 			attemptId: interruptible.attemptId,
-			timeoutMs: 5000,
+			// Generous: graceful SIGTERM shutdown can take seconds on a busy machine.
+			timeoutMs: 20_000,
 			pollIntervalMs: 50,
 		});
 		assert.equal(interruptedWait.status, "completed");

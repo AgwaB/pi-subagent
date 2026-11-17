@@ -77,6 +77,14 @@ try {
 			/agent\/task input/.test(error.message),
 	);
 
+	await assert.rejects(
+		() =>
+			runSubagent({ backend: "inline", task: "noop", parentSessionId: "" }),
+		(error) =>
+			error instanceof SubagentValidationError &&
+			/parentSessionId/.test(error.message),
+	);
+
 	cwd = await mkdtemp(join(tmpdir(), "pi-subagent-api-check-"));
 	const runId = "run_api_check";
 	const attemptId = "attempt_api_check";
@@ -238,6 +246,7 @@ try {
 		async: true,
 		timeoutMs: 1000,
 		correlationId: "corr_api_async_parallel",
+		parentSessionId: "session_api_parent",
 		tasks: [{ task: "async A" }, { task: "async B" }],
 	});
 	assert.equal(asyncParallel.mode, "parallel");
@@ -262,6 +271,16 @@ try {
 			),
 			"async parallel run should reach a terminal status",
 		);
+	}
+
+	// Regression: the API used to drop a caller's parentSessionId, so runs
+	// launched programmatically (e.g. by a dispatch helper) never appeared in
+	// their session's panel scope.
+	for (const runId of asyncParallel.runIds) {
+		const record = JSON.parse(
+			await readFile(join(cwd, ".pi/agent/runs", runId, "run.json"), "utf8"),
+		);
+		assert.equal(record.parentSessionId, "session_api_parent");
 	}
 
 	const reconcileMissing = await reconcileSubagentRun({

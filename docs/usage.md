@@ -530,7 +530,7 @@ Run locks live in the hidden `.locks/` directory beside the run directories (ear
 
 `result.json` carries `metadata.provider`, `metadata.model`, `metadata.usage` (token/cost totals summed across the run's assistant messages), and `metadata.stopReason` on every backend; headless and tmux derive them from Pi's JSON event stream, inline from the SDK session's messages.
 
-`run.json` records a `parentSessionId` field: the Pi session id of the session that launched the run, injected from the tool context (not a model-settable argument). Consumers (e.g. status panels) can use it to scope a shared per-`cwd` runs directory to the session that owns each run. The field is omitted when no session id is available, and older records simply lack it.
+`run.json` records a `parentSessionId` field: the Pi session id of the session that launched the run, injected from the tool context (not a model-settable argument); programmatic `runSubagent()` callers may pass it explicitly. Consumers (e.g. status panels) can use it to scope a shared per-`cwd` runs directory to the session that owns each run. The field is omitted when no session id is available, and older records simply lack it.
 
 Recent runs also write a small locator file under Pi's global subagent-run index. Locators older than `PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS` (default 30 days; a negative value disables pruning) are swept in the background the first time a process writes a locator, at most 500 per sweep, and again whenever the run panel lists the index. A locator contains the `runId`, absolute `cwd`, optional `runsDir`, optional `parentSessionId`, optional `correlationId`, and `updatedAt`. It is not authoritative evidence and can become stale if the pointed-to run directory is moved or deleted; use `run.json`, `events.jsonl`, and attempt `result.json` as the source of truth.
 
@@ -557,12 +557,14 @@ The preview is an on-demand UTF-8 prefix of that attempt's `output.log`, not a m
 The panel shows run/attempt details, workspace/artifact paths, dependency metadata, event tail, and log tail. It has three scopes:
 
 - `session`: runs whose `run.json.parentSessionId` matches the current Pi session. This is the default when a session id is available.
-- `cwd`: runs under the current workspace's `.pi/agent/runs`, including legacy records that lack `parentSessionId`.
+- `cwd`: runs under the current workspace's `.pi/agent/runs`, including legacy records that lack `parentSessionId`, plus runs the global index records for this workspace under a custom `runsDir` (for example `.pi/agent/runs/<batch>/<task>/`).
 - `all`: the global locator index plus current-cwd legacy records.
 
 Status filters are `all`, `running`, `completed`, and `failed`. In the `all` status view, the default list shows all active runs plus recent terminal runs only: 20 for `session`/`cwd`, 50 for `all`. The `completed` and `failed` filters use the same recent terminal cap; `running` is uncapped. The header reports `shown/total`, and when older matching runs are hidden, press `m` in the panel to show more; no separate command is needed. The panel keeps a fixed-height layout, uses an internally scrollable detail pane, and never renders raw `parentSessionId` values.
 
-Stale or malformed locators are counted in the header and skipped. Active runs whose process metadata is dead and whose heartbeat/update timestamp is stale are rendered read-only as `failed` with failure `stale`; the panel does not mutate run records. It may prune old stale locator pointers only; use `action:"reconcile"` to repair local registry state from durable artifacts when possible.
+The panel refreshes live every 1.5s. Switching scope shows that scope's last load at once (or `Loading …` the first time) and never the previous scope's rows; status filters and `m` re-filter the loaded data without reading the disk. Between refreshes the panel reuses parsed index locators and finished indexed runs while every file a row is built from (`run.json`, `events.jsonl`, attempt `result.json`) is unchanged by its stat fingerprint, and active runs are always re-read. Press `r` to re-read everything; the live refresh also bypasses the cache at least every 30s per scope and backs off while loads are slow.
+
+Stale or malformed locators are counted in the header and skipped. Active runs whose process metadata is dead and whose heartbeat/update timestamp is stale are rendered read-only as `failed` with failure `stale`, and so is a run whose `run.json` still says it is active after every attempt it recorded as active was found dead; the panel does not mutate run records. It may prune old stale locator pointers only; use `action:"reconcile"` to repair local registry state from durable artifacts when possible.
 
 The panel is for human inspection; existing-run tool actions remain the programmatic interface.
 
@@ -607,3 +609,5 @@ npm run check:all                # plus model-backed integration checks (needs m
 npm run validate
 npm pack --dry-run --json
 ```
+
+Every `check:*` script preloads `test/support/isolate-run-index.mjs`, which points `PI_SUBAGENT_RUN_INDEX_DIR` at a per-process temp directory so checks never write locators into your real `~/.pi/agent/subagent-runs`. Run a single check through npm (`npm run check:panel`), or preload it yourself when invoking node directly: `node --import ./test/support/isolate-run-index.mjs ./test/checks/panel.mjs`.

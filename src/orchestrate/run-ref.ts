@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs";
 import {
 	mkdir,
 	readdir,
@@ -9,6 +10,8 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { mapWithConcurrency } from "../core/concurrency.ts";
+import { statsFingerprint } from "../core/file-fingerprint.ts";
 
 const DEFAULT_RUNS_DIR = ".pi/agent/runs";
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -258,57 +261,100 @@ export async function readRunLocator(
 	}
 }
 
-export async function listRunLocators(): Promise<RunLocatorListResult> {
+type LocatorEntryOutcome =
+	| { kind: "locator"; locator: RunRefLocator }
+	| { kind: "skipped" | "invalid" | "pruned" };
+
+const LOCATOR_LIST_CONCURRENCY = 32;
+
+/**
+ * Parsed locators keyed by index file path. A caller that lists the index
+ * repeatedly (the live panel) passes one in so unchanged files are not
+ * re-read; entries are revalidated against the file's stat fingerprint.
+ */
+export type RunLocatorCache = Map<
+	string,
+	{ fingerprint: string; locator: RunRefLocator }
+>;
+
+export interface ListRunLocatorsOptions {
+	cache?: RunLocatorCache;
+	/** Re-read every file even when the cache entry is still valid. */
+	fresh?: boolean;
+}
+
+async function readLocatorEntry(
+	indexDir: string,
+	entry: Dirent,
+	options: ListRunLocatorsOptions,
+): Promise<LocatorEntryOutcome> {
+	if (!entry.isFile()) return { kind: "skipped" };
+	if (!entry.name.endsWith(".json") || entry.name.endsWith(".tmp"))
+		return { kind: "skipped" };
+	const runId = entry.name.slice(0, -".json".length);
+	try {
+		assertSafeId("runId", runId);
+		const path = join(indexDir, entry.name);
+		const info = await stat(path);
+		const pruneOrInvalid = async (): Promise<LocatorEntryOutcome> => {
+			options.cache?.delete(path);
+			return olderThanPruneThreshold(info.mtimeMs) && (await pruneLocator(path))
+				? { kind: "pruned" }
+				: { kind: "invalid" };
+		};
+		if (!info.isFile() || info.size > 64 * 1024) return await pruneOrInvalid();
+		const fingerprint = statsFingerprint(info);
+		const cached = options.fresh ? undefined : options.cache?.get(path);
+		if (cached?.fingerprint === fingerprint)
+			return { kind: "locator", locator: cached.locator };
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await readFile(path, "utf8"));
+		} catch {
+			return await pruneOrInvalid();
+		}
+		if (!isRunRefLocator(parsed) || parsed.runId !== runId)
+			return await pruneOrInvalid();
+		const cwd = normalizeCwd(parsed.cwd);
+		assertSafeRunsDir(cwd, parsed.runsDir);
+		const locator = { ...parsed, cwd };
+		// The fingerprint was taken before the read, so a write racing the read
+		// leaves a stale fingerprint and the next listing re-reads the file.
+		options.cache?.set(path, { fingerprint, locator });
+		return { kind: "locator", locator };
+	} catch {
+		return { kind: "invalid" };
+	}
+}
+
+export async function listRunLocators(
+	options: ListRunLocatorsOptions = {},
+): Promise<RunLocatorListResult> {
 	const indexDir = runIndexDir();
 	const entries = await readdir(indexDir, { withFileTypes: true }).catch(
 		() => [],
 	);
+	// The index can hold thousands of tiny files; reading them one at a time
+	// made every panel refresh wait on sequential disk round-trips.
+	const outcomes = await mapWithConcurrency(
+		entries,
+		LOCATOR_LIST_CONCURRENCY,
+		(entry) => readLocatorEntry(indexDir, entry, options),
+	);
+	if (options.cache !== undefined) {
+		const present = new Set(entries.map((entry) => join(indexDir, entry.name)));
+		for (const path of options.cache.keys())
+			if (!present.has(path)) options.cache.delete(path);
+	}
 	const locators: RunRefLocator[] = [];
 	let invalidCount = 0;
 	let skippedCount = 0;
 	let prunedCount = 0;
-
-	for (const entry of entries) {
-		if (!entry.isFile()) {
-			skippedCount += 1;
-			continue;
-		}
-		if (!entry.name.endsWith(".json") || entry.name.endsWith(".tmp")) {
-			skippedCount += 1;
-			continue;
-		}
-		const runId = entry.name.slice(0, -".json".length);
-		try {
-			assertSafeId("runId", runId);
-			const path = join(indexDir, entry.name);
-			const info = await stat(path);
-			if (!info.isFile() || info.size > 64 * 1024) {
-				if (olderThanPruneThreshold(info.mtimeMs) && (await pruneLocator(path)))
-					prunedCount += 1;
-				else invalidCount += 1;
-				continue;
-			}
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(await readFile(path, "utf8"));
-			} catch {
-				if (olderThanPruneThreshold(info.mtimeMs) && (await pruneLocator(path)))
-					prunedCount += 1;
-				else invalidCount += 1;
-				continue;
-			}
-			if (!isRunRefLocator(parsed) || parsed.runId !== runId) {
-				if (olderThanPruneThreshold(info.mtimeMs) && (await pruneLocator(path)))
-					prunedCount += 1;
-				else invalidCount += 1;
-				continue;
-			}
-			const cwd = normalizeCwd(parsed.cwd);
-			assertSafeRunsDir(cwd, parsed.runsDir);
-			locators.push({ ...parsed, cwd });
-		} catch {
-			invalidCount += 1;
-		}
+	for (const outcome of outcomes) {
+		if (outcome.kind === "locator") locators.push(outcome.locator);
+		else if (outcome.kind === "skipped") skippedCount += 1;
+		else if (outcome.kind === "pruned") prunedCount += 1;
+		else invalidCount += 1;
 	}
 
 	return { locators, invalidCount, skippedCount, prunedCount };

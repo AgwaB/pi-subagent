@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	utimes,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createJiti } from "jiti";
@@ -922,6 +929,62 @@ async function main() {
 			"raw parent session id should not render",
 		);
 
+		// Regression: a scope switch while the initial load is still in flight
+		// used to be dropped, so the previous scope's rows stayed on screen under
+		// the new tab until the next live tick.
+		const racing = await runCommand("panel", {
+			sessionManager: { getSessionId: () => sessionId },
+		});
+		racing.component.handleInput("\u001b[C");
+		const switchedAt = Date.now();
+		assert.match(
+			renderText(racing.component),
+			/\[cwd\][\s\S]*Loading cwd runs/,
+			"an unloaded scope should render a loading state, not stale rows",
+		);
+		let sawPreviousScopeRows = false;
+		await waitFor(() => {
+			const current = renderText(racing.component);
+			if (current.includes("run_session_other_cwd"))
+				sawPreviousScopeRows = true;
+			return current.includes("[cwd]") && current.includes("run_active");
+		}, "cwd scope after a mid-load switch");
+		assert.equal(
+			sawPreviousScopeRows,
+			false,
+			"session-scope rows must not render under the cwd tab",
+		);
+		assert.ok(
+			Date.now() - switchedAt < 1_500,
+			"a queued scope switch should load before the next live tick",
+		);
+		// Status filters re-project loaded data synchronously (no disk reload).
+		racing.component.handleInput("\t");
+		racing.component.handleInput("\u001b[C");
+		text = renderText(racing.component);
+		assert.match(text, /\[running\]/, "status filter should switch");
+		assert.doesNotMatch(text, /Loading/);
+		const filteredStatuses = [...text.matchAll(/^[▸ ] run_\S+\s+(\S+)/gm)].map(
+			(match) => match[1],
+		);
+		assert.ok(filteredStatuses.length > 0, "running filter should list runs");
+		assert.ok(
+			filteredStatuses.every((status) => /^(running|pending)\b/.test(status)),
+			`status filter should apply immediately without a reload: ${filteredStatuses.join(",")}`,
+		);
+		racing.component.handleInput("\u001b[D");
+		// Returning to a scope loaded earlier shows its rows at once.
+		racing.component.handleInput("\u001b[Z");
+		racing.component.handleInput("\u001b[D");
+		text = renderText(racing.component);
+		assert.match(
+			text,
+			/\[session\][\s\S]*run_session_current/,
+			"a previously loaded scope should render cached rows immediately",
+		);
+		assert.doesNotMatch(text, /Loading/);
+		racing.component.handleInput("q");
+
 		scoped.component.handleInput("\u001b[C");
 		await waitFor(() => {
 			const current = renderText(scoped.component);
@@ -1023,6 +1086,90 @@ async function main() {
 		}, "all scope show more should reveal all hidden terminal rows");
 		scoped.component.handleInput("q");
 		assert.equal(scoped.closeCount(), 1, "q should close session-scoped panel");
+
+		// Regression: run.json can keep saying "running" after its worker died
+		// without finalizing the run (seen in the wild when a launch crashed
+		// before any process existed). Once every attempt recorded as active is
+		// found dead, the run must stop counting as active forever.
+		const deadSessionId = "session-dead-789";
+		const deadCwd = join(tempRoot, "dead-workspace");
+		await mkdir(deadCwd, { recursive: true });
+		await writeIndexedRun(indexDir, deadCwd, "run_dead_active", "attempt-1", {
+			status: "running",
+			backend: "headless",
+			parentSessionId: deadSessionId,
+			updatedAt: new Date(fixedPanelNow - 3_600_000).toISOString(),
+			resultMtime: new Date(fixedPanelNow - 3_600_000),
+			log: "worker died without finalizing",
+		});
+		// Between retries a run stays running while its only recorded attempt
+		// failed normally; nothing shows it died, so it must stay running.
+		await writeIndexedRun(indexDir, deadCwd, "run_retry_pending", "attempt-1", {
+			status: "failed",
+			failureKind: "model",
+			backend: "headless",
+			parentSessionId: deadSessionId,
+			log: "first attempt failed; retry pending",
+		});
+		const retryRunJson = join(
+			deadCwd,
+			".pi/agent/runs/run_retry_pending/run.json",
+		);
+		const retryRecord = JSON.parse(await readFile(retryRunJson, "utf8"));
+		await writeFile(
+			retryRunJson,
+			`${JSON.stringify({ ...retryRecord, status: "running", completedAt: null }, null, 2)}\n`,
+		);
+		const dead = await runCommand("panel", {
+			sessionManager: { getSessionId: () => deadSessionId },
+		});
+		await waitFor(
+			() => /run_retry_pending/.test(renderText(dead.component)),
+			"dead-run session render",
+		);
+		text = renderText(dead.component);
+		assert.match(
+			text,
+			/run_dead_active\s+failed/,
+			"a run whose recorded-active attempts all died should render failed",
+		);
+		assert.match(
+			text,
+			/run_retry_pending\s+running/,
+			"a running run without dead attempts should stay running",
+		);
+		assert.match(
+			text,
+			/live · 1 active · 1 failed/,
+			"a dead run must not count as active",
+		);
+		dead.component.handleInput("q");
+
+		// Regression: runs kept under a custom runsDir (e.g. a dispatch batch at
+		// `.pi/agent/runs/<batch>/<task>/<runId>`) are invisible to the direct
+		// cwd scan; the cwd scope must find them through the index.
+		const nestedCwd = join(tempRoot, "nested-workspace");
+		const nestedRunsDir = ".pi/agent/runs/dispatch-batch/task-a";
+		const nestedRunDir = join(nestedCwd, nestedRunsDir, "run_nested_dispatch");
+		await mkdir(nestedRunDir, { recursive: true });
+		const nestedAt = new Date(fixedPanelNow - 60_000).toISOString();
+		await writeFile(
+			join(nestedRunDir, "run.json"),
+			`${JSON.stringify({ schemaVersion: 2, runId: "run_nested_dispatch", mode: "single", status: "completed", backend: "headless", cwd: nestedCwd, runsDir: nestedRunsDir, startedAt: nestedAt, updatedAt: nestedAt, completedAt: nestedAt, attempts: [{ attemptId: "attempt-1", status: "completed", backend: "headless", startedAt: nestedAt, updatedAt: nestedAt, completedAt: nestedAt }] }, null, 2)}\n`,
+		);
+		await writeFile(
+			join(indexDir, "run_nested_dispatch.json"),
+			`${JSON.stringify({ schemaVersion: 1, runId: "run_nested_dispatch", cwd: nestedCwd, runsDir: nestedRunsDir, updatedAt: nestedAt }, null, 2)}\n`,
+		);
+		const nested = await runCommand("panel", { cwd: nestedCwd });
+		await waitFor(
+			() => /run_nested_dispatch/.test(renderText(nested.component)),
+			"cwd scope should include indexed runs under a custom runsDir",
+		);
+		text = renderText(nested.component);
+		assert.match(text, /\[cwd\]/, "no session id defaults to the cwd scope");
+		assert.match(text, /1\/1 shown/, "other workspaces' indexed runs stay out");
+		nested.component.handleInput("q");
 
 		const executeCwd = join(tempRoot, "execute-workspace");
 		await mkdir(executeCwd, { recursive: true });
