@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runParallelSubagentTasks } from "../../src/orchestrate/run.ts";
 import { startAsyncParallelSubagentRuns } from "../../src/orchestrate/async.ts";
+import { waitForRun } from "../../src/orchestrate/status.ts";
 
 async function makeCwd() {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-subagent-fail-fast-"));
@@ -190,7 +191,26 @@ try {
 		partialError.startedRunIds?.length,
 		"async mid-launch failure should not return before sibling spawns are accounted",
 	);
-	await rm(asyncCwd, { recursive: true, force: true });
+	// The started siblings keep running detached; let them settle before
+	// deleting their workspace, or the recursive delete races their writes
+	// (ENOTEMPTY).
+	await Promise.all(
+		(partialError.startedResults ?? []).map((result) =>
+			waitForRun({
+				cwd: asyncCwd,
+				runId: result.runId,
+				attemptId: result.attemptId,
+				timeoutMs: 30_000,
+				pollIntervalMs: 100,
+			}),
+		),
+	);
+	await rm(asyncCwd, {
+		recursive: true,
+		force: true,
+		maxRetries: 5,
+		retryDelay: 100,
+	});
 
 	console.log(
 		JSON.stringify({ name: "check-fail-fast", status: "completed" }, null, 2),
@@ -198,5 +218,11 @@ try {
 } finally {
 	if (oldIndexDir === undefined) delete process.env.PI_SUBAGENT_RUN_INDEX_DIR;
 	else process.env.PI_SUBAGENT_RUN_INDEX_DIR = oldIndexDir;
-	if (cwd !== undefined) await rm(cwd, { recursive: true, force: true });
+	if (cwd !== undefined)
+		await rm(cwd, {
+			recursive: true,
+			force: true,
+			maxRetries: 5,
+			retryDelay: 100,
+		});
 }

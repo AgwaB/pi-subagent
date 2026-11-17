@@ -167,7 +167,9 @@ try {
 		cwd: parentDeathCwd,
 		runId: launchedRef.runId,
 		attemptId: launchedRef.attemptId,
-		timeoutMs: 15_000,
+		// Generous: the detached worker finalizes on its own schedule, which a
+		// busy machine can stretch well past 15s.
+		timeoutMs: 30_000,
 		pollIntervalMs: 100,
 	});
 	assert.equal(
