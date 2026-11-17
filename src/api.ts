@@ -241,13 +241,23 @@ function validateRunOptions(options: RunSubagentOptions): {
 	backend: ResolvedBackend;
 	signal?: AbortSignal;
 } {
-	const { signal, ...rawInput } = options;
+	const { signal, parentSessionId, ...rawInput } = options;
 	const validation = validateResolveInput(rawInput);
 	if (!validation.ok) {
 		throw new SubagentValidationError(
 			validation.failure.error,
 			validation.failure.backend,
 		);
+	}
+	// validateResolveInput never accepts parentSessionId: on the tool path it
+	// comes from the Pi session context, not from model arguments. A
+	// programmatic caller is trusted to name the session it runs under.
+	if (parentSessionId !== undefined) {
+		if (typeof parentSessionId !== "string" || parentSessionId.length === 0)
+			throw new SubagentValidationError(
+				"parentSessionId must be a non-empty string when provided.",
+			);
+		validation.input.parentSessionId = parentSessionId;
 	}
 
 	const resolved = resolveBackend(validation.input);
