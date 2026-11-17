@@ -815,21 +815,51 @@ function limitRunsForPanel(
 	};
 }
 
-async function loadRuns(options: LoadOptions): Promise<PanelSnapshot> {
+/** Every run of one scope, before status filtering and paging. */
+interface LoadedScope {
+	runs: RunRow[];
+	loadedAt: Date;
+	stale: number;
+	invalid: number;
+	skipped: number;
+}
+
+async function loadScope(
+	options: Pick<LoadOptions, "cwd" | "scope" | "currentSessionId">,
+): Promise<LoadedScope> {
 	const effectiveScope =
 		options.scope === "session" && options.currentSessionId === undefined
 			? "cwd"
 			: options.scope;
-	const loaded = await loadRunsForScope({ ...options, scope: effectiveScope });
+	const loaded = await loadRunsForScope({
+		...options,
+		scope: effectiveScope,
+		statusFilter: "all",
+		showMorePages: 0,
+	});
 	const unique = new Map<string, RunRow>();
 	for (const run of loaded.runs) unique.set(run.key, run);
-	const allRuns = [...unique.values()].sort(
+	const runs = [...unique.values()].sort(
 		(a, b) =>
 			statusPriority(a.status) - statusPriority(b.status) ||
 			b.updatedMs - a.updatedMs ||
 			a.key.localeCompare(b.key),
 	);
-	const filtered = allRuns.filter((run) =>
+	return {
+		runs,
+		loadedAt: new Date(nowMs()),
+		stale: loaded.stale,
+		invalid: loaded.invalid,
+		skipped: loaded.skipped,
+	};
+}
+
+/** Apply the status filter and paging to an already loaded scope (no I/O). */
+function projectSnapshot(
+	loaded: LoadedScope,
+	options: Pick<LoadOptions, "scope" | "statusFilter" | "showMorePages">,
+): PanelSnapshot {
+	const filtered = loaded.runs.filter((run) =>
 		statusMatches(run, options.statusFilter),
 	);
 	const limited = limitRunsForPanel(filtered, options);
@@ -837,7 +867,7 @@ async function loadRuns(options: LoadOptions): Promise<PanelSnapshot> {
 		runs: limited.runs,
 		totalRuns: filtered.length,
 		hiddenRuns: limited.hiddenRuns,
-		loadedAt: new Date(nowMs()),
+		loadedAt: loaded.loadedAt,
 		staleLocators: loaded.stale,
 		invalidLocators: loaded.invalid,
 		skippedLocators: loaded.skipped,
@@ -952,8 +982,8 @@ function currentSessionIdFromCtx(
 	}
 }
 
-export class SubagentPanel implements Component {
-	private snapshot: PanelSnapshot = {
+function emptySnapshot(): PanelSnapshot {
+	return {
 		runs: [],
 		totalRuns: 0,
 		loadedAt: new Date(nowMs()),
@@ -962,6 +992,14 @@ export class SubagentPanel implements Component {
 		invalidLocators: 0,
 		skippedLocators: 0,
 	};
+}
+
+export class SubagentPanel implements Component {
+	private snapshot: PanelSnapshot = emptySnapshot();
+	/** Latest unfiltered load per scope; filter and paging are projected from it. */
+	private readonly loadedByScope = new Map<ScopeFilter, LoadedScope>();
+	/** A user-requested refresh that arrived while a load was in flight. */
+	private pendingRefresh: { preserveSelection: boolean } | undefined;
 	private selectedRun = 0;
 	private showMorePages = 0;
 	private scope: ScopeFilter;
@@ -981,7 +1019,10 @@ export class SubagentPanel implements Component {
 	) {
 		this.scope = currentSessionId === undefined ? "cwd" : "session";
 		void this.refresh({ preserveSelection: false });
-		this.timer = setInterval(() => void this.refresh(), LIVE_REFRESH_MS);
+		this.timer = setInterval(
+			() => void this.refresh({ background: true }),
+			LIVE_REFRESH_MS,
+		);
 	}
 
 	dispose(): void {
@@ -1006,7 +1047,7 @@ export class SubagentPanel implements Component {
 		if (data === "m") {
 			if (this.snapshot.hiddenRuns > 0) {
 				this.showMorePages += 1;
-				void this.refresh();
+				this.applySnapshot(true);
 			}
 			return;
 		}
@@ -1021,11 +1062,11 @@ export class SubagentPanel implements Component {
 			return;
 		}
 		if (isArrowKey(data, "right") || data === "l") {
-			void this.cycleFocused(1);
+			this.cycleFocused(1);
 			return;
 		}
 		if (isArrowKey(data, "left") || data === "h") {
-			void this.cycleFocused(-1);
+			this.cycleFocused(-1);
 			return;
 		}
 		if (isEnterKey(data)) return;
@@ -1056,18 +1097,22 @@ export class SubagentPanel implements Component {
 			stale > 0 || this.snapshot.skippedLocators > 0
 				? ` · stale ${this.snapshot.staleLocators} · skipped ${this.snapshot.invalidLocators + this.snapshot.skippedLocators}`
 				: "";
-		const status = `live · ${active} active · ${failed} failed · ${this.snapshot.runs.length}/${this.snapshot.totalRuns} shown${staleText} · updated ${fmtAge(this.snapshot.loadedAt.getTime())}`;
+		const loadingView = !this.loadedByScope.has(this.scope);
+		const status = loadingView
+			? `loading ${this.scope} runs…`
+			: `live · ${active} active · ${failed} failed · ${this.snapshot.runs.length}/${this.snapshot.totalRuns} shown${staleText} · updated ${fmtAge(this.snapshot.loadedAt.getTime())}`;
 		lines.push(splitLine(title, style(this.theme, "muted", status), safeWidth));
 		lines.push(style(this.theme, "border", border(safeWidth)));
 		lines.push(this.renderControls(safeWidth));
 		lines.push(this.renderScopeHelp(safeWidth));
 		lines.push(style(this.theme, "border", border(safeWidth)));
 
-		if (this.snapshot.runs.length === 0) {
+		if (loadingView || this.snapshot.runs.length === 0) {
 			const bodyHeight = Math.max(1, maxLines - lines.length - 2);
-			lines.push(
-				style(this.theme, "muted", clip(this.emptyMessage(), safeWidth)),
-			);
+			const message = loadingView
+				? `Loading ${this.scope} runs…`
+				: this.emptyMessage();
+			lines.push(style(this.theme, "muted", clip(message, safeWidth)));
 			for (let index = 1; index < bodyHeight; index += 1) lines.push("");
 			lines.push(style(this.theme, "border", border(safeWidth)));
 			lines.push(style(this.theme, "dim", this.footerHelp(false)));
@@ -1111,60 +1156,106 @@ export class SubagentPanel implements Component {
 		return `No subagent runs found under ${DEFAULT_RUNS_DIR}`;
 	}
 
+	/** Re-project the loaded scope with the current filter/paging (no I/O). */
+	private applySnapshot(preserveSelection: boolean): void {
+		const loaded = this.loadedByScope.get(this.scope);
+		if (loaded === undefined) return;
+		const previousKey = preserveSelection
+			? this.snapshot.runs[this.selectedRun]?.key
+			: undefined;
+		const snapshot = projectSnapshot(loaded, {
+			scope: this.scope,
+			statusFilter: this.statusFilter,
+			showMorePages: this.showMorePages,
+		});
+		this.snapshot = snapshot;
+		const oldSelectedRun = this.selectedRun;
+		const nextIndex =
+			previousKey === undefined
+				? -1
+				: snapshot.runs.findIndex((run) => run.key === previousKey);
+		this.selectedRun =
+			nextIndex >= 0
+				? nextIndex
+				: Math.min(this.selectedRun, Math.max(0, snapshot.runs.length - 1));
+		if (this.selectedRun !== oldSelectedRun) this.detailOffset = 0;
+		this.tui.requestRender?.();
+	}
+
 	private async refresh(
-		options: { preserveSelection?: boolean } = {},
+		options: { preserveSelection?: boolean; background?: boolean } = {},
 	): Promise<void> {
-		if (this.loading || this.disposed) return;
+		if (this.disposed) return;
+		const preserveSelection = options.preserveSelection !== false;
+		if (this.loading) {
+			// Timer ticks may be skipped, but a user request (scope change, `r`)
+			// must not be dropped: run it right after the in-flight load.
+			if (options.background !== true)
+				this.pendingRefresh = {
+					preserveSelection:
+						(this.pendingRefresh?.preserveSelection ?? true) &&
+						preserveSelection,
+				};
+			return;
+		}
 		this.loading = true;
+		let request: { preserveSelection: boolean } | undefined = {
+			preserveSelection,
+		};
 		try {
-			const previousKey =
-				options.preserveSelection === false
-					? undefined
-					: this.snapshot.runs[this.selectedRun]?.key;
-			const snapshot = await loadRuns({
-				cwd: this.cwd,
-				scope: this.scope,
-				statusFilter: this.statusFilter,
-				currentSessionId: this.currentSessionId,
-				showMorePages: this.showMorePages,
-			});
-			this.snapshot = snapshot;
-			const oldSelectedRun = this.selectedRun;
-			const nextIndex =
-				previousKey === undefined
-					? -1
-					: snapshot.runs.findIndex((run) => run.key === previousKey);
-			this.selectedRun =
-				nextIndex >= 0
-					? nextIndex
-					: Math.min(this.selectedRun, Math.max(0, snapshot.runs.length - 1));
-			if (this.selectedRun !== oldSelectedRun) this.detailOffset = 0;
-			this.tui.requestRender?.();
+			while (request !== undefined && !this.disposed) {
+				const current = request;
+				const scope = this.scope;
+				const loaded = await loadScope({
+					cwd: this.cwd,
+					scope,
+					currentSessionId: this.currentSessionId,
+				});
+				request = this.pendingRefresh;
+				this.pendingRefresh = undefined;
+				if (this.disposed) return;
+				this.loadedByScope.set(scope, loaded);
+				// The scope changed mid-load: keep the result cached but do not show
+				// it; load the scope the user is looking at next.
+				if (scope !== this.scope) {
+					request ??= { preserveSelection: false };
+					continue;
+				}
+				this.applySnapshot(current.preserveSelection);
+			}
 		} finally {
 			this.loading = false;
 		}
 	}
 
-	private async cycleFocused(delta: number): Promise<void> {
-		if (this.focus === "scope") {
-			const scopes: ScopeFilter[] = ["session", "cwd", "all"];
-			const current = scopes.indexOf(this.scope);
-			this.scope =
-				scopes[(current + delta + scopes.length) % scopes.length] ?? "cwd";
-			this.detailOffset = 0;
-		} else if (this.focus === "status") {
+	private cycleFocused(delta: number): void {
+		if (this.focus === "detail") {
+			this.scrollDetail(delta > 0 ? 1 : -1);
+			return;
+		}
+		this.detailOffset = 0;
+		this.selectedRun = 0;
+		this.showMorePages = 0;
+		if (this.focus === "status") {
 			const filters: StatusFilter[] = ["all", "running", "completed", "failed"];
 			const current = filters.indexOf(this.statusFilter);
 			this.statusFilter =
 				filters[(current + delta + filters.length) % filters.length] ?? "all";
-			this.detailOffset = 0;
-		} else {
-			this.scrollDetail(delta > 0 ? 1 : -1);
+			// Filtering needs no disk reads; the live timer keeps the data fresh.
+			this.applySnapshot(false);
+			this.tui.requestRender?.();
 			return;
 		}
-		this.selectedRun = 0;
-		this.showMorePages = 0;
-		await this.refresh({ preserveSelection: false });
+		const scopes: ScopeFilter[] = ["session", "cwd", "all"];
+		const current = scopes.indexOf(this.scope);
+		this.scope =
+			scopes[(current + delta + scopes.length) % scopes.length] ?? "cwd";
+		// Never keep showing the previous scope's rows while the new one loads;
+		// show this scope's last load (if any) at once and refresh it.
+		this.snapshot = emptySnapshot();
+		this.applySnapshot(false);
+		this.tui.requestRender?.();
+		void this.refresh({ preserveSelection: false });
 	}
 
 	private footerHelp(withDetailKeys: boolean): string {

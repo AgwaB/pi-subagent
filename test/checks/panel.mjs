@@ -922,6 +922,62 @@ async function main() {
 			"raw parent session id should not render",
 		);
 
+		// Regression: a scope switch while the initial load is still in flight
+		// used to be dropped, so the previous scope's rows stayed on screen under
+		// the new tab until the next live tick.
+		const racing = await runCommand("panel", {
+			sessionManager: { getSessionId: () => sessionId },
+		});
+		racing.component.handleInput("\u001b[C");
+		const switchedAt = Date.now();
+		assert.match(
+			renderText(racing.component),
+			/\[cwd\][\s\S]*Loading cwd runs/,
+			"an unloaded scope should render a loading state, not stale rows",
+		);
+		let sawPreviousScopeRows = false;
+		await waitFor(() => {
+			const current = renderText(racing.component);
+			if (current.includes("run_session_other_cwd"))
+				sawPreviousScopeRows = true;
+			return current.includes("[cwd]") && current.includes("run_active");
+		}, "cwd scope after a mid-load switch");
+		assert.equal(
+			sawPreviousScopeRows,
+			false,
+			"session-scope rows must not render under the cwd tab",
+		);
+		assert.ok(
+			Date.now() - switchedAt < 1_500,
+			"a queued scope switch should load before the next live tick",
+		);
+		// Status filters re-project loaded data synchronously (no disk reload).
+		racing.component.handleInput("\t");
+		racing.component.handleInput("\u001b[C");
+		text = renderText(racing.component);
+		assert.match(text, /\[running\]/, "status filter should switch");
+		assert.doesNotMatch(text, /Loading/);
+		const filteredStatuses = [...text.matchAll(/^[▸ ] run_\S+\s+(\S+)/gm)].map(
+			(match) => match[1],
+		);
+		assert.ok(filteredStatuses.length > 0, "running filter should list runs");
+		assert.ok(
+			filteredStatuses.every((status) => /^(running|pending)\b/.test(status)),
+			`status filter should apply immediately without a reload: ${filteredStatuses.join(",")}`,
+		);
+		racing.component.handleInput("\u001b[D");
+		// Returning to a scope loaded earlier shows its rows at once.
+		racing.component.handleInput("\u001b[Z");
+		racing.component.handleInput("\u001b[D");
+		text = renderText(racing.component);
+		assert.match(
+			text,
+			/\[session\][\s\S]*run_session_current/,
+			"a previously loaded scope should render cached rows immediately",
+		);
+		assert.doesNotMatch(text, /Loading/);
+		racing.component.handleInput("q");
+
 		scoped.component.handleInput("\u001b[C");
 		await waitFor(() => {
 			const current = renderText(scoped.component);
