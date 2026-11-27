@@ -258,6 +258,7 @@ async function writeParallelErrorResult(options: {
 		dependency: options.taskInput.asyncDependency ?? null,
 		correlationId: options.taskInput.correlationId,
 		parentSessionId: options.taskInput.parentSessionId,
+		agent: options.taskInput.agent,
 		activeAttemptId: options.attemptId,
 		attempts: [
 			{
@@ -561,6 +562,7 @@ export async function runPreparedSubagentExecution(
 		dependency: input.asyncDependency ?? null,
 		correlationId: input.correlationId,
 		parentSessionId: input.parentSessionId,
+		agent: input.agent,
 		attempts: [],
 	});
 	const runningRecord = await upsertRunAttempt({

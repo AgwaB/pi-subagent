@@ -15,3 +15,12 @@ if (!process.env.PI_SUBAGENT_RUN_INDEX_DIR) {
 		rmSync(indexDir, { recursive: true, force: true });
 	});
 }
+
+// Likewise keep checks away from the user's extension preferences.
+if (!process.env.PI_SUBAGENT_PREFERENCES_PATH) {
+	const prefsDir = mkdtempSync(join(tmpdir(), "pi-subagent-check-prefs-"));
+	process.env.PI_SUBAGENT_PREFERENCES_PATH = join(prefsDir, "pi-subagent.json");
+	process.on("exit", () => {
+		rmSync(prefsDir, { recursive: true, force: true });
+	});
+}

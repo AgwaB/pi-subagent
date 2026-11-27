@@ -237,6 +237,55 @@ export async function writeRunLocator(
 	await writeFile(tempPath, `${JSON.stringify(locator, null, 2)}\n`);
 	await rename(tempPath, path);
 	scheduleRunLocatorSweep();
+	for (const listener of locatorListeners) {
+		try {
+			listener(locator);
+		} catch {
+			// Observers must not affect run bookkeeping.
+		}
+	}
+}
+
+const locatorListeners = new Set<(locator: RunRefLocator) => void>();
+
+/**
+ * Observe locators this process writes (every run start writes one), so
+ * in-process observers can find new runs without scanning the global index.
+ */
+export function onRunLocatorWritten(
+	listener: (locator: RunRefLocator) => void,
+): () => void {
+	locatorListeners.add(listener);
+	return () => {
+		locatorListeners.delete(listener);
+	};
+}
+
+const RUN_ID_TIME_PATTERN = /^run_([0-9a-z]+)_[0-9a-f]+\.json$/;
+
+/**
+ * Locators of runs created at or after `sinceMs`, judged by the creation time
+ * encoded in generated run ids (`run_<base36 ms>_<hex>`). Only those files are
+ * read, so this stays cheap on a large index; other run ids are skipped.
+ */
+export async function listRecentRunLocators(
+	sinceMs: number,
+): Promise<RunRefLocator[]> {
+	const names = await readdir(runIndexDir()).catch(() => [] as string[]);
+	const recent = names.filter((name) => {
+		const match = RUN_ID_TIME_PATTERN.exec(name);
+		return (
+			match !== null && Number.parseInt(match[1] ?? "", 36) >= sinceMs
+		);
+	});
+	const locators = await mapWithConcurrency(
+		recent,
+		LOCATOR_LIST_CONCURRENCY,
+		(name) => readRunLocator(name.slice(0, -".json".length)),
+	);
+	return locators.filter(
+		(locator): locator is RunRefLocator => locator !== null,
+	);
 }
 
 export async function readRunLocator(

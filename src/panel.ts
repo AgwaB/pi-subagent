@@ -1,13 +1,14 @@
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Component } from "@earendil-works/pi-tui";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ResultEnvelope, RunEvent } from "./artifacts/index.ts";
 import type { Status } from "./core/constants.ts";
 import { mapWithConcurrency } from "./core/concurrency.ts";
 import { fingerprintFiles } from "./core/file-fingerprint.ts";
 import { clip, stripAnsi, visibleLength } from "./core/text-width.ts";
 import {
+	listRecentRunLocators,
 	listRunLocators,
 	locatorOlderThanPruneThreshold,
 	removeRunLocator,
@@ -56,6 +57,8 @@ interface TaskRow {
 interface RunRow {
 	key: string;
 	runId: string;
+	/** Requested agent name recorded in run.json, when known. */
+	agent: string | null;
 	sourceCwd: string;
 	runsDir: string;
 	status: Status;
@@ -206,7 +209,7 @@ function aggregateLegacyRunStatus(attempts: TaskRow[]): Status {
 	return attempts.length === 0 ? "pending" : "completed";
 }
 
-function isEscapeKey(data: string): boolean {
+export function isEscapeKey(data: string): boolean {
 	return (
 		data === "\u001b" ||
 		data === "escape" ||
@@ -219,7 +222,7 @@ function isEscapeKey(data: string): boolean {
 	);
 }
 
-function isEnterKey(data: string): boolean {
+export function isEnterKey(data: string): boolean {
 	return (
 		data === "\r" ||
 		data === "\n" ||
@@ -239,7 +242,7 @@ function isPageKey(data: string, direction: "up" | "down"): boolean {
 	return data === "pagedown" || data === "pgdown" || data === "\u001b[6~";
 }
 
-function isArrowKey(
+export function isArrowKey(
 	data: string,
 	direction: "up" | "down" | "left" | "right",
 ): boolean {
@@ -375,6 +378,7 @@ interface RegistryTaskRecord {
 
 interface RegistryRunRecord {
 	runId: string;
+	agent?: string;
 	mode?: string;
 	status: Status;
 	backend?: string;
@@ -619,6 +623,10 @@ async function readRunFromRegistry(
 	return {
 		key: runKey(cwd, runsDir, registry.runId),
 		runId: registry.runId,
+		agent:
+			typeof registry.agent === "string" && registry.agent.length > 0
+				? registry.agent
+				: null,
 		sourceCwd: cwd,
 		runsDir,
 		status: settled ? aggregateRunStatus(tasks) : registryStatus,
@@ -737,6 +745,7 @@ async function loadRunsFromCwd(
 		runs.push({
 			key: runKey(cwd, DEFAULT_RUNS_DIR, runEntry.name),
 			runId: runEntry.name,
+			agent: null,
 			sourceCwd: cwd,
 			runsDir: DEFAULT_RUNS_DIR,
 			status,
@@ -1125,9 +1134,7 @@ function panelLineBudget(): number {
 	);
 }
 
-function currentSessionIdFromCtx(
-	ctx: ExtensionCommandContext,
-): string | undefined {
+function currentSessionIdFromCtx(ctx: unknown): string | undefined {
 	const raw = ctx as unknown as {
 		sessionManager?: { getSessionId?: () => unknown };
 	};
@@ -1182,6 +1189,8 @@ export class SubagentPanel implements Component {
 	private timer: NodeJS.Timeout | undefined;
 	private disposed = false;
 	private loading = false;
+	/** Run to select (and show in the detail pane) once it first loads. */
+	private pendingSelectKey: string | undefined;
 
 	constructor(
 		private readonly cwd: string,
@@ -1189,8 +1198,13 @@ export class SubagentPanel implements Component {
 		private readonly tui: PanelTui,
 		private readonly done: () => void,
 		private readonly currentSessionId?: string,
+		initialRunKey?: string,
 	) {
 		this.scope = currentSessionId === undefined ? "cwd" : "session";
+		if (initialRunKey !== undefined) {
+			this.pendingSelectKey = initialRunKey;
+			this.focus = "detail";
+		}
 		void this.refresh({ preserveSelection: false });
 		this.timer = setInterval(
 			() => void this.refresh({ background: true }),
@@ -1334,25 +1348,30 @@ export class SubagentPanel implements Component {
 	private applySnapshot(preserveSelection: boolean): void {
 		const loaded = this.loadedByScope.get(this.scope);
 		if (loaded === undefined) return;
-		const previousKey = preserveSelection
-			? this.snapshot.runs[this.selectedRun]?.key
-			: undefined;
+		const shownKey = this.snapshot.runs[this.selectedRun]?.key;
+		const previousKey =
+			this.pendingSelectKey ??
+			(preserveSelection
+				? this.snapshot.runs[this.selectedRun]?.key
+				: undefined);
 		const snapshot = projectSnapshot(loaded, {
 			scope: this.scope,
 			statusFilter: this.statusFilter,
 			showMorePages: this.showMorePages,
 		});
 		this.snapshot = snapshot;
-		const oldSelectedRun = this.selectedRun;
 		const nextIndex =
 			previousKey === undefined
 				? -1
 				: snapshot.runs.findIndex((run) => run.key === previousKey);
+		if (nextIndex >= 0) this.pendingSelectKey = undefined;
 		this.selectedRun =
 			nextIndex >= 0
 				? nextIndex
 				: Math.min(this.selectedRun, Math.max(0, snapshot.runs.length - 1));
-		if (this.selectedRun !== oldSelectedRun) this.detailOffset = 0;
+		// Rows reorder as runs update; keep the detail scroll while the same
+		// run stays selected.
+		if (snapshot.runs[this.selectedRun]?.key !== shownKey) this.detailOffset = 0;
 		this.tui.requestRender?.();
 	}
 
@@ -1714,8 +1733,14 @@ export class SubagentPanel implements Component {
 	}
 }
 
+export type PanelHostContext = Pick<
+	ExtensionContext,
+	"cwd" | "mode" | "hasUI" | "ui"
+>;
+
 export async function showSubagentPanel(
-	ctx: ExtensionCommandContext,
+	ctx: PanelHostContext,
+	options: { runKey?: string } = {},
 ): Promise<void> {
 	if (ctx.mode !== "tui" || !ctx.hasUI) {
 		ctx.ui.notify?.(
@@ -1731,6 +1756,152 @@ export async function showSubagentPanel(
 			theme: PanelTheme,
 			_keybindings: unknown,
 			done: () => void,
-		) => new SubagentPanel(ctx.cwd, theme, tui, done, currentSessionId),
+		) =>
+			new SubagentPanel(
+				ctx.cwd,
+				theme,
+				tui,
+				done,
+				currentSessionId,
+				options.runKey,
+			),
 	);
+}
+
+/** One session run as the editor activity widget shows it. */
+export interface ActivityRun {
+	key: string;
+	runId: string;
+	agent: string | null;
+	status: Status;
+	/** The run or one of its children failed. */
+	failed: boolean;
+	backend: string;
+	model: string;
+	startedAt: string;
+	completedAt: string | null;
+	updatedMs: number;
+	attempts: number;
+	failureKind: string | null;
+	children?: { total: number; running: number; failed: number };
+}
+
+/** Panel clock; tests pin it with PI_SUBAGENT_PANEL_NOW_MS. */
+export function panelNowMs(): number {
+	return nowMs();
+}
+
+export function isActiveStatus(status: Status): boolean {
+	return isActive(status);
+}
+
+export function formatRunElapsed(
+	startedAt: string,
+	completedAt: string | null,
+): string {
+	return fmtElapsed(startedAt, completedAt);
+}
+
+function toActivityRun(run: RunRow): ActivityRun {
+	const latest = run.tasks.at(-1);
+	return {
+		key: run.key,
+		runId: run.runId,
+		agent: run.agent,
+		status: run.status,
+		failed: runHasFailure(run),
+		backend: run.backend,
+		model: latest?.modelLabel ?? "",
+		startedAt: run.startedAt,
+		completedAt: run.completedAt,
+		updatedMs: run.updatedMs,
+		attempts: run.tasks.length,
+		failureKind: latest?.failureKind ?? null,
+		...(run.childSummary === undefined
+			? {}
+			: {
+					children: {
+						total: run.childSummary.total,
+						running: run.childSummary.running,
+						failed: childFailureCount(run.childSummary),
+					},
+				}),
+	};
+}
+
+/** How long the activity loader keeps re-reading a run after it finished. */
+const ACTIVITY_FORGET_AFTER_MS = 10 * 60_000;
+
+export interface SessionActivityLoader {
+	/** Start following a run (its locator was just written). */
+	track(locator: RunRefLocator): void;
+	/** Find this session's recent runs in the index (e.g. a resumed session). */
+	seed(sinceMs: number): Promise<void>;
+	load(): Promise<ActivityRun[]>;
+}
+
+/**
+ * Loads the current session's runs for the activity widget. Unlike the panel
+ * it never scans the whole run index on a timer: it re-reads only the runs it
+ * was told about (`track`, `seed`), reusing the panel's file caches so
+ * finished runs are not re-read while their files are unchanged.
+ */
+export function createSessionActivityLoader(
+	sessionId: string,
+): SessionActivityLoader {
+	const cache: PanelLoadCache = {
+		locators: new Map(),
+		runs: new Map(),
+		runHits: 0,
+	};
+	const tracked = new Map<string, RunRefLocator>();
+	const track = (locator: RunRefLocator): void => {
+		if (locator.parentSessionId === sessionId)
+			tracked.set(locator.runId, locator);
+	};
+	return {
+		track,
+		async seed(sinceMs) {
+			for (const locator of await listRecentRunLocators(sinceMs))
+				track(locator);
+		},
+		async load() {
+			const locators = [...tracked.values()];
+			const loaded = await mapWithConcurrency(
+				locators,
+				INDEX_LOAD_CONCURRENCY,
+				(locator) =>
+					loadRunFromLocator(locator, {
+						scope: "session",
+						currentSessionId: sessionId,
+						cache,
+					}),
+			);
+			const runs: ActivityRun[] = [];
+			const now = nowMs();
+			loaded.forEach((result, index) => {
+				const locator = locators[index];
+				if (locator === undefined) return;
+				if (result.row === null) {
+					// Gone or unreadable: stop following it once it is not new.
+					if (result.invalid || result.pruned || result.stale)
+						tracked.delete(locator.runId);
+					return;
+				}
+				if (
+					!isActive(result.row.status) &&
+					now - result.row.updatedMs > ACTIVITY_FORGET_AFTER_MS
+				) {
+					tracked.delete(locator.runId);
+					return;
+				}
+				runs.push(toActivityRun(result.row));
+			});
+			return runs;
+		},
+	};
+}
+
+export function currentSessionId(ctx: unknown): string | undefined {
+	return currentSessionIdFromCtx(ctx);
 }

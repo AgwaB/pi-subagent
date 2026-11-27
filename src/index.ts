@@ -49,6 +49,7 @@ import {
 	readRunResult,
 	waitForRun,
 } from "./orchestrate/status.ts";
+import { registerActivityWidget } from "./activity-widget.ts";
 import { showSubagentPanel } from "./panel.ts";
 import { WorkspacePolicyError } from "./workspace/worktree.ts";
 
@@ -868,16 +869,23 @@ export function parsePruneCommandArgs(argText: string): {
 }
 
 export default function registerSubagentEngine(pi: ExtensionAPI) {
+	const activityWidget = registerActivityWidget(pi, TOOL_NAME);
 	if (typeof pi.registerCommand === "function") {
 		pi.registerCommand("subagent", {
 			description:
-				"Subagent utilities. `/subagent panel` opens the live status panel; `/subagent prune [--yes] [--keep N] [--older-than DAYS]` deletes old terminal runs (dry run without --yes).",
+				"Subagent utilities. `/subagent panel` opens the live status panel; `/subagent widget [on|off]` toggles the below-editor activity widget; `/subagent prune [--yes] [--keep N] [--older-than DAYS]` deletes old terminal runs (dry run without --yes).",
 			getArgumentCompletions(prefix) {
 				const items = [
 					{
 						value: "panel",
 						label: "panel",
 						description: "Open the live Subagents status panel",
+					},
+					{
+						value: "widget",
+						label: "widget",
+						description:
+							"Turn the below-editor activity widget on or off (remembered)",
 					},
 					{
 						value: "prune",
@@ -896,6 +904,29 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 				const normalizedArgs = commandArgs.replace(/^\/?subagent\b\s*/, "").trim();
 				if (normalizedArgs === "panel") {
 					await showSubagentPanel(ctx);
+					return;
+				}
+				const widgetMatch = /^widget(?:\s+(\S+))?$/u.exec(normalizedArgs);
+				if (widgetMatch !== null) {
+					const choice = widgetMatch[1]?.toLowerCase();
+					if (choice !== undefined && choice !== "on" && choice !== "off") {
+						ctx.ui.notify?.("Usage: /subagent widget [on|off]", "warning");
+						return;
+					}
+					const next =
+						choice === undefined ? !activityWidget.isEnabled() : choice === "on";
+					try {
+						activityWidget.setEnabled(next);
+						ctx.ui.notify?.(
+							`Subagent activity widget ${next ? "on" : "off"}`,
+							"info",
+						);
+					} catch (error) {
+						ctx.ui.notify?.(
+							error instanceof Error ? error.message : String(error),
+							"error",
+						);
+					}
 					return;
 				}
 				if (/^prune(\s|$)/u.test(normalizedArgs)) {
@@ -917,7 +948,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 					return;
 				}
 				ctx.ui.notify?.(
-					"Usage: /subagent panel | /subagent prune [--yes] [--keep N] [--older-than DAYS]",
+					"Usage: /subagent panel | /subagent prune [--yes] [--keep N] [--older-than DAYS] | /subagent widget [on|off]",
 					"warning",
 				);
 			},

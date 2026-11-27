@@ -293,6 +293,7 @@ export async function startAsyncSubagentRun(
 		dependency,
 		correlationId: input.correlationId,
 		parentSessionId: input.parentSessionId,
+		agent: input.agent,
 		activeAttemptId: attemptId,
 		attempts: [],
 	});

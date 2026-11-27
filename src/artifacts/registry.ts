@@ -123,6 +123,8 @@ export interface RunRecord {
 	correlationId?: string;
 	/** Pi session id of the parent session that launched this run. */
 	parentSessionId?: string;
+	/** Requested agent name, for display only. */
+	agent?: string;
 	mode: ExecutionMode;
 	status: Status;
 	failureKind: FailureKind | null;
@@ -184,6 +186,7 @@ export interface BeginRunOptions extends RunRef {
 	dependency?: AsyncDependency | null;
 	correlationId?: string;
 	parentSessionId?: string;
+	agent?: string;
 	activeAttemptId?: string | null;
 	attempts?: Array<
 		Pick<RunAttemptRecord, "attemptId"> & Partial<RunAttemptRecord>
@@ -663,6 +666,7 @@ export async function beginRunRecord(
 						...(options.parentSessionId === undefined
 							? {}
 							: { parentSessionId: options.parentSessionId }),
+						...(options.agent === undefined ? {} : { agent: options.agent }),
 						mode: options.mode,
 						status: attempts.length > 0 ? aggregate.status : "pending",
 						failureKind: attempts.length > 0 ? aggregate.failureKind : null,
@@ -687,6 +691,9 @@ export async function beginRunRecord(
 						...(existing.parentSessionId === undefined &&
 						options.parentSessionId !== undefined
 							? { parentSessionId: options.parentSessionId }
+							: {}),
+						...(existing.agent === undefined && options.agent !== undefined
+							? { agent: options.agent }
 							: {}),
 						mode: existing.mode ?? options.mode,
 						backend: existing.backend ?? options.backend,

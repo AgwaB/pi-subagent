@@ -136,6 +136,8 @@ Open the run monitor:
 
 ![/subagent panel](./assets/subagent-panel.png)
 
+While this session has running (or just-finished) subagents, a one-line summary sits below the editor. With the editor empty, press `↓` to open it as a list + detail drawer, `↑↓` to select a run, `Enter` to open that run in the panel's detail pane, and `Esc` (or `↑` at the top) to return to the editor. `/subagent widget off` hides it (and `on` brings it back); the choice is remembered across sessions.
+
 ## Code API
 
 Orchestrators can use the same runtime directly:
